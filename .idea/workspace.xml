@@ -5,12 +5,9 @@
   </component>
   <component name="ChangeListManager">
     <list default="true" id="501509db-c9de-4eb9-b574-ffa1c3e6a775" name="Changes" comment="initial project structure">
-      <change beforePath="$PROJECT_DIR$/.idea/difi_aggregator.iml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/difi_aggregator.iml" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/core/difi_packet.py" beforeDir="false" afterPath="$PROJECT_DIR$/src/core/difi_packet.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/main.py" beforeDir="false" afterPath="$PROJECT_DIR$/src/main.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/src/modules/generator.py" beforeDir="false" afterPath="$PROJECT_DIR$/src/modules/generator.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/modules/receiver.py" beforeDir="false" afterPath="$PROJECT_DIR$/src/modules/receiver.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/ui/config_gui.py" beforeDir="false" afterPath="$PROJECT_DIR$/src/ui/config_gui.py" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -61,6 +58,7 @@
   "keyToString": {
     "ModuleVcsDetector.initialDetectionPerformed": "true",
     "Python.config_gui.executor": "Run",
+    "Python.difi_packet.executor": "Run",
     "Python.main.executor": "Run",
     "Python.tx_gui.executor": "Run",
     "RunOnceActivity.MCP Project settings loaded": "true",
@@ -166,7 +164,7 @@
       <workItem from="1769200537544" duration="261000" />
       <workItem from="1769200813580" duration="4060000" />
       <workItem from="1777661136815" duration="1740000" />
-      <workItem from="1777663551947" duration="2108000" />
+      <workItem from="1777663551947" duration="4419000" />
     </task>
     <task id="LOCAL-00001" summary="initial project structure">
       <option name="closed" value="true" />
@@ -192,7 +190,15 @@
       <option name="project" value="LOCAL" />
       <updated>1768662096544</updated>
     </task>
-    <option name="localTasksCounter" value="4" />
+    <task id="LOCAL-00004" summary="initial project structure">
+      <option name="closed" value="true" />
+      <created>1777666575745</created>
+      <option name="number" value="00004" />
+      <option name="presentableId" value="LOCAL-00004" />
+      <option name="project" value="LOCAL" />
+      <updated>1777666575745</updated>
+    </task>
+    <option name="localTasksCounter" value="5" />
     <servers />
   </component>
   <component name="TypeScriptGeneratedFilesManager">
@@ -203,7 +209,8 @@
     <option name="LAST_COMMIT_MESSAGE" value="initial project structure" />
   </component>
   <component name="com.intellij.coverage.CoverageDataManagerImpl">
-    <SUITE FILE_PATH="coverage/difi_aggregator$config_gui.coverage" NAME="config_gui Coverage Results" MODIFIED="1777665065813" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/src/ui" />
+    <SUITE FILE_PATH="coverage/difi_aggregator$difi_packet.coverage" NAME="difi_packet Coverage Results" MODIFIED="1777666628381" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/src/core" />
+    <SUITE FILE_PATH="coverage/difi_aggregator$config_gui.coverage" NAME="config_gui Coverage Results" MODIFIED="1777668709405" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/src/ui" />
     <SUITE FILE_PATH="coverage/difi_aggregator$main.coverage" NAME="main Coverage Results" MODIFIED="1768716661068" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/src" />
     <SUITE FILE_PATH="coverage/difi_aggregator$tx_gui.coverage" NAME="tx_gui Coverage Results" MODIFIED="1777664580478" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/src/ui" />
   </component>

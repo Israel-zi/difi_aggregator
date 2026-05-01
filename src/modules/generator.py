@@ -75,8 +75,9 @@ class DifiGenerator:
         self._ctx_seq   = 0
         self._pkt_count = 0
         self._phase     = 0.0
-        self._bw_filter = None   # cached bandpass filter coefficients
-        self._bw_zi     = None   # filter state (for continuity across packets)
+        self._running   = True
+        self._bw_filter = None
+        self._bw_zi     = None
 
         self._build_bw_filter()
 
@@ -169,7 +170,7 @@ class DifiGenerator:
             rf_ref_freq_hz      = self.rf_ref_freq_hz,
             bandwidth_hz        = self.bandwidth_hz,
             reference_level_dbm = self.ref_level_dbm,
-            bit_depth           = self.bit_depth if hasattr(self, 'bit_depth') else 16,
+            sample_bit_depth = self.bit_depth,
             tsi                 = TSI_UTC,
             tsf                 = TSF_REAL_TIME,
         ).to_bytes()
@@ -235,7 +236,7 @@ class DifiGenerator:
             f"fs={self.sample_rate_hz:.0f}Hz | dest={self.dest}"
         )
         try:
-            while num_packets == 0 or count < num_packets:
+            while self._running and (num_packets == 0 or count < num_packets):
                 t0 = time.monotonic()
                 self.send_one_packet()
                 count += 1
@@ -243,12 +244,11 @@ class DifiGenerator:
                     sleep = interval - (time.monotonic() - t0)
                     if sleep > 0:
                         time.sleep(sleep)
-        except KeyboardInterrupt:
+        except (KeyboardInterrupt, OSError):
             pass
-        finally:
-            self._sock.close()
 
     def close(self):
+        self._running = False
         try:
             self._sock.close()
         except OSError:
