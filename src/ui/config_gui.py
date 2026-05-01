@@ -18,14 +18,15 @@ from PySide6.QtWidgets import (
 )
 import pyqtgraph as pg
 
-from modules.generator     import DifiGenerator, SIGNAL_CW, SIGNAL_BW
+from modules.generator     import DifiGenerator, SIGNAL_CW, SIGNAL_BW, SIGNAL_OFF
 from modules.input_capture import InputCapture
 from modules.aggregator    import Aggregator
 from modules.packetizer    import Packetizer
 from modules.sender        import DifiSender
 from modules.receiver      import DifiReceiver
 
-UNIT_MUL = {"Hz": 1.0, "kHz": 1e3, "MHz": 1e6, "GHz": 1e9}
+UNIT_MUL    = {"Hz": 1.0, "kHz": 1_000.0, "MHz": 1_000_000.0, "GHz": 1_000_000_000.0}
+UNIT_LABELS = ["Hz", "kHz", "MHz", "GHz"]
 
 
 class FreqInput(QWidget):
@@ -44,12 +45,12 @@ class FreqInput(QWidget):
         self._spin.setDecimals(3)
         self._spin.setRange(0.001, 999_999.999)
         self._spin.setValue(val)
-        self._spin.setMinimumWidth(110)
+        self._spin.setFixedWidth(115)
 
         self._unit = QComboBox()
-        self._unit.addItems(list(UNIT_MUL.keys()))
+        self._unit.addItems(UNIT_LABELS)
         self._unit.setCurrentText(unit)
-        self._unit.setMinimumWidth(60)
+        self._unit.setFixedWidth(70)
 
         lay = QHBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
@@ -69,14 +70,17 @@ class GeneratorPanel(QGroupBox):
         type_w   = QWidget()
         type_lay = QHBoxLayout(type_w)
         type_lay.setContentsMargins(0, 0, 0, 0)
-        self._cw_rb = QRadioButton("CW")
-        self._bw_rb = QRadioButton("BW")
+        self._cw_rb  = QRadioButton("CW")
+        self._bw_rb  = QRadioButton("BW")
+        self._off_rb = QRadioButton("OFF")
         self._cw_rb.setChecked(True)
         grp = QButtonGroup(self)
         grp.addButton(self._cw_rb)
         grp.addButton(self._bw_rb)
+        grp.addButton(self._off_rb)
         type_lay.addWidget(self._cw_rb)
         type_lay.addWidget(self._bw_rb)
+        type_lay.addWidget(self._off_rb)
         type_lay.addStretch()
         grid.addWidget(type_w, 0, 1)
 
@@ -104,7 +108,7 @@ class GeneratorPanel(QGroupBox):
         self._cw_rb.toggled.connect(lambda: self._bw.setEnabled(self._bw_rb.isChecked()))
         self._bw.setEnabled(False)
 
-    def signal_type(self)    -> str:   return SIGNAL_CW if self._cw_rb.isChecked() else SIGNAL_BW
+    def signal_type(self)    -> str:   return SIGNAL_CW if self._cw_rb.isChecked() else (SIGNAL_BW if self._bw_rb.isChecked() else "OFF")
     def tone_hz(self)        -> float: return self._tone.value_hz()
     def bandwidth_hz(self)   -> float: return self._bw.value_hz()
     def rf_ref_freq_hz(self) -> float: return self._rf.value_hz()
@@ -166,6 +170,9 @@ class MainWindow(QMainWindow):
         self._plot.setLabel("bottom", "Frequency", units="Hz")
         self._plot.setLabel("left",   "Magnitude", units="dB")
         self._plot.showGrid(x=True, y=True, alpha=0.3)
+        self._plot.enableAutoRange(axis="xy", enable=False)
+        self._plot.setYRange(-110, -10, padding=0)
+        self._plot.setXRange(0, 5e6, padding=0)
         self._curve = self._plot.plot([], [], pen=pg.mkPen("c", width=1))
 
         # reference line at amplitude level
@@ -189,47 +196,48 @@ class MainWindow(QMainWindow):
 
     def _build_display_controls(self) -> QWidget:
         box    = QGroupBox("Display")
-        layout = QHBoxLayout(box)
+        vlay   = QVBoxLayout(box)
+        vlay.setSpacing(4)
 
-        def spin(label, default, min_val, max_val, step, suffix=""):
-            layout.addWidget(QLabel(label))
-            s = QDoubleSpinBox()
-            s.setRange(min_val, max_val)
-            s.setDecimals(3)
-            s.setSingleStep(step)
-            s.setValue(default)
-            if suffix:
-                s.setSuffix(suffix)
-            s.setMinimumWidth(90)
-            layout.addWidget(s)
-            return s
-
-        # Center frequency
-        layout.addWidget(QLabel("Center:"))
+        # row 1 — frequency axis
+        row1 = QHBoxLayout()
+        row1.addWidget(QLabel("Center:"))
         self._disp_center = FreqInput(default_hz=2.5e6)
-        self._disp_center.setMinimumWidth(160)
-        layout.addWidget(self._disp_center)
-
-        # Span
-        layout.addWidget(QLabel("Span:"))
+        row1.addWidget(self._disp_center)
+        row1.addSpacing(16)
+        row1.addWidget(QLabel("Span:"))
         self._disp_span = FreqInput(default_hz=5e6)
-        self._disp_span.setMinimumWidth(160)
-        layout.addWidget(self._disp_span)
-
-        layout.addWidget(QLabel("  "))  # spacer
-
-        # Amplitude (top of Y axis = reference level)
-        self._disp_amp    = spin("Amplitude:", -10, -200, 50, 10, " dB")
-        # dB/div
-        self._disp_dbdiv  = spin("dB/div:", 10, 1, 100, 1, " dB")
-
-        layout.addStretch()
-
+        row1.addWidget(self._disp_span)
+        row1.addStretch()
         auto_btn = QPushButton("Auto")
-        auto_btn.setFixedWidth(55)
-        auto_btn.setToolTip("Auto-fit display to current sample rate")
+        auto_btn.setFixedWidth(60)
         auto_btn.clicked.connect(self._auto_display)
-        layout.addWidget(auto_btn)
+        row1.addWidget(auto_btn)
+        vlay.addLayout(row1)
+
+        # row 2 — amplitude axis
+        row2 = QHBoxLayout()
+        row2.addWidget(QLabel("Amplitude:"))
+        self._disp_amp = QDoubleSpinBox()
+        self._disp_amp.setRange(-200, 50)
+        self._disp_amp.setDecimals(1)
+        self._disp_amp.setSingleStep(10)
+        self._disp_amp.setValue(-10)
+        self._disp_amp.setSuffix(" dB")
+        self._disp_amp.setFixedWidth(120)
+        row2.addWidget(self._disp_amp)
+        row2.addSpacing(16)
+        row2.addWidget(QLabel("dB/div:"))
+        self._disp_dbdiv = QDoubleSpinBox()
+        self._disp_dbdiv.setRange(1, 100)
+        self._disp_dbdiv.setDecimals(1)
+        self._disp_dbdiv.setSingleStep(1)
+        self._disp_dbdiv.setValue(10)
+        self._disp_dbdiv.setSuffix(" dB")
+        self._disp_dbdiv.setFixedWidth(110)
+        row2.addWidget(self._disp_dbdiv)
+        row2.addStretch()
+        vlay.addLayout(row2)
 
         return box
 
@@ -338,42 +346,38 @@ class MainWindow(QMainWindow):
         rx = self._modules.get("receiver")
         if rx is None:
             return
-        iq = rx.get_iq_snapshot()
-        fs = rx.get_sample_rate()
-        n  = len(iq)
+        iq  = rx.get_iq_snapshot()
+        # always use the configured sample rate (not receiver's default)
+        fs  = self._shared_fs.value_hz()
+        n   = len(iq)
         if n == 0:
             return
 
-        # FFT — positive frequencies only
-        window = np.hanning(n)
-        X      = np.fft.fft(iq * window)
-        freqs  = np.fft.fftfreq(n, d=1.0 / fs)
-        pos    = freqs >= 0
-        freqs  = freqs[pos]
-        mag_db = 20 * np.log10(np.abs(X[pos]) / n + 1e-12)
+        # FFT — positive frequencies only (0 to Fs/2)
+        window  = np.hanning(n)
+        X       = np.fft.fft(iq * window)
+        freqs   = np.fft.fftfreq(n, d=1.0 / fs)
+        pos     = freqs >= 0
+        freqs   = freqs[pos]
+        mag_db  = 20 * np.log10(np.abs(X[pos]) / n + 1e-12)
 
         self._curve.setData(freqs, mag_db)
 
         # apply display controls
-        center   = self._disp_center.value_hz()
-        span     = self._disp_span.value_hz()
-        amp_top  = self._disp_amp.value()
-        db_div   = self._disp_dbdiv.value()
-        n_divs   = 10
-        amp_bot  = amp_top - db_div * n_divs
+        center  = self._disp_center.value_hz()
+        span    = self._disp_span.value_hz()
+        amp_top = self._disp_amp.value()
+        db_div  = self._disp_dbdiv.value()
+        amp_bot = amp_top - db_div * 10
 
-        x_min = max(0, center - span / 2)
-        x_max = center + span / 2
-
-        self._plot.setXRange(x_min, x_max, padding=0)
+        self._plot.setXRange(max(0, center - span / 2), center + span / 2, padding=0)
         self._plot.setYRange(amp_bot, amp_top, padding=0)
-
-        # reference line at amplitude level
+        self._plot.getViewBox().setAutoPan(x=False, y=False)
         self._ref_line.setValue(amp_top)
 
         agg = self._modules.get("aggregator")
         self._status.showMessage(
-            f"Running — fs={fs/1e6:.1f}MHz | "
+            f"Running — fs={fs/1e6:.3f}MHz | "
             f"center={center/1e6:.3f}MHz  span={span/1e6:.3f}MHz | "
             f"data={rx.data_received}  chunks={agg.chunks_emitted if agg else 0}"
         )

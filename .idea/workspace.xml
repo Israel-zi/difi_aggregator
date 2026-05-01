@@ -164,7 +164,7 @@
       <workItem from="1769200537544" duration="261000" />
       <workItem from="1769200813580" duration="4060000" />
       <workItem from="1777661136815" duration="1740000" />
-      <workItem from="1777663551947" duration="4419000" />
+      <workItem from="1777663551947" duration="5513000" />
     </task>
     <task id="LOCAL-00001" summary="initial project structure">
       <option name="closed" value="true" />
@@ -198,7 +198,15 @@
       <option name="project" value="LOCAL" />
       <updated>1777666575745</updated>
     </task>
-    <option name="localTasksCounter" value="5" />
+    <task id="LOCAL-00005" summary="initial project structure">
+      <option name="closed" value="true" />
+      <created>1777668866364</created>
+      <option name="number" value="00005" />
+      <option name="presentableId" value="LOCAL-00005" />
+      <option name="project" value="LOCAL" />
+      <updated>1777668866364</updated>
+    </task>
+    <option name="localTasksCounter" value="6" />
     <servers />
   </component>
   <component name="TypeScriptGeneratedFilesManager">
@@ -210,7 +218,7 @@
   </component>
   <component name="com.intellij.coverage.CoverageDataManagerImpl">
     <SUITE FILE_PATH="coverage/difi_aggregator$difi_packet.coverage" NAME="difi_packet Coverage Results" MODIFIED="1777666628381" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/src/core" />
-    <SUITE FILE_PATH="coverage/difi_aggregator$config_gui.coverage" NAME="config_gui Coverage Results" MODIFIED="1777668709405" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/src/ui" />
+    <SUITE FILE_PATH="coverage/difi_aggregator$config_gui.coverage" NAME="config_gui Coverage Results" MODIFIED="1777669706126" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/src/ui" />
     <SUITE FILE_PATH="coverage/difi_aggregator$main.coverage" NAME="main Coverage Results" MODIFIED="1768716661068" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/src" />
     <SUITE FILE_PATH="coverage/difi_aggregator$tx_gui.coverage" NAME="tx_gui Coverage Results" MODIFIED="1777664580478" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/src/ui" />
   </component>

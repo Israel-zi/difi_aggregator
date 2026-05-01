@@ -22,8 +22,9 @@ from core.difi_packet import (
 )
 
 CONTEXT_INTERVAL_PKTS = 10
-SIGNAL_CW = "CW"
-SIGNAL_BW = "BW"
+SIGNAL_CW  = "CW"
+SIGNAL_BW  = "BW"
+SIGNAL_OFF = "OFF"
 
 
 class DifiGenerator:
@@ -148,6 +149,8 @@ class DifiGenerator:
         return sig.astype(np.complex64)
 
     def _generate_samples(self) -> np.ndarray:
+        if self.signal_type == SIGNAL_OFF:
+            return np.zeros(self.samples_per_pkt, dtype=np.complex64)
         if self.signal_type == SIGNAL_CW:
             return self._generate_cw()
         return self._generate_bw()
@@ -170,7 +173,7 @@ class DifiGenerator:
             rf_ref_freq_hz      = self.rf_ref_freq_hz,
             bandwidth_hz        = self.bandwidth_hz,
             reference_level_dbm = self.ref_level_dbm,
-            sample_bit_depth = self.bit_depth,
+            sample_bit_depth    = self.bit_depth,
             tsi                 = TSI_UTC,
             tsf                 = TSF_REAL_TIME,
         ).to_bytes()
@@ -183,7 +186,7 @@ class DifiGenerator:
             timestamp_int    = ts_int,
             timestamp_frac   = ts_frac,
             payload          = samples,
-            sample_bit_depth = self.bit_depth,
+            sample_bit_depth    = self.bit_depth,
             tsi              = TSI_UTC,
             tsf              = TSF_REAL_TIME,
         ).to_bytes()
