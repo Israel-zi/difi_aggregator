@@ -5,7 +5,12 @@
   </component>
   <component name="ChangeListManager">
     <list default="true" id="501509db-c9de-4eb9-b574-ffa1c3e6a775" name="Changes" comment="initial project structure">
+      <change beforePath="$PROJECT_DIR$/.idea/difi_aggregator.iml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/difi_aggregator.iml" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/core/difi_packet.py" beforeDir="false" afterPath="$PROJECT_DIR$/src/core/difi_packet.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/main.py" beforeDir="false" afterPath="$PROJECT_DIR$/src/main.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/modules/generator.py" beforeDir="false" afterPath="$PROJECT_DIR$/src/modules/generator.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/modules/receiver.py" beforeDir="false" afterPath="$PROJECT_DIR$/src/modules/receiver.py" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -34,7 +39,7 @@
   <component name="GithubPullRequestsUISettings">{
   &quot;selectedUrlAndAccountId&quot;: {
     &quot;url&quot;: &quot;https://github.com/Israel-zi/difi_aggregator.git&quot;,
-    &quot;accountId&quot;: &quot;5be466bf-62c2-42ff-bebd-de88ce3c6a05&quot;
+    &quot;accountId&quot;: &quot;23587928-4c0b-478e-8fde-4477af5eba62&quot;
   }
 }</component>
   <component name="McpProjectServerCommands">
@@ -55,6 +60,7 @@
   <component name="PropertiesComponent"><![CDATA[{
   "keyToString": {
     "ModuleVcsDetector.initialDetectionPerformed": "true",
+    "Python.config_gui.executor": "Run",
     "Python.main.executor": "Run",
     "Python.tx_gui.executor": "Run",
     "RunOnceActivity.MCP Project settings loaded": "true",
@@ -63,6 +69,7 @@
     "RunOnceActivity.git.unshallow": "true",
     "RunOnceActivity.typescript.service.memoryLimit.init": "true",
     "ai.playground.ignore.import.keys.banner.in.settings": "true",
+    "codeWithMe.voiceChat.enabledByDefault": "false",
     "com.intellij.ml.llm.matterhorn.ej.ui.settings.DefaultModelSelectionForGA.v1": "true",
     "git-widget-placeholder": "master",
     "ignore.virus.scanning.warn.message": "true",
@@ -82,7 +89,7 @@
     ]
   }
 }]]></component>
-  <component name="RunManager" selected="Python.tx_gui">
+  <component name="RunManager">
     <configuration name="main" type="PythonConfigurationType" factoryName="Python" temporary="true" nameIsGenerated="true">
       <module name="difi_aggregator" />
       <option name="ENV_FILES" value="" />
@@ -96,6 +103,7 @@
       <option name="IS_MODULE_SDK" value="true" />
       <option name="ADD_CONTENT_ROOTS" value="true" />
       <option name="ADD_SOURCE_ROOTS" value="true" />
+      <option name="DEBUG_JUST_MY_CODE" value="true" />
       <EXTENSION ID="PythonCoverageRunConfigurationExtension" runner="coverage.py" />
       <option name="RUN_TOOL" value="" />
       <option name="SCRIPT_NAME" value="$PROJECT_DIR$/src/main.py" />
@@ -120,6 +128,7 @@
       <option name="IS_MODULE_SDK" value="true" />
       <option name="ADD_CONTENT_ROOTS" value="true" />
       <option name="ADD_SOURCE_ROOTS" value="true" />
+      <option name="DEBUG_JUST_MY_CODE" value="true" />
       <EXTENSION ID="PythonCoverageRunConfigurationExtension" runner="coverage.py" />
       <option name="RUN_TOOL" value="" />
       <option name="SCRIPT_NAME" value="$PROJECT_DIR$/src/ui/tx_gui.py" />
@@ -141,8 +150,7 @@
   <component name="SharedIndexes">
     <attachedChunks>
       <set>
-        <option value="bundled-js-predefined-d6986cc7102b-9b0f141eb926-JavaScript-PY-253.29346.308" />
-        <option value="bundled-python-sdk-ca5e2b39c7df-6e1f45a539f7-com.jetbrains.pycharm.pro.sharedIndexes.bundled-PY-253.29346.308" />
+        <option value="bundled-python-sdk-024ed6589d45-c2ffad84badb-com.jetbrains.pycharm.pro.sharedIndexes.bundled-PY-261.23567.174" />
       </set>
     </attachedChunks>
   </component>
@@ -157,6 +165,8 @@
       <workItem from="1768716046330" duration="620000" />
       <workItem from="1769200537544" duration="261000" />
       <workItem from="1769200813580" duration="4060000" />
+      <workItem from="1777661136815" duration="1740000" />
+      <workItem from="1777663551947" duration="2108000" />
     </task>
     <task id="LOCAL-00001" summary="initial project structure">
       <option name="closed" value="true" />
@@ -193,7 +203,8 @@
     <option name="LAST_COMMIT_MESSAGE" value="initial project structure" />
   </component>
   <component name="com.intellij.coverage.CoverageDataManagerImpl">
+    <SUITE FILE_PATH="coverage/difi_aggregator$config_gui.coverage" NAME="config_gui Coverage Results" MODIFIED="1777665065813" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/src/ui" />
     <SUITE FILE_PATH="coverage/difi_aggregator$main.coverage" NAME="main Coverage Results" MODIFIED="1768716661068" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/src" />
-    <SUITE FILE_PATH="coverage/difi_aggregator$tx_gui.coverage" NAME="tx_gui Coverage Results" MODIFIED="1769205176070" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/src/ui" />
+    <SUITE FILE_PATH="coverage/difi_aggregator$tx_gui.coverage" NAME="tx_gui Coverage Results" MODIFIED="1777664580478" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/src/ui" />
   </component>
 </project>
