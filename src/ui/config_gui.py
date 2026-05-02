@@ -45,7 +45,7 @@ class FreqInput(QWidget):
 
         self._spin = QDoubleSpinBox()
         self._spin.setDecimals(3)
-        self._spin.setRange(0.001, 999_999.999)
+        self._spin.setRange(0.0, 999_999.999)
         self._spin.setValue(val)
         self._spin.setFixedWidth(115)
 
@@ -67,6 +67,8 @@ class FreqInput(QWidget):
 
 
 class GeneratorPanel(QGroupBox):
+    changed = Signal()
+
     def __init__(self, n: int, parent=None):
         super().__init__(f"Generator {n}  —  Stream 0x0000000{n}", parent)
         grid = QGridLayout(self)
@@ -89,7 +91,7 @@ class GeneratorPanel(QGroupBox):
         type_lay.addStretch()
         grid.addWidget(type_w, 0, 1)
 
-        grid.addWidget(QLabel("Tone / Center freq:"), 1, 0)
+        grid.addWidget(QLabel("RF Frequency:"), 1, 0)
         self._tone = FreqInput(default_hz=1e6 if n == 1 else 2e6)
         grid.addWidget(self._tone, 1, 1)
 
@@ -98,7 +100,7 @@ class GeneratorPanel(QGroupBox):
         grid.addWidget(self._bw, 2, 1)
 
         grid.addWidget(QLabel("RF reference:"), 3, 0)
-        self._rf = FreqInput(default_hz=1e9)
+        self._rf = FreqInput(default_hz=0)
         grid.addWidget(self._rf, 3, 1)
 
         grid.addWidget(QLabel("Amplitude:"), 4, 0)
@@ -113,6 +115,14 @@ class GeneratorPanel(QGroupBox):
         for rb in (self._cw_rb, self._bw_rb, self._off_rb):
             rb.toggled.connect(lambda: self._bw.setEnabled(self._bw_rb.isChecked()))
         self._bw.setEnabled(False)
+
+        # emit changed whenever any control is modified
+        for rb in (self._cw_rb, self._bw_rb, self._off_rb):
+            rb.toggled.connect(self.changed)
+        self._tone.changed.connect(self.changed)
+        self._bw.changed.connect(self.changed)
+        self._rf.changed.connect(self.changed)
+        self._amp.valueChanged.connect(self.changed)
 
     def signal_type(self)    -> str:   return SIGNAL_CW if self._cw_rb.isChecked() else (SIGNAL_BW if self._bw_rb.isChecked() else "OFF")
     def tone_hz(self)        -> float: return self._tone.value_hz()
@@ -136,6 +146,8 @@ class MainWindow(QMainWindow):
         self._pipeline_running = False
         self._modules          = {}
         self._build_ui()
+        self._panel1.changed.connect(self._live_update_generators)
+        self._panel2.changed.connect(self._live_update_generators)
 
     def _build_ui(self):
         central = QWidget()
@@ -187,6 +199,11 @@ class MainWindow(QMainWindow):
             pen=pg.mkPen("y", width=1, style=Qt.DashLine)
         )
         self._plot.addItem(self._ref_line)
+
+        # Keep display spinboxes in sync when user pans/zooms with mouse
+        self._plot.getPlotItem().getViewBox().sigRangeChanged.connect(
+            lambda vb, ranges: self._sync_viewport_to_spinboxes(ranges)
+        )
 
         right_layout.addWidget(self._plot)
         splitter.addWidget(right)
@@ -275,9 +292,13 @@ class MainWindow(QMainWindow):
         p2 = self._panel2
         fs = self._shared_fs.value_hz()
 
+        # Tone field holds absolute RF frequency; generator needs baseband offset
+        tone1_bb = p1.tone_hz() - p1.rf_ref_freq_hz()
+        tone2_bb = p2.tone_hz() - p2.rf_ref_freq_hz()
+
         gen1 = DifiGenerator(
             stream_id       = 0x00000001,
-            tone_hz         = p1.tone_hz(),
+            tone_hz         = tone1_bb,
             signal_type     = p1.signal_type(),
             dest_port       = 50001,
             sample_rate_hz  = fs,
@@ -289,7 +310,7 @@ class MainWindow(QMainWindow):
         )
         gen2 = DifiGenerator(
             stream_id       = 0x00000002,
-            tone_hz         = p2.tone_hz(),
+            tone_hz         = tone2_bb,
             signal_type     = p2.signal_type(),
             dest_port       = 50002,
             sample_rate_hz  = fs,
@@ -322,6 +343,20 @@ class MainWindow(QMainWindow):
         packetizer.start()
         sender.start()
 
+        # Warn if any baseband tone exceeds Nyquist — signal will alias
+        nyquist = fs / 2.0
+        alias_warnings = []
+        if abs(tone1_bb) >= nyquist:
+            alias_warnings.append(f"Gen1 RF={p1.tone_hz()/1e6:.3f}MHz (bb={tone1_bb/1e6:.3f}MHz)")
+        if abs(tone2_bb) >= nyquist:
+            alias_warnings.append(f"Gen2 RF={p2.tone_hz()/1e6:.3f}MHz (bb={tone2_bb/1e6:.3f}MHz)")
+        if alias_warnings:
+            self._status.showMessage(
+                f"⚠ Tone exceeds Nyquist (Fs/2={nyquist/1e6:.3f}MHz): "
+                + ", ".join(alias_warnings)
+                + " — reduce tone or increase sample rate"
+            )
+
         pkt_rate = fs / self.SAMPLES_PER_PKT
         threading.Thread(target=gen1.run, kwargs=dict(packet_rate_hz=pkt_rate), daemon=True).start()
         threading.Thread(target=gen2.run, kwargs=dict(packet_rate_hz=pkt_rate), daemon=True).start()
@@ -330,6 +365,10 @@ class MainWindow(QMainWindow):
         self._start_btn.setEnabled(False)
         self._stop_btn.setEnabled(True)
         self._timer.start()
+        self._apply_range()   # immediately restore Y range and spinbox-tracked X range
+
+        # Auto-fit only if signal is outside current display after context arrives
+        QTimer.singleShot(600, self._smart_auto_display)
         self._status.showMessage(
             f"Running — fs={fs/1e6:.1f}MHz | "
             f"Gen1:{p1.signal_type()} {p1.tone_hz()/1e6:.3f}MHz | "
@@ -364,26 +403,46 @@ class MainWindow(QMainWindow):
         if n == 0:
             return
 
-        # RF reference from context packet — shifts baseband to actual RF frequencies
+        # RF reference: prefer received context, fall back to configured UI value
         ctx    = rx.context
-        rf_ref = ctx.rf_ref_freq_hz if ctx else 0.0
+        rf_ref = ctx.rf_ref_freq_hz if ctx else self._panel1.rf_ref_freq_hz()
 
-        # FFT — positive baseband frequencies shifted to RF
+        # FFT — full complex IQ spectrum (-fs/2 to +fs/2) shifted to RF
         window  = np.hanning(n)
-        X       = np.fft.fft(iq * window)
-        freqs   = np.fft.fftfreq(n, d=1.0 / fs)
-        pos     = freqs >= 0
-        freqs   = freqs[pos] + rf_ref          # baseband → RF
-        mag_db  = 20 * np.log10(np.abs(X[pos]) / n + 1e-12)
+        X       = np.fft.fftshift(np.fft.fft(iq * window))
+        freqs   = np.fft.fftshift(np.fft.fftfreq(n, d=1.0 / fs)) + rf_ref
+        mag_db  = 20 * np.log10(np.abs(X) / n + 1e-12)
 
         self._curve.setData(freqs, mag_db)
-        self._apply_range()
 
         agg = self._modules.get("aggregator")
         rf_str = f" | RF={rf_ref/1e6:.3f} MHz" if rf_ref else ""
         self._status.showMessage(
             f"Running — fs={fs/1e6:.3f} MHz{rf_str} | "
             f"data={rx.data_received}  chunks={agg.chunks_emitted if agg else 0}"
+        )
+
+    def _live_update_generators(self):
+        if not self._pipeline_running:
+            return
+        gen1 = self._modules.get("gen1")
+        gen2 = self._modules.get("gen2")
+        if not gen1 or not gen2:
+            return
+        p1, p2 = self._panel1, self._panel2
+        gen1.update_params(
+            tone_hz        = p1.tone_hz() - p1.rf_ref_freq_hz(),
+            signal_type    = p1.signal_type(),
+            bandwidth_hz   = p1.bandwidth_hz(),
+            rf_ref_freq_hz = p1.rf_ref_freq_hz(),
+            ref_level_dbm  = p1.amplitude_dbm(),
+        )
+        gen2.update_params(
+            tone_hz        = p2.tone_hz() - p2.rf_ref_freq_hz(),
+            signal_type    = p2.signal_type(),
+            bandwidth_hz   = p2.bandwidth_hz(),
+            rf_ref_freq_hz = p2.rf_ref_freq_hz(),
+            ref_level_dbm  = p2.amplitude_dbm(),
         )
 
     def _apply_range(self):
@@ -396,32 +455,83 @@ class MainWindow(QMainWindow):
         self._ref_line.setValue(amp_top)
 
     def _auto_display(self):
-        """Fit display to rf_ref .. rf_ref + Fs/2 based on current context."""
-        fs     = self._shared_fs.value_hz()
-        half   = fs / 2.0
-        rx     = self._modules.get("receiver")
-        ctx    = rx.context if rx else None
-        rf_ref = ctx.rf_ref_freq_hz if ctx else 0.0
+        """Fit display to full IQ band: rf_ref ± fs/2."""
+        if not self._pipeline_running:
+            return
+        fs  = self._shared_fs.value_hz()
+        rx  = self._modules.get("receiver")
+        ctx = rx.context if rx else None
+        if ctx is None:
+            QTimer.singleShot(300, self._auto_display)
+            return
+        rf_ref = ctx.rf_ref_freq_hz
 
-        center = rf_ref + half / 2.0   # mid-point of the positive baseband
+        center = rf_ref
+        span   = fs
 
-        # pick best display unit
-        ref_hz = center
-        if ref_hz >= 1e9:
-            unit, cval, sval = "GHz", center / 1e9, half / 1e9
-        elif ref_hz >= 1e6:
-            unit, cval, sval = "MHz", center / 1e6, half / 1e6
-        elif ref_hz >= 1e3:
-            unit, cval, sval = "kHz", center / 1e3, half / 1e3
-        else:
-            unit, cval, sval = "Hz", center, half
+        def pick_unit(hz):
+            a = abs(hz)
+            if a >= 1e9: return "GHz", hz / 1e9
+            if a >= 1e6: return "MHz", hz / 1e6
+            if a >= 1e3: return "kHz", hz / 1e3
+            return "Hz", hz
 
-        self._disp_center._unit.setCurrentText(unit)
-        self._disp_center._spin.setValue(cval)
-        self._disp_span._unit.setCurrentText(unit)
-        self._disp_span._spin.setValue(sval)
+        s_unit, s_val = pick_unit(span)
+        # when center is zero, reuse span's unit so spinbox doesn't overflow
+        c_unit, c_val = (s_unit, 0.0) if center == 0.0 else pick_unit(center)
+
+        self._disp_center._unit.setCurrentText(c_unit)
+        self._disp_center._spin.setValue(c_val)
+        self._disp_span._unit.setCurrentText(s_unit)
+        self._disp_span._spin.setValue(s_val)
         self._disp_amp.setValue(-10.0)
         self._disp_dbdiv.setValue(10.0)
+        self._apply_range()
+
+    def _smart_auto_display(self):
+        """Auto-fit only when the signal is outside the current viewport."""
+        if not self._pipeline_running:
+            return
+        rx  = self._modules.get("receiver")
+        ctx = rx.context if rx else None
+        if ctx is None:
+            QTimer.singleShot(300, self._smart_auto_display)
+            return
+        lo = self._disp_center.value_hz() - self._disp_span.value_hz() / 2
+        hi = self._disp_center.value_hz() + self._disp_span.value_hz() / 2
+        t1 = self._panel1.tone_hz()
+        t2 = self._panel2.tone_hz()
+        if not (lo <= t1 <= hi and lo <= t2 <= hi):
+            self._auto_display()
+
+    def _sync_viewport_to_spinboxes(self, ranges):
+        """Keep X-axis display spinboxes in sync when user pans/zooms the plot."""
+        x_lo, x_hi = ranges[0]
+        if x_hi <= x_lo:
+            return
+        center_hz = (x_lo + x_hi) / 2.0
+        span_hz   = x_hi - x_lo
+
+        def unit_val(hz):
+            a = abs(hz)
+            if a >= 1e9: return "GHz", hz / 1e9
+            if a >= 1e6: return "MHz", hz / 1e6
+            if a >= 1e3: return "kHz", hz / 1e3
+            return "Hz", hz
+
+        c_unit, c_val = unit_val(center_hz)
+        s_unit, s_val = unit_val(span_hz)
+
+        for widget, unit, val in [
+            (self._disp_center, c_unit, c_val),
+            (self._disp_span,   s_unit, s_val),
+        ]:
+            widget._spin.blockSignals(True)
+            widget._unit.blockSignals(True)
+            widget._unit.setCurrentText(unit)
+            widget._spin.setValue(val)
+            widget._spin.blockSignals(False)
+            widget._unit.blockSignals(False)
 
     def closeEvent(self, event):
         self._stop_pipeline()

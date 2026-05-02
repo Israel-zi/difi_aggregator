@@ -16,7 +16,7 @@ if _src not in sys.path:
 
 import threading
 
-from PySide6.QtCore import QTimer
+from PySide6.QtCore import QTimer, Signal
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QGridLayout, QLabel, QDoubleSpinBox, QComboBox, QPushButton,
@@ -31,6 +31,8 @@ UNIT_LABELS = ["Hz", "kHz", "MHz", "GHz"]
 
 
 class FreqInput(QWidget):
+    changed = Signal()
+
     def __init__(self, default_hz: float = 1e6, parent=None):
         super().__init__(parent)
         if default_hz >= 1e9:
@@ -44,7 +46,7 @@ class FreqInput(QWidget):
 
         self._spin = QDoubleSpinBox()
         self._spin.setDecimals(3)
-        self._spin.setRange(0.001, 999_999.999)
+        self._spin.setRange(0.0, 999_999.999)
         self._spin.setValue(val)
         self._spin.setFixedWidth(115)
 
@@ -58,11 +60,16 @@ class FreqInput(QWidget):
         lay.addWidget(self._spin)
         lay.addWidget(self._unit)
 
+        self._spin.valueChanged.connect(self.changed)
+        self._unit.currentIndexChanged.connect(self.changed)
+
     def value_hz(self) -> float:
         return self._spin.value() * UNIT_MUL[self._unit.currentText()]
 
 
 class GeneratorPanel(QGroupBox):
+    changed = Signal()
+
     def __init__(self, n: int, default_tone_hz: float, default_port: int, parent=None):
         super().__init__(f"Generator {n}  —  Stream 0x0000000{n}", parent)
         grid = QGridLayout(self)
@@ -97,7 +104,7 @@ class GeneratorPanel(QGroupBox):
         type_lay.addStretch()
         grid.addWidget(type_w, 1, 1)
 
-        grid.addWidget(QLabel("Tone / Center:"), 2, 0)
+        grid.addWidget(QLabel("RF Frequency:"), 2, 0)
         self._tone = FreqInput(default_hz=default_tone_hz)
         grid.addWidget(self._tone, 2, 1)
 
@@ -125,6 +132,13 @@ class GeneratorPanel(QGroupBox):
         for rb in (self._cw_rb, self._bw_rb, self._off_rb):
             rb.toggled.connect(lambda: self._bw.setEnabled(self._bw_rb.isChecked()))
         self._bw.setEnabled(False)
+
+        for rb in (self._cw_rb, self._bw_rb, self._off_rb):
+            rb.toggled.connect(self.changed)
+        self._tone.changed.connect(self.changed)
+        self._bw.changed.connect(self.changed)
+        self._rf.changed.connect(self.changed)
+        self._amp.valueChanged.connect(self.changed)
 
     def port(self)           -> int:   return self._port.value()
     def signal_type(self)    -> str:
@@ -158,6 +172,8 @@ class TransmitterWindow(QMainWindow):
         self._gen1    = None
         self._gen2    = None
         self._build_ui()
+        self._panel1.changed.connect(self._live_update_generators)
+        self._panel2.changed.connect(self._live_update_generators)
 
     def _build_ui(self):
         central = QWidget()
@@ -219,9 +235,13 @@ class TransmitterWindow(QMainWindow):
         fs       = self._fs.value_hz()
         pkt_rate = fs / self.SAMPLES_PER_PKT
 
+        # Tone field holds absolute RF frequency; generator needs baseband offset
+        tone1_bb = self._panel1.tone_hz() - self._panel1.rf_ref_freq_hz()
+        tone2_bb = self._panel2.tone_hz() - self._panel2.rf_ref_freq_hz()
+
         self._gen1 = DifiGenerator(
             stream_id       = 0x00000001,
-            tone_hz         = self._panel1.tone_hz(),
+            tone_hz         = tone1_bb,
             signal_type     = self._panel1.signal_type(),
             dest_host       = ip,
             dest_port       = self._panel1.port(),
@@ -234,7 +254,7 @@ class TransmitterWindow(QMainWindow):
         )
         self._gen2 = DifiGenerator(
             stream_id       = 0x00000002,
-            tone_hz         = self._panel2.tone_hz(),
+            tone_hz         = tone2_bb,
             signal_type     = self._panel2.signal_type(),
             dest_host       = ip,
             dest_port       = self._panel2.port(),
@@ -292,6 +312,26 @@ class TransmitterWindow(QMainWindow):
         self._status.showMessage(
             f"Gen 1: {c1:,} pkts | Gen 2: {c2:,} pkts"
         )
+
+    def _live_update_generators(self):
+        if not self._running:
+            return
+        if self._gen1:
+            self._gen1.update_params(
+                tone_hz        = self._panel1.tone_hz() - self._panel1.rf_ref_freq_hz(),
+                signal_type    = self._panel1.signal_type(),
+                bandwidth_hz   = self._panel1.bandwidth_hz(),
+                rf_ref_freq_hz = self._panel1.rf_ref_freq_hz(),
+                ref_level_dbm  = self._panel1.amplitude_dbm(),
+            )
+        if self._gen2:
+            self._gen2.update_params(
+                tone_hz        = self._panel2.tone_hz() - self._panel2.rf_ref_freq_hz(),
+                signal_type    = self._panel2.signal_type(),
+                bandwidth_hz   = self._panel2.bandwidth_hz(),
+                rf_ref_freq_hz = self._panel2.rf_ref_freq_hz(),
+                ref_level_dbm  = self._panel2.amplitude_dbm(),
+            )
 
     def closeEvent(self, event):
         self._stop()

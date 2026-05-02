@@ -46,7 +46,7 @@ class FreqInput(QWidget):
 
         self._spin = QDoubleSpinBox()
         self._spin.setDecimals(3)
-        self._spin.setRange(0.001, 999_999.999)
+        self._spin.setRange(0.0, 999_999.999)
         self._spin.setValue(val)
         self._spin.setFixedWidth(115)
 
@@ -207,6 +207,11 @@ class ReceiverWindow(QMainWindow):
         )
         self._plot.addItem(self._ref_line)
 
+        # Keep display spinboxes in sync when user pans/zooms with mouse
+        self._plot.getPlotItem().getViewBox().sigRangeChanged.connect(
+            lambda vb, ranges: self._sync_viewport_to_spinboxes(ranges)
+        )
+
         right_layout.addWidget(self._plot)
         splitter.addWidget(right)
         splitter.setSizes([290, 760])
@@ -231,7 +236,10 @@ class ReceiverWindow(QMainWindow):
         self._start_btn.setEnabled(False)
         self._stop_btn.setEnabled(True)
         self._timer.start()
+        self._apply_range()   # immediately restore Y range and spinbox-tracked X range
         self._status.showMessage(f"Listening on 0.0.0.0:{port}")
+
+        QTimer.singleShot(600, self._auto_display)
 
     def _stop(self):
         if not self._running:
@@ -250,27 +258,10 @@ class ReceiverWindow(QMainWindow):
         if not self._receiver:
             return
 
-        iq = self._receiver.get_iq_snapshot()
-        fs = self._receiver.get_sample_rate()
-        n  = len(iq)
-        if n == 0:
-            return
+        rx  = self._receiver
+        ctx = rx.context
 
-        # RF reference from context — shifts baseband to actual RF frequencies
-        rx     = self._receiver
-        ctx    = rx.context
-        rf_ref = ctx.rf_ref_freq_hz if ctx else 0.0
-
-        # FFT — positive baseband frequencies shifted to RF
-        window = np.hanning(n)
-        X      = np.fft.fft(iq * window)
-        freqs  = np.fft.fftfreq(n, d=1.0 / fs)
-        pos    = freqs >= 0
-        mag_db = 20 * np.log10(np.abs(X[pos]) / n + 1e-12)
-        self._curve.setData(freqs[pos] + rf_ref, mag_db)
-        self._apply_range()
-
-        # stats
+        # Always update counters so the user can see data flowing
         self._lbl_data.setText(f"{rx.data_received:,}")
         self._lbl_ctx.setText(f"{rx.context_received:,}")
         self._lbl_errs.setText(str(rx.parse_errors))
@@ -279,6 +270,28 @@ class ReceiverWindow(QMainWindow):
             self._lbl_fs.setText(f"{ctx.sample_rate_hz / 1e6:.3f} MHz")
             self._lbl_rf.setText(f"{ctx.rf_ref_freq_hz / 1e6:.3f} MHz")
             self._lbl_sid.setText(f"0x{ctx.stream_id:08X}")
+
+        # Wait for context before drawing — RF shift is unknown without it
+        if ctx is None:
+            self._status.showMessage(
+                f"Listening | data={rx.data_received:,} | waiting for context packet…"
+            )
+            return
+
+        rf_ref = ctx.rf_ref_freq_hz
+        fs     = ctx.sample_rate_hz
+
+        iq = rx.get_iq_snapshot()
+        n  = len(iq)
+        if n == 0:
+            return
+
+        # FFT — full complex IQ spectrum (-fs/2 to +fs/2) shifted to RF
+        window = np.hanning(n)
+        X      = np.fft.fftshift(np.fft.fft(iq * window))
+        freqs  = np.fft.fftshift(np.fft.fftfreq(n, d=1.0 / fs)) + rf_ref
+        mag_db = 20 * np.log10(np.abs(X) / n + 1e-12)
+        self._curve.setData(freqs, mag_db)
 
         self._status.showMessage(
             f"Listening | data={rx.data_received:,} | "
@@ -298,27 +311,64 @@ class ReceiverWindow(QMainWindow):
         self._ref_line.setValue(amp_top)
 
     def _auto_display(self):
-        fs     = self._receiver.get_sample_rate() if self._receiver else 10e6
-        half   = fs / 2.0
-        ctx    = self._receiver.context if self._receiver else None
-        rf_ref = ctx.rf_ref_freq_hz if ctx else 0.0
-        center = rf_ref + half / 2.0
+        if not self._receiver:
+            return
+        ctx = self._receiver.context
+        if ctx is None:
+            # Context not yet received — retry after 500 ms
+            QTimer.singleShot(500, self._auto_display)
+            return
+        fs     = ctx.sample_rate_hz
+        rf_ref = ctx.rf_ref_freq_hz
+        center = rf_ref
+        span   = fs
 
-        if center >= 1e9:
-            unit, cval, sval = "GHz", center / 1e9, half / 1e9
-        elif center >= 1e6:
-            unit, cval, sval = "MHz", center / 1e6, half / 1e6
-        elif center >= 1e3:
-            unit, cval, sval = "kHz", center / 1e3, half / 1e3
-        else:
-            unit, cval, sval = "Hz", center, half
+        def pick_unit(hz):
+            a = abs(hz)
+            if a >= 1e9: return "GHz", hz / 1e9
+            if a >= 1e6: return "MHz", hz / 1e6
+            if a >= 1e3: return "kHz", hz / 1e3
+            return "Hz", hz
 
-        self._center._unit.setCurrentText(unit)
-        self._center._spin.setValue(cval)
-        self._span._unit.setCurrentText(unit)
-        self._span._spin.setValue(sval)
+        s_unit, s_val = pick_unit(span)
+        c_unit, c_val = (s_unit, 0.0) if center == 0.0 else pick_unit(center)
+
+        self._center._unit.setCurrentText(c_unit)
+        self._center._spin.setValue(c_val)
+        self._span._unit.setCurrentText(s_unit)
+        self._span._spin.setValue(s_val)
         self._amp_top.setValue(-10.0)
         self._db_div.setValue(10.0)
+        self._apply_range()   # force-apply even if spinbox values didn't change
+
+    def _sync_viewport_to_spinboxes(self, ranges):
+        """Keep X-axis display spinboxes in sync when user pans/zooms the plot."""
+        x_lo, x_hi = ranges[0]
+        if x_hi <= x_lo:
+            return
+        center_hz = (x_lo + x_hi) / 2.0
+        span_hz   = x_hi - x_lo
+
+        def unit_val(hz):
+            a = abs(hz)
+            if a >= 1e9: return "GHz", hz / 1e9
+            if a >= 1e6: return "MHz", hz / 1e6
+            if a >= 1e3: return "kHz", hz / 1e3
+            return "Hz", hz
+
+        c_unit, c_val = unit_val(center_hz)
+        s_unit, s_val = unit_val(span_hz)
+
+        for widget, unit, val in [
+            (self._center, c_unit, c_val),
+            (self._span,   s_unit, s_val),
+        ]:
+            widget._spin.blockSignals(True)
+            widget._unit.blockSignals(True)
+            widget._unit.setCurrentText(unit)
+            widget._spin.setValue(val)
+            widget._spin.blockSignals(False)
+            widget._unit.blockSignals(False)
 
     def closeEvent(self, event):
         self._stop()

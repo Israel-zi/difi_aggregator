@@ -83,9 +83,14 @@ class DifiReceiver:
 
     def stop(self):
         self._stop_evt.set()
-        self._thread.join(timeout=3.0)
-        if self._sock:
-            self._sock.close()
+        # Close socket immediately to unblock recvfrom — no 1-second timeout wait
+        if self._sock is not None:
+            try:
+                self._sock.close()
+            except OSError:
+                pass
+            self._sock = None
+        self._thread.join(timeout=2.0)
         print(
             f"[Receiver] Stopped | "
             f"data={self.data_received} ctx={self.context_received}"

@@ -75,6 +75,12 @@ class PortListener(threading.Thread):
 
     def stop(self):
         self._stop_evt.set()
+        # Close socket immediately to unblock recvfrom — no 1-second timeout wait
+        if self._sock is not None:
+            try:
+                self._sock.close()
+            except OSError:
+                pass
 
     def run(self):
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -91,9 +97,12 @@ class PortListener(threading.Thread):
             except socket.timeout:
                 continue
             except OSError:
-                break   # socket closed
+                break   # socket closed (by stop() or network error)
 
-        self._sock.close()
+        try:
+            self._sock.close()
+        except OSError:
+            pass  # already closed by stop()
         print(f"[Capture] Port {self.port} listener stopped")
 
     def _parse_and_enqueue(self, data: bytes):
