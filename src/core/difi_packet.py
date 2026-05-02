@@ -133,7 +133,7 @@ class DifiDataPacket:
     # ── parse ──────────────────────────────────────────────────────────────
 
     @classmethod
-    def from_bytes(cls, data: bytes) -> "DifiDataPacket":
+    def from_bytes(cls, data: bytes, sample_bit_depth: int = 16) -> "DifiDataPacket":
         """Parse a received UDP payload into a DifiDataPacket."""
         if len(data) < PROLOGUE_WORDS * 4:
             raise ValueError(f"Packet too short: {len(data)} bytes")
@@ -151,27 +151,28 @@ class DifiDataPacket:
         info_class     = (word4 >> 16) & 0xFFFF
         timestamp_int  = word5
         timestamp_frac = (word6 << 32) | word7
-        payload        = cls._unpack_iq_samples(data[PROLOGUE_WORDS * 4:])
+        payload        = cls._unpack_iq_samples(data[PROLOGUE_WORDS * 4:], sample_bit_depth)
 
         return cls(
-            stream_id      = stream_id,
-            seq_num        = seq_num,
-            timestamp_int  = timestamp_int,
-            timestamp_frac = timestamp_frac,
-            payload        = payload,
-            info_class     = info_class,
-            tsi            = tsi,
-            tsf            = tsf,
+            stream_id        = stream_id,
+            seq_num          = seq_num,
+            timestamp_int    = timestamp_int,
+            timestamp_frac   = timestamp_frac,
+            payload          = payload,
+            sample_bit_depth = sample_bit_depth,
+            info_class       = info_class,
+            tsi              = tsi,
+            tsf              = tsf,
         )
 
     @staticmethod
-    def _unpack_iq_samples(payload_bytes: bytes) -> np.ndarray:
+    def _unpack_iq_samples(payload_bytes: bytes, sample_bit_depth: int = 16) -> np.ndarray:
         """Unpack interleaved int16 IQ bytes into complex64 array."""
         n = len(payload_bytes) // 2
         if n == 0:
             return np.array([], dtype=np.complex64)
         raw       = np.frombuffer(payload_bytes[:n * 2], dtype=np.int16)
-        scale     = 32767.0
+        scale     = float((2 ** (sample_bit_depth - 1)) - 1)
         i_samples = raw[0::2].astype(np.float32) / scale
         q_samples = raw[1::2].astype(np.float32) / scale
         return (i_samples + 1j * q_samples).astype(np.complex64)

@@ -13,6 +13,7 @@ Each port corresponds to one DIFI stream:
 """
 
 import socket
+import struct
 import threading
 import queue
 import time
@@ -131,9 +132,6 @@ class PortListener(threading.Thread):
 # ─────────────────────────────────────────────
 # Multi-port capture manager
 # ─────────────────────────────────────────────
-
-import struct   # noqa: E402  (imported here to avoid circular reference above)
-
 
 class InputCapture:
     """

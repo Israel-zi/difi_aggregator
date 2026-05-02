@@ -238,6 +238,10 @@ class Aggregator:
             for sid, buf in self._buffers.items()
         }
 
+    def stream_last_seen(self) -> dict:
+        """Return {stream_id: last_update monotonic time} for all known streams."""
+        return {sid: buf.last_update for sid, buf in self._buffers.items()}
+
 
 # ─────────────────────────────────────────────
 # Quick self-test (standalone)

@@ -105,7 +105,8 @@ class GeneratorPanel(QGroupBox):
         self._amp.setSuffix(" dBm")
         grid.addWidget(self._amp, 4, 1)
 
-        self._cw_rb.toggled.connect(lambda: self._bw.setEnabled(self._bw_rb.isChecked()))
+        for rb in (self._cw_rb, self._bw_rb, self._off_rb):
+            rb.toggled.connect(lambda: self._bw.setEnabled(self._bw_rb.isChecked()))
         self._bw.setEnabled(False)
 
     def signal_type(self)    -> str:   return SIGNAL_CW if self._cw_rb.isChecked() else (SIGNAL_BW if self._bw_rb.isChecked() else "OFF")

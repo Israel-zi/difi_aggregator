@@ -22,6 +22,7 @@ Aggregation strategy for the unified stream
 import queue
 import time
 import threading
+import numpy as np
 
 from core.difi_packet import (
     DifiDataPacket,
@@ -38,7 +39,7 @@ from modules.aggregator import Aggregator, AggregatedChunk
 # ─────────────────────────────────────────────
 
 UNIFIED_STREAM_ID      = 0xAA000000   # aggregated stream ID
-CONTEXT_INTERVAL_PKTS  = 10                                      # context every N data pkts
+CONTEXT_MIN_INTERVAL_S = 0.05         # max 20 context packets/s per DIFI standard (Section 4.3.1)
 
 
 # ─────────────────────────────────────────────
@@ -73,7 +74,7 @@ class Packetizer:
 
         self._data_seq         = 0
         self._ctx_seq          = 0
-        self._pkt_count        = 0
+        self._last_ctx_time    = 0.0   # 0 ensures context is sent before the first data packet
 
         # stats
         self.packets_produced  = 0
@@ -132,12 +133,7 @@ class Packetizer:
         return ctx.to_bytes()
 
     def _build_data(self, chunk: AggregatedChunk) -> bytes:
-        """Concatenate all stream payloads and pack into one Data packet."""
-        import numpy as np
-
-        # interleave: [stream0_s0, stream1_s0, stream0_s1, stream1_s1, ...]
-        # or simply concatenate for PoC — preserves each carrier in sequence
-        combined = np.concatenate([s.samples for s in chunk.streams])
+        combined = sum(s.samples for s in chunk.streams)
 
         ts_int, ts_frac = now_timestamp()
 
@@ -161,13 +157,13 @@ class Packetizer:
             if chunk is None:
                 continue
 
-            # periodic context packet
-            ctx_bytes  = None
-            if self._pkt_count % CONTEXT_INTERVAL_PKTS == 0:
+            now       = time.monotonic()
+            ctx_bytes = None
+            if (now - self._last_ctx_time) >= CONTEXT_MIN_INTERVAL_S:
                 ctx_bytes = self._build_context(chunk)
+                self._last_ctx_time = now
 
             data_bytes = self._build_data(chunk)
-            self._pkt_count += 1
 
             try:
                 self._out_queue.put_nowait((ctx_bytes, data_bytes))

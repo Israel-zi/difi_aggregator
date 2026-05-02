@@ -21,7 +21,7 @@ from core.difi_packet import (
     TSF_REAL_TIME,
 )
 
-CONTEXT_INTERVAL_PKTS = 10
+CONTEXT_MIN_INTERVAL_S = 0.05   # max 20 context packets/s per DIFI standard (Section 4.3.1)
 SIGNAL_CW  = "CW"
 SIGNAL_BW  = "BW"
 SIGNAL_OFF = "OFF"
@@ -71,14 +71,15 @@ class DifiGenerator:
         self.bandwidth_hz    = bandwidth_hz
         self.ref_level_dbm   = ref_level_dbm
 
-        self._sock      = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self._data_seq  = 0
-        self._ctx_seq   = 0
-        self._pkt_count = 0
-        self._phase     = 0.0
-        self._running   = True
-        self._bw_filter = None
-        self._bw_zi     = None
+        self._sock          = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self._data_seq      = 0
+        self._ctx_seq       = 0
+        self._pkt_count     = 0
+        self._phase         = 0.0
+        self._running       = True
+        self._bw_filter     = None
+        self._bw_zi         = None
+        self._last_ctx_time = 0.0   # 0 ensures context is sent before the first data packet
 
         self._build_bw_filter()
 
@@ -95,8 +96,8 @@ class DifiGenerator:
         high = min((fc + bw / 2) / nyq, 1 - 1e-6)
 
         if low >= high or low <= 0 or high >= 1:
-            # fallback: lowpass at BW/2
-            self._bw_filter = scipy_signal.firwin(101, bw / nyq)
+            # fallback: lowpass at BW/2, clamped so firwin doesn't raise
+            self._bw_filter = scipy_signal.firwin(101, min(bw / nyq, 0.999))
         else:
             self._bw_filter = scipy_signal.firwin(
                 101, [low, high], pass_zero=False
@@ -223,8 +224,10 @@ class DifiGenerator:
             self._build_bw_filter()
 
     def send_one_packet(self):
-        if self._pkt_count % CONTEXT_INTERVAL_PKTS == 0:
+        now = time.monotonic()
+        if (now - self._last_ctx_time) >= CONTEXT_MIN_INTERVAL_S:
             self._sock.sendto(self._make_context(), self.dest)
+            self._last_ctx_time = now
 
         samples = self._generate_samples()
         self._sock.sendto(self._make_data(samples), self.dest)

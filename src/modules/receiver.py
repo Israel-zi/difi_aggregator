@@ -125,12 +125,13 @@ class DifiReceiver:
 
         try:
             if pkt_type == PACKET_TYPE_DATA:
-                pkt = DifiDataPacket.from_bytes(data)
+                bit_depth = self.context.sample_bit_depth if self.context else 16
+                pkt = DifiDataPacket.from_bytes(data, sample_bit_depth=bit_depth)
                 self._update_buffer(pkt.payload)
                 self.data_received += 1
 
             elif pkt_type == PACKET_TYPE_CONTEXT:
-                pkt         = DifiContextPacket.from_bytes(data)
+                pkt          = DifiContextPacket.from_bytes(data)
                 self.context = pkt
                 self.context_received += 1
 

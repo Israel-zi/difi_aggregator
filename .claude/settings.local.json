@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(Get-ChildItem *)",
+      "Bash(xargs -I {} basename {})",
+      "PowerShell(& \"C:\\\\Users\\\\276709\\\\PycharmProjects\\\\difi_aggregator\\\\.venv\\\\Scripts\\\\python.exe\" -c \"import pypdf; print\\('ok'\\)\" 2>&1)",
+      "PowerShell(& \"C:\\\\Users\\\\276709\\\\PycharmProjects\\\\difi_aggregator\\\\.venv\\\\Scripts\\\\python.exe\" -c \"import pdfplumber; print\\('ok'\\)\" 2>&1)",
+      "PowerShell(& \"C:\\\\Users\\\\276709\\\\PycharmProjects\\\\difi_aggregator\\\\.venv\\\\Scripts\\\\python.exe\" -c \"import fitz; print\\('ok'\\)\" 2>&1)",
+      "PowerShell(& \"C:\\\\Users\\\\276709\\\\PycharmProjects\\\\difi_aggregator\\\\.venv\\\\Scripts\\\\python.exe\" -c \"import pdfminer; print\\('ok'\\)\" 2>&1)",
+      "PowerShell(& \"C:\\\\Users\\\\276709\\\\PycharmProjects\\\\difi_aggregator\\\\.venv\\\\Scripts\\\\pip.exe\" install pypdf --quiet)",
+      "Bash(pip show *)"
+    ]
+  }
+}
