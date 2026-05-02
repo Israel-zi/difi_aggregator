@@ -16,7 +16,7 @@ if _src not in sys.path:
 
 import numpy as np
 
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QGridLayout, QLabel, QDoubleSpinBox, QComboBox, QPushButton,
@@ -31,6 +31,8 @@ UNIT_LABELS = ["Hz", "kHz", "MHz", "GHz"]
 
 
 class FreqInput(QWidget):
+    changed = Signal()
+
     def __init__(self, default_hz: float = 1e6, parent=None):
         super().__init__(parent)
         if default_hz >= 1e9:
@@ -57,6 +59,9 @@ class FreqInput(QWidget):
         lay.setContentsMargins(0, 0, 0, 0)
         lay.addWidget(self._spin)
         lay.addWidget(self._unit)
+
+        self._spin.valueChanged.connect(self.changed)
+        self._unit.currentIndexChanged.connect(self.changed)
 
     def value_hz(self) -> float:
         return self._spin.value() * UNIT_MUL[self._unit.currentText()]
@@ -135,6 +140,12 @@ class ReceiverWindow(QMainWindow):
         auto_btn = QPushButton("Auto")
         auto_btn.clicked.connect(self._auto_display)
         disp_grid.addWidget(auto_btn, 4, 0, 1, 2)
+
+        self._center.changed.connect(self._apply_range)
+        self._span.changed.connect(self._apply_range)
+        self._amp_top.valueChanged.connect(self._apply_range)
+        self._db_div.valueChanged.connect(self._apply_range)
+
         left_layout.addWidget(disp_box)
 
         # Statistics
@@ -245,30 +256,25 @@ class ReceiverWindow(QMainWindow):
         if n == 0:
             return
 
-        # FFT — positive frequencies only
+        # RF reference from context — shifts baseband to actual RF frequencies
+        rx     = self._receiver
+        ctx    = rx.context
+        rf_ref = ctx.rf_ref_freq_hz if ctx else 0.0
+
+        # FFT — positive baseband frequencies shifted to RF
         window = np.hanning(n)
         X      = np.fft.fft(iq * window)
         freqs  = np.fft.fftfreq(n, d=1.0 / fs)
         pos    = freqs >= 0
         mag_db = 20 * np.log10(np.abs(X[pos]) / n + 1e-12)
-        self._curve.setData(freqs[pos], mag_db)
-
-        # display range
-        center  = self._center.value_hz()
-        span    = self._span.value_hz()
-        amp_top = self._amp_top.value()
-        db_div  = self._db_div.value()
-        self._plot.setXRange(max(0, center - span / 2), center + span / 2, padding=0)
-        self._plot.setYRange(amp_top - db_div * 10, amp_top, padding=0)
-        self._ref_line.setValue(amp_top)
+        self._curve.setData(freqs[pos] + rf_ref, mag_db)
+        self._apply_range()
 
         # stats
-        rx = self._receiver
         self._lbl_data.setText(f"{rx.data_received:,}")
         self._lbl_ctx.setText(f"{rx.context_received:,}")
         self._lbl_errs.setText(str(rx.parse_errors))
 
-        ctx = rx.context
         if ctx:
             self._lbl_fs.setText(f"{ctx.sample_rate_hz / 1e6:.3f} MHz")
             self._lbl_rf.setText(f"{ctx.rf_ref_freq_hz / 1e6:.3f} MHz")
@@ -277,19 +283,35 @@ class ReceiverWindow(QMainWindow):
         self._status.showMessage(
             f"Listening | data={rx.data_received:,} | "
             f"fs={fs / 1e6:.3f} MHz"
+            + (f" | RF={rf_ref/1e6:.3f} MHz" if rf_ref else "")
         )
 
     # ── helpers ────────────────────────────────────────────────────────────
 
+    def _apply_range(self):
+        center  = self._center.value_hz()
+        span    = self._span.value_hz()
+        amp_top = self._amp_top.value()
+        db_div  = self._db_div.value()
+        self._plot.setXRange(center - span / 2, center + span / 2, padding=0)
+        self._plot.setYRange(amp_top - db_div * 10, amp_top, padding=0)
+        self._ref_line.setValue(amp_top)
+
     def _auto_display(self):
-        fs   = self._receiver.get_sample_rate() if self._receiver else 10e6
-        half = fs / 2.0
-        if half >= 1e6:
-            unit, cval, sval = "MHz", (half / 2) / 1e6, half / 1e6
-        elif half >= 1e3:
-            unit, cval, sval = "kHz", (half / 2) / 1e3, half / 1e3
+        fs     = self._receiver.get_sample_rate() if self._receiver else 10e6
+        half   = fs / 2.0
+        ctx    = self._receiver.context if self._receiver else None
+        rf_ref = ctx.rf_ref_freq_hz if ctx else 0.0
+        center = rf_ref + half / 2.0
+
+        if center >= 1e9:
+            unit, cval, sval = "GHz", center / 1e9, half / 1e9
+        elif center >= 1e6:
+            unit, cval, sval = "MHz", center / 1e6, half / 1e6
+        elif center >= 1e3:
+            unit, cval, sval = "kHz", center / 1e3, half / 1e3
         else:
-            unit, cval, sval = "Hz", half / 2, half
+            unit, cval, sval = "Hz", center, half
 
         self._center._unit.setCurrentText(unit)
         self._center._spin.setValue(cval)

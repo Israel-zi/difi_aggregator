@@ -86,24 +86,16 @@ class DifiGenerator:
     # ── signal generation ──────────────────────────────────────────────────
 
     def _build_bw_filter(self):
-        """Build a bandpass FIR filter for BW mode."""
-        fs    = self.sample_rate_hz
-        nyq   = fs / 2.0
-        bw    = self.bandwidth_hz
-        fc    = self.tone_hz
+        """Build a lowpass FIR filter for BW mode.
 
-        low  = max((fc - bw / 2) / nyq, 1e-6)
-        high = min((fc + bw / 2) / nyq, 1 - 1e-6)
+        _generate_bw mixes the filtered noise up to tone_hz, so the filter
+        only needs to define the bandwidth — a lowpass at BW/2 is correct.
+        A bandpass at tone_hz here would double-shift the signal to 2*tone_hz.
+        """
+        nyq    = self.sample_rate_hz / 2.0
+        cutoff = max(min(self.bandwidth_hz / 2.0 / nyq, 0.499), 1e-4)
+        self._bw_filter = scipy_signal.firwin(101, cutoff)
 
-        if low >= high or low <= 0 or high >= 1:
-            # fallback: lowpass at BW/2, clamped so firwin doesn't raise
-            self._bw_filter = scipy_signal.firwin(101, min(bw / nyq, 0.999))
-        else:
-            self._bw_filter = scipy_signal.firwin(
-                101, [low, high], pass_zero=False
-            )
-
-        # init filter state
         zi = scipy_signal.lfilter_zi(self._bw_filter, [1.0])
         self._bw_zi_i = zi * 0
         self._bw_zi_q = zi * 0
@@ -123,7 +115,7 @@ class DifiGenerator:
         return sig
 
     def _generate_bw(self) -> np.ndarray:
-        """Generate one packet of bandpass-filtered AWGN centered at tone_hz."""
+        """Generate one packet of lowpass-filtered AWGN mixed up to tone_hz."""
         n   = self.samples_per_pkt
         amp = 10 ** (self.ref_level_dbm / 20.0)
 

@@ -9,7 +9,7 @@ import threading
 import time
 
 import numpy as np
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
     QLabel, QDoubleSpinBox, QComboBox, QPushButton, QGroupBox,
@@ -30,6 +30,8 @@ UNIT_LABELS = ["Hz", "kHz", "MHz", "GHz"]
 
 
 class FreqInput(QWidget):
+    changed = Signal()
+
     def __init__(self, default_hz: float = 1e6, parent=None):
         super().__init__(parent)
         if default_hz >= 1e9:
@@ -56,6 +58,9 @@ class FreqInput(QWidget):
         lay.setContentsMargins(0, 0, 0, 0)
         lay.addWidget(self._spin)
         lay.addWidget(self._unit)
+
+        self._spin.valueChanged.connect(self.changed)
+        self._unit.currentIndexChanged.connect(self.changed)
 
     def value_hz(self) -> float:
         return self._spin.value() * UNIT_MUL[self._unit.currentText()]
@@ -240,6 +245,12 @@ class MainWindow(QMainWindow):
         row2.addStretch()
         vlay.addLayout(row2)
 
+        # apply range immediately whenever any display control changes
+        self._disp_center.changed.connect(self._apply_range)
+        self._disp_span.changed.connect(self._apply_range)
+        self._disp_amp.valueChanged.connect(self._apply_range)
+        self._disp_dbdiv.valueChanged.connect(self._apply_range)
+
         return box
 
     def _build_buttons(self) -> QWidget:
@@ -315,7 +326,6 @@ class MainWindow(QMainWindow):
         threading.Thread(target=gen1.run, kwargs=dict(packet_rate_hz=pkt_rate), daemon=True).start()
         threading.Thread(target=gen2.run, kwargs=dict(packet_rate_hz=pkt_rate), daemon=True).start()
 
-        self._auto_display()
         self._pipeline_running = True
         self._start_btn.setEnabled(False)
         self._stop_btn.setEnabled(True)
@@ -354,47 +364,57 @@ class MainWindow(QMainWindow):
         if n == 0:
             return
 
-        # FFT — positive frequencies only (0 to Fs/2)
+        # RF reference from context packet — shifts baseband to actual RF frequencies
+        ctx    = rx.context
+        rf_ref = ctx.rf_ref_freq_hz if ctx else 0.0
+
+        # FFT — positive baseband frequencies shifted to RF
         window  = np.hanning(n)
         X       = np.fft.fft(iq * window)
         freqs   = np.fft.fftfreq(n, d=1.0 / fs)
         pos     = freqs >= 0
-        freqs   = freqs[pos]
+        freqs   = freqs[pos] + rf_ref          # baseband → RF
         mag_db  = 20 * np.log10(np.abs(X[pos]) / n + 1e-12)
 
         self._curve.setData(freqs, mag_db)
+        self._apply_range()
 
-        # apply display controls
+        agg = self._modules.get("aggregator")
+        rf_str = f" | RF={rf_ref/1e6:.3f} MHz" if rf_ref else ""
+        self._status.showMessage(
+            f"Running — fs={fs/1e6:.3f} MHz{rf_str} | "
+            f"data={rx.data_received}  chunks={agg.chunks_emitted if agg else 0}"
+        )
+
+    def _apply_range(self):
         center  = self._disp_center.value_hz()
         span    = self._disp_span.value_hz()
         amp_top = self._disp_amp.value()
         db_div  = self._disp_dbdiv.value()
-        amp_bot = amp_top - db_div * 10
-
-        self._plot.setXRange(max(0, center - span / 2), center + span / 2, padding=0)
-        self._plot.setYRange(amp_bot, amp_top, padding=0)
-        self._plot.getViewBox().setAutoPan(x=False, y=False)
+        self._plot.setXRange(center - span / 2, center + span / 2, padding=0)
+        self._plot.setYRange(amp_top - db_div * 10, amp_top, padding=0)
         self._ref_line.setValue(amp_top)
 
-        agg = self._modules.get("aggregator")
-        self._status.showMessage(
-            f"Running — fs={fs/1e6:.3f}MHz | "
-            f"center={center/1e6:.3f}MHz  span={span/1e6:.3f}MHz | "
-            f"data={rx.data_received}  chunks={agg.chunks_emitted if agg else 0}"
-        )
-
     def _auto_display(self):
-        """Set display to show 0..Fs/2 based on current shared sample rate."""
-        fs   = self._shared_fs.value_hz()
-        half = fs / 2.0
+        """Fit display to rf_ref .. rf_ref + Fs/2 based on current context."""
+        fs     = self._shared_fs.value_hz()
+        half   = fs / 2.0
+        rx     = self._modules.get("receiver")
+        ctx    = rx.context if rx else None
+        rf_ref = ctx.rf_ref_freq_hz if ctx else 0.0
 
-        # pick best unit
-        if half >= 1e6:
-            unit, cval, sval = "MHz", (half / 2) / 1e6, half / 1e6
-        elif half >= 1e3:
-            unit, cval, sval = "kHz", (half / 2) / 1e3, half / 1e3
+        center = rf_ref + half / 2.0   # mid-point of the positive baseband
+
+        # pick best display unit
+        ref_hz = center
+        if ref_hz >= 1e9:
+            unit, cval, sval = "GHz", center / 1e9, half / 1e9
+        elif ref_hz >= 1e6:
+            unit, cval, sval = "MHz", center / 1e6, half / 1e6
+        elif ref_hz >= 1e3:
+            unit, cval, sval = "kHz", center / 1e3, half / 1e3
         else:
-            unit, cval, sval = "Hz", half / 2, half
+            unit, cval, sval = "Hz", center, half
 
         self._disp_center._unit.setCurrentText(unit)
         self._disp_center._spin.setValue(cval)
