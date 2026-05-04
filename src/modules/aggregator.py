@@ -130,7 +130,7 @@ class Aggregator:
         capture: InputCapture,
         expected_streams: list,
         chunk_size: int       = 1024,
-        out_queue_size: int   = 100,
+        out_queue_size: int   = 8,
         stale_timeout: float  = 5.0,
     ):
         self._capture          = capture

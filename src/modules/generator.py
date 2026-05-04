@@ -97,8 +97,7 @@ class DifiGenerator:
         self._bw_filter = scipy_signal.firwin(101, cutoff)
 
         zi = scipy_signal.lfilter_zi(self._bw_filter, [1.0])
-        self._bw_zi_i = zi * 0
-        self._bw_zi_q = zi * 0
+        self._bw_zi = zi * 0
 
     def _generate_cw(self) -> np.ndarray:
         """Generate one packet of pure CW (complex sinusoid)."""
@@ -115,21 +114,24 @@ class DifiGenerator:
         return sig
 
     def _generate_bw(self) -> np.ndarray:
-        """Generate one packet of lowpass-filtered AWGN mixed up to tone_hz."""
+        """Generate one packet of bandlimited complex noise centered at tone_hz.
+
+        Uses a single real noise source → lowpass filter → Hilbert transform to
+        produce an analytic (single-sideband) baseband signal before mixing.
+        This eliminates the mirror image at -tone_hz that the old dual-channel
+        approach produced.
+        """
         n   = self.samples_per_pkt
         amp = 10 ** (self.ref_level_dbm / 20.0)
 
-        # white noise
-        noise_i = np.random.randn(n).astype(np.float32)
-        noise_q = np.random.randn(n).astype(np.float32)
+        # real AWGN → lowpass filter (state-continuous across packets)
+        noise = np.random.randn(n).astype(np.float32)
+        filt, self._bw_zi = scipy_signal.lfilter(
+            self._bw_filter, [1.0], noise, zi=self._bw_zi
+        )
 
-        # apply bandpass filter with state continuity
-        filt_i, self._bw_zi_i = scipy_signal.lfilter(
-            self._bw_filter, [1.0], noise_i, zi=self._bw_zi_i
-        )
-        filt_q, self._bw_zi_q = scipy_signal.lfilter(
-            self._bw_filter, [1.0], noise_q, zi=self._bw_zi_q
-        )
+        # analytic signal: energy at positive frequencies only → no mirror image
+        baseband = scipy_signal.hilbert(filt).astype(np.complex64)
 
         # shift to center frequency
         t   = np.arange(n) / self.sample_rate_hz
@@ -138,8 +140,7 @@ class DifiGenerator:
             self._phase + 2.0 * np.pi * self.tone_hz * n / self.sample_rate_hz
         ) % (2.0 * np.pi)
 
-        sig = amp * (filt_i + 1j * filt_q) * mix
-        return sig.astype(np.complex64)
+        return (amp * baseband * mix).astype(np.complex64)
 
     def _generate_samples(self) -> np.ndarray:
         if self.signal_type == SIGNAL_OFF:
@@ -199,7 +200,7 @@ class DifiGenerator:
         rebuild_filter = False
         if tone_hz is not None:
             self.tone_hz = tone_hz
-            rebuild_filter = True
+            # tone does not affect the lowpass BW filter — no rebuild needed
         if signal_type is not None:
             self.signal_type = signal_type
         if bandwidth_hz is not None:

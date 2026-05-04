@@ -278,6 +278,7 @@ class TransmitterWindow(QMainWindow):
         ).start()
 
         self._running = True
+        self._fs.setEnabled(False)          # lock sample rate while running
         self._start_btn.setEnabled(False)
         self._stop_btn.setEnabled(True)
         self._timer.start()
@@ -298,6 +299,7 @@ class TransmitterWindow(QMainWindow):
         self._panel1.set_status(False)
         self._panel2.set_status(False)
         self._running = False
+        self._fs.setEnabled(True)           # unlock sample rate
         self._start_btn.setEnabled(True)
         self._stop_btn.setEnabled(False)
         self._status.showMessage("Stopped")

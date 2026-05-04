@@ -62,7 +62,7 @@ class Packetizer:
         self,
         aggregator: Aggregator,
         unified_stream_id: int = UNIFIED_STREAM_ID,
-        out_queue_size: int    = 200,
+        out_queue_size: int    = 8,
     ):
         self._aggregator       = aggregator
         self._stream_id        = unified_stream_id

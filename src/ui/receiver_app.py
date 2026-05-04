@@ -197,9 +197,11 @@ class ReceiverWindow(QMainWindow):
         self._plot.setLabel("left",   "Magnitude", units="dB")
         self._plot.showGrid(x=True, y=True, alpha=0.3)
         self._plot.enableAutoRange(axis="xy", enable=False)
+        self._plot.getPlotItem().getViewBox().enableAutoRange(enable=False)
         self._plot.setYRange(-110, -10, padding=0)
         self._plot.setXRange(0, 5e6, padding=0)
         self._curve = self._plot.plot([], [], pen=pg.mkPen("c", width=1))
+        self._y_range_applied = False
 
         self._ref_line = pg.InfiniteLine(
             angle=0, movable=False,
@@ -233,6 +235,7 @@ class ReceiverWindow(QMainWindow):
         self._receiver = DifiReceiver(port=port)
         self._receiver.start()
         self._running = True
+        self._y_range_applied = False
         self._start_btn.setEnabled(False)
         self._stop_btn.setEnabled(True)
         self._timer.start()
@@ -290,8 +293,12 @@ class ReceiverWindow(QMainWindow):
         window = np.hanning(n)
         X      = np.fft.fftshift(np.fft.fft(iq * window))
         freqs  = np.fft.fftshift(np.fft.fftfreq(n, d=1.0 / fs)) + rf_ref
-        mag_db = 20 * np.log10(np.abs(X) / n + 1e-12)
+        mag_db = 20 * np.log10(np.abs(X) / n + 1e-7)
         self._curve.setData(freqs, mag_db)
+
+        if not self._y_range_applied:
+            self._apply_range()
+            self._y_range_applied = True
 
         self._status.showMessage(
             f"Listening | data={rx.data_received:,} | "

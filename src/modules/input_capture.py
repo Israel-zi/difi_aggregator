@@ -164,7 +164,7 @@ class InputCapture:
         self,
         ports: list,
         host: str        = "0.0.0.0",
-        queue_maxsize: int = 1000,
+        queue_maxsize: int = 30,
     ):
         self._out_queue = queue.Queue(maxsize=queue_maxsize)
         self._listeners = [

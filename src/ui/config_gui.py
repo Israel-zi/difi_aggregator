@@ -12,7 +12,7 @@ import numpy as np
 from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
-    QLabel, QDoubleSpinBox, QComboBox, QPushButton, QGroupBox,
+    QLabel, QDoubleSpinBox, QSpinBox, QComboBox, QPushButton, QGroupBox,
     QStatusBar, QMainWindow, QSplitter, QButtonGroup, QRadioButton,
     QFrame,
 )
@@ -145,6 +145,15 @@ class MainWindow(QMainWindow):
         self.setMinimumSize(1100, 700)
         self._pipeline_running = False
         self._modules          = {}
+
+        # sweep state
+        self._sweep_active             = False
+        self._sweep_positions          = np.array([])
+        self._sweep_pos_idx            = 0
+        self._sweep_composite_freqs    = np.array([])
+        self._sweep_composite_data_raw = np.array([])
+        self._sweep_sort_idx           = np.array([], dtype=int)
+
         self._build_ui()
         self._panel1.changed.connect(self._live_update_generators)
         self._panel2.changed.connect(self._live_update_generators)
@@ -189,9 +198,11 @@ class MainWindow(QMainWindow):
         self._plot.setLabel("left",   "Magnitude", units="dB")
         self._plot.showGrid(x=True, y=True, alpha=0.3)
         self._plot.enableAutoRange(axis="xy", enable=False)
+        self._plot.getPlotItem().getViewBox().enableAutoRange(enable=False)
         self._plot.setYRange(-110, -10, padding=0)
         self._plot.setXRange(0, 5e6, padding=0)
         self._curve = self._plot.plot([], [], pen=pg.mkPen("c", width=1))
+        self._y_range_applied = False   # re-enforce Y after first real data
 
         # reference line at amplitude level
         self._ref_line = pg.InfiniteLine(
@@ -362,6 +373,8 @@ class MainWindow(QMainWindow):
         threading.Thread(target=gen2.run, kwargs=dict(packet_rate_hz=pkt_rate), daemon=True).start()
 
         self._pipeline_running = True
+        self._y_range_applied  = False      # will re-enforce Y after first real data
+        self._shared_fs.setEnabled(False)   # lock sample rate while running
         self._start_btn.setEnabled(False)
         self._stop_btn.setEnabled(True)
         self._timer.start()
@@ -388,6 +401,7 @@ class MainWindow(QMainWindow):
         m["gen1"].close()
         m["gen2"].close()
         self._pipeline_running = False
+        self._shared_fs.setEnabled(True)    # unlock sample rate
         self._start_btn.setEnabled(True)
         self._stop_btn.setEnabled(False)
         self._status.showMessage("Stopped")
@@ -411,9 +425,17 @@ class MainWindow(QMainWindow):
         window  = np.hanning(n)
         X       = np.fft.fftshift(np.fft.fft(iq * window))
         freqs   = np.fft.fftshift(np.fft.fftfreq(n, d=1.0 / fs)) + rf_ref
-        mag_db  = 20 * np.log10(np.abs(X) / n + 1e-12)
+        # floor at -140 dB (1e-7) — avoids the extreme -240 dB floor that
+        # comes from 1e-12 and forces pyqtgraph to auto-expand the Y axis
+        mag_db  = 20 * np.log10(np.abs(X) / n + 1e-7)
 
         self._curve.setData(freqs, mag_db)
+
+        # Re-enforce the configured Y range once after the first real data
+        # arrives — pyqtgraph can auto-range on the empty→data transition
+        if not self._y_range_applied:
+            self._apply_range()
+            self._y_range_applied = True
 
         agg = self._modules.get("aggregator")
         rf_str = f" | RF={rf_ref/1e6:.3f} MHz" if rf_ref else ""
@@ -444,6 +466,9 @@ class MainWindow(QMainWindow):
             rf_ref_freq_hz = p2.rf_ref_freq_hz(),
             ref_level_dbm  = p2.amplitude_dbm(),
         )
+        rx = self._modules.get("receiver")
+        if rx:
+            rx.flush()   # clear stale IQ so display refreshes on the next tick
 
     def _apply_range(self):
         center  = self._disp_center.value_hz()

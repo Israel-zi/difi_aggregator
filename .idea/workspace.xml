@@ -6,7 +6,10 @@
   <component name="ChangeListManager">
     <list default="true" id="501509db-c9de-4eb9-b574-ffa1c3e6a775" name="Changes" comment="initial project structure">
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/modules/aggregator.py" beforeDir="false" afterPath="$PROJECT_DIR$/src/modules/aggregator.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/modules/generator.py" beforeDir="false" afterPath="$PROJECT_DIR$/src/modules/generator.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/src/modules/input_capture.py" beforeDir="false" afterPath="$PROJECT_DIR$/src/modules/input_capture.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/modules/packetizer.py" beforeDir="false" afterPath="$PROJECT_DIR$/src/modules/packetizer.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/src/modules/receiver.py" beforeDir="false" afterPath="$PROJECT_DIR$/src/modules/receiver.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/src/ui/config_gui.py" beforeDir="false" afterPath="$PROJECT_DIR$/src/ui/config_gui.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/src/ui/receiver_app.py" beforeDir="false" afterPath="$PROJECT_DIR$/src/ui/receiver_app.py" afterDir="false" />
@@ -81,7 +84,7 @@
     &quot;node.js.selected.package.eslint&quot;: &quot;(autodetect)&quot;,
     &quot;node.js.selected.package.tslint&quot;: &quot;(autodetect)&quot;,
     &quot;nodejs_package_manager_path&quot;: &quot;npm&quot;,
-    &quot;settings.editor.selected.configurable&quot;: &quot;preferences.pluginManager&quot;,
+    &quot;settings.editor.selected.configurable&quot;: &quot;advanced.settings&quot;,
     &quot;to.speed.mode.migration.done&quot;: &quot;true&quot;,
     &quot;vue.rearranger.settings.migration&quot;: &quot;true&quot;
   },
@@ -173,7 +176,9 @@
       <workItem from="1777708671686" duration="255000" />
       <workItem from="1777708941512" duration="209000" />
       <workItem from="1777709168971" duration="9813000" />
-      <workItem from="1777748203915" duration="4875000" />
+      <workItem from="1777748203915" duration="4901000" />
+      <workItem from="1777919363886" duration="55000" />
+      <workItem from="1777919449091" duration="5213000" />
     </task>
     <task id="LOCAL-00001" summary="initial project structure">
       <option name="closed" value="true" />
@@ -239,7 +244,15 @@
       <option name="project" value="LOCAL" />
       <updated>1777728572378</updated>
     </task>
-    <option name="localTasksCounter" value="9" />
+    <task id="LOCAL-00009" summary="initial project structure">
+      <option name="closed" value="true" />
+      <created>1777753456377</created>
+      <option name="number" value="00009" />
+      <option name="presentableId" value="LOCAL-00009" />
+      <option name="project" value="LOCAL" />
+      <updated>1777753456377</updated>
+    </task>
+    <option name="localTasksCounter" value="10" />
     <servers />
   </component>
   <component name="TypeScriptGeneratedFilesManager">
@@ -252,7 +265,7 @@
   <component name="com.intellij.coverage.CoverageDataManagerImpl">
     <SUITE FILE_PATH="coverage/difi_aggregator$difi_packet.coverage" NAME="difi_packet Coverage Results" MODIFIED="1777666628381" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/src/core" />
     <SUITE FILE_PATH="coverage/difi_aggregator$config_gui.coverage" NAME="config_gui Coverage Results" MODIFIED="1777669842567" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/src/ui" />
-    <SUITE FILE_PATH="coverage/difi_aggregator$main.coverage" NAME="main Coverage Results" MODIFIED="1777752937335" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/src" />
+    <SUITE FILE_PATH="coverage/difi_aggregator$main.coverage" NAME="main Coverage Results" MODIFIED="1777924319951" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/src" />
     <SUITE FILE_PATH="coverage/difi_aggregator$tx_gui.coverage" NAME="tx_gui Coverage Results" MODIFIED="1777664580478" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/src/ui" />
     <SUITE FILE_PATH="coverage/difi_aggregator$generator.coverage" NAME="generator Coverage Results" MODIFIED="1777669831465" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/src/modules" />
   </component>

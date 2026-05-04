@@ -103,6 +103,11 @@ class DifiReceiver:
         with self._lock:
             return self._iq_buffer.copy()
 
+    def flush(self):
+        """Zero the IQ buffer so the display refreshes cleanly after a param change."""
+        with self._lock:
+            self._iq_buffer[:] = 0
+
     def get_sample_rate(self) -> float:
         """Return sample rate from the latest context packet (or default)."""
         if self.context:
