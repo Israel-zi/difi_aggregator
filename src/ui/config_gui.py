@@ -18,7 +18,7 @@ from PySide6.QtWidgets import (
 )
 import pyqtgraph as pg
 
-from modules.generator     import DifiGenerator, SIGNAL_CW, SIGNAL_BW, SIGNAL_OFF
+from modules.generator     import DifiGenerator, SIGNAL_CW, SIGNAL_BW, SIGNAL_OFF  # noqa: F401
 from modules.input_capture import InputCapture
 from modules.aggregator    import Aggregator
 from modules.packetizer    import Packetizer
@@ -48,6 +48,7 @@ class FreqInput(QWidget):
         self._spin.setRange(0.0, 999_999.999)
         self._spin.setValue(val)
         self._spin.setFixedWidth(115)
+        self._spin.setKeyboardTracking(False)  # only emit on Enter/focus-leave, not per-keystroke
 
         self._unit = QComboBox()
         self._unit.addItems(UNIT_LABELS)
@@ -153,6 +154,8 @@ class MainWindow(QMainWindow):
         self._sweep_composite_freqs    = np.array([])
         self._sweep_composite_data_raw = np.array([])
         self._sweep_sort_idx           = np.array([], dtype=int)
+        self._sweep_snap_acc           = np.array([])
+        self._sweep_snap_count         = 0
 
         self._build_ui()
         self._panel1.changed.connect(self._live_update_generators)
@@ -181,6 +184,7 @@ class MainWindow(QMainWindow):
         self._panel2 = GeneratorPanel(2)
         left_layout.addWidget(self._panel1)
         left_layout.addWidget(self._panel2)
+        left_layout.addWidget(self._build_sweep_controls())
         left_layout.addStretch()
         left_layout.addWidget(self._build_buttons())
         splitter.addWidget(left)
@@ -295,6 +299,61 @@ class MainWindow(QMainWindow):
         h.addWidget(self._stop_btn)
         return w
 
+    def _build_sweep_controls(self) -> QWidget:
+        box  = QGroupBox("Spectrum Sweep")
+        vlay = QVBoxLayout(box)
+        grid = QGridLayout()
+        vlay.addLayout(grid)
+
+        grid.addWidget(QLabel("Start:"), 0, 0)
+        self._sw_start = FreqInput(default_hz=0.0)
+        grid.addWidget(self._sw_start, 0, 1)
+
+        grid.addWidget(QLabel("Stop:"), 1, 0)
+        self._sw_stop = FreqInput(default_hz=100e6)
+        grid.addWidget(self._sw_stop, 1, 1)
+
+        grid.addWidget(QLabel("Step:"), 2, 0)
+        self._sw_step = FreqInput(default_hz=10e6)
+        grid.addWidget(self._sw_step, 2, 1)
+
+        grid.addWidget(QLabel("Dwell:"), 3, 0)
+        self._sw_dwell = QSpinBox()
+        self._sw_dwell.setRange(1, 50)
+        self._sw_dwell.setValue(1)
+        self._sw_dwell.setSuffix(" frames")
+        grid.addWidget(self._sw_dwell, 3, 1)
+
+        btn_row = QHBoxLayout()
+        self._sw_run_btn  = QPushButton("▶  Sweep")
+        self._sw_stop_btn = QPushButton("■  Stop Sweep")
+        self._sw_stop_btn.setEnabled(False)
+        self._sw_run_btn.clicked.connect(self._start_sweep)
+        self._sw_stop_btn.clicked.connect(self._stop_sweep)
+        btn_row.addWidget(self._sw_run_btn)
+        btn_row.addWidget(self._sw_stop_btn)
+        vlay.addLayout(btn_row)
+
+        return box
+
+    def _rf_ref_for(self, panel) -> float:
+        """
+        Effective LO for a generator panel.
+
+        When RF Reference is left at 0 but RF Frequency is beyond the
+        Nyquist limit (fs/2), the signal would alias to baseband.
+        In that case treat RF Frequency as the LO so the generator
+        produces a tone at 0 Hz baseband, and the context packet carries
+        the correct absolute carrier frequency.  The display then shows
+        the signal at its intended RF position automatically.
+
+        If RF Reference is explicitly set to a non-zero value, use it as-is.
+        """
+        rf_ref = panel.rf_ref_freq_hz()
+        if rf_ref == 0.0 and abs(panel.tone_hz()) > self._shared_fs.value_hz() / 2.0:
+            return panel.tone_hz()
+        return rf_ref
+
     def _start_pipeline(self):
         if self._pipeline_running:
             return
@@ -303,9 +362,10 @@ class MainWindow(QMainWindow):
         p2 = self._panel2
         fs = self._shared_fs.value_hz()
 
-        # Tone field holds absolute RF frequency; generator needs baseband offset
-        tone1_bb = p1.tone_hz() - p1.rf_ref_freq_hz()
-        tone2_bb = p2.tone_hz() - p2.rf_ref_freq_hz()
+        rf_ref1  = self._rf_ref_for(p1)
+        rf_ref2  = self._rf_ref_for(p2)
+        tone1_bb = p1.tone_hz() - rf_ref1
+        tone2_bb = p2.tone_hz() - rf_ref2
 
         gen1 = DifiGenerator(
             stream_id       = 0x00000001,
@@ -315,7 +375,7 @@ class MainWindow(QMainWindow):
             sample_rate_hz  = fs,
             samples_per_pkt = self.SAMPLES_PER_PKT,
             bit_depth       = self.BIT_DEPTH,
-            rf_ref_freq_hz  = p1.rf_ref_freq_hz(),
+            rf_ref_freq_hz  = rf_ref1,
             bandwidth_hz    = p1.bandwidth_hz(),
             ref_level_dbm   = p1.amplitude_dbm(),
         )
@@ -327,7 +387,7 @@ class MainWindow(QMainWindow):
             sample_rate_hz  = fs,
             samples_per_pkt = self.SAMPLES_PER_PKT,
             bit_depth       = self.BIT_DEPTH,
-            rf_ref_freq_hz  = p2.rf_ref_freq_hz(),
+            rf_ref_freq_hz  = rf_ref2,
             bandwidth_hz    = p2.bandwidth_hz(),
             ref_level_dbm   = p2.amplitude_dbm(),
         )
@@ -354,18 +414,18 @@ class MainWindow(QMainWindow):
         packetizer.start()
         sender.start()
 
-        # Warn if any baseband tone exceeds Nyquist — signal will alias
+        # Warn if any baseband tone still exceeds Nyquist after LO auto-assignment
         nyquist = fs / 2.0
         alias_warnings = []
         if abs(tone1_bb) >= nyquist:
-            alias_warnings.append(f"Gen1 RF={p1.tone_hz()/1e6:.3f}MHz (bb={tone1_bb/1e6:.3f}MHz)")
+            alias_warnings.append(f"Gen1 RF={p1.tone_hz()/1e6:.3f}MHz bb={tone1_bb/1e6:.3f}MHz")
         if abs(tone2_bb) >= nyquist:
-            alias_warnings.append(f"Gen2 RF={p2.tone_hz()/1e6:.3f}MHz (bb={tone2_bb/1e6:.3f}MHz)")
+            alias_warnings.append(f"Gen2 RF={p2.tone_hz()/1e6:.3f}MHz bb={tone2_bb/1e6:.3f}MHz")
         if alias_warnings:
             self._status.showMessage(
-                f"⚠ Tone exceeds Nyquist (Fs/2={nyquist/1e6:.3f}MHz): "
+                f"⚠ Tone exceeds Nyquist ({nyquist/1e6:.3f}MHz): "
                 + ", ".join(alias_warnings)
-                + " — reduce tone or increase sample rate"
+                + " — set RF Reference to the correct LO"
             )
 
         pkt_rate = fs / self.SAMPLES_PER_PKT
@@ -380,8 +440,6 @@ class MainWindow(QMainWindow):
         self._timer.start()
         self._apply_range()   # immediately restore Y range and spinbox-tracked X range
 
-        # Auto-fit only if signal is outside current display after context arrives
-        QTimer.singleShot(600, self._smart_auto_display)
         self._status.showMessage(
             f"Running — fs={fs/1e6:.1f}MHz | "
             f"Gen1:{p1.signal_type()} {p1.tone_hz()/1e6:.3f}MHz | "
@@ -391,6 +449,8 @@ class MainWindow(QMainWindow):
     def _stop_pipeline(self):
         if not self._pipeline_running:
             return
+        if self._sweep_active:
+            self._stop_sweep()
         self._timer.stop()
         m = self._modules
         m["sender"].stop()
@@ -417,32 +477,46 @@ class MainWindow(QMainWindow):
         if n == 0:
             return
 
-        # RF reference: prefer received context, fall back to configured UI value
+        # Use the combined stream's actual sample rate from the received context.
+        # After freq-stitching, new_fs may be larger than the generator's orig_fs.
         ctx    = rx.context
-        rf_ref = ctx.rf_ref_freq_hz if ctx else self._panel1.rf_ref_freq_hz()
+        fs     = ctx.sample_rate_hz      if ctx else self._shared_fs.value_hz()
+        rf_ref = ctx.rf_ref_freq_hz      if ctx else self._panel1.rf_ref_freq_hz()
 
-        # FFT — full complex IQ spectrum (-fs/2 to +fs/2) shifted to RF
-        window  = np.hanning(n)
-        X       = np.fft.fftshift(np.fft.fft(iq * window))
-        freqs   = np.fft.fftshift(np.fft.fftfreq(n, d=1.0 / fs)) + rf_ref
-        # floor at -140 dB (1e-7) — avoids the extreme -240 dB floor that
-        # comes from 1e-12 and forces pyqtgraph to auto-expand the Y axis
-        mag_db  = 20 * np.log10(np.abs(X) / n + 1e-7)
+        # FFT — full complex IQ spectrum
+        window = np.hanning(n)
+        X      = np.fft.fftshift(np.fft.fft(iq * window))
+        mag_db = 20 * np.log10(np.abs(X) / n + 1e-7)
 
-        self._curve.setData(freqs, mag_db)
+        if self._sweep_active:
+            # Use the known LO position directly — don't wait for context to propagate
+            lo_hz = self._sweep_positions[self._sweep_pos_idx]
+            freqs = np.fft.fftshift(np.fft.fftfreq(n, d=1.0 / fs)) + lo_hz
+            self._sweep_step(freqs, mag_db)
+        else:
+            freqs = np.fft.fftshift(np.fft.fftfreq(n, d=1.0 / fs)) + rf_ref
+            self._curve.setData(freqs, mag_db)
 
-        # Re-enforce the configured Y range once after the first real data
-        # arrives — pyqtgraph can auto-range on the empty→data transition
+        # On first real data: auto-fit frequency axis to the actual received
+        # signal band (uses combined center + fs from context).  This handles
+        # the freq-stitched case where the combined stream may be at a
+        # different center / sample-rate than the individual generators.
         if not self._y_range_applied:
-            self._apply_range()
+            if ctx and not self._sweep_active:
+                self._auto_display()
+            else:
+                self._apply_range()
             self._y_range_applied = True
 
-        agg = self._modules.get("aggregator")
-        rf_str = f" | RF={rf_ref/1e6:.3f} MHz" if rf_ref else ""
-        self._status.showMessage(
-            f"Running — fs={fs/1e6:.3f} MHz{rf_str} | "
-            f"data={rx.data_received}  chunks={agg.chunks_emitted if agg else 0}"
-        )
+        if not self._sweep_active:
+            agg    = self._modules.get("aggregator")
+            ctx    = rx.context
+            rf_ref = ctx.rf_ref_freq_hz if ctx else 0
+            rf_str = f" | RF={rf_ref/1e6:.3f} MHz" if rf_ref else ""
+            self._status.showMessage(
+                f"Running — fs={fs/1e6:.3f} MHz{rf_str} | "
+                f"data={rx.data_received}  chunks={agg.chunks_emitted if agg else 0}"
+            )
 
     def _live_update_generators(self):
         if not self._pipeline_running:
@@ -451,19 +525,21 @@ class MainWindow(QMainWindow):
         gen2 = self._modules.get("gen2")
         if not gen1 or not gen2:
             return
-        p1, p2 = self._panel1, self._panel2
+        p1, p2   = self._panel1, self._panel2
+        rf_ref1  = self._rf_ref_for(p1)
+        rf_ref2  = self._rf_ref_for(p2)
         gen1.update_params(
-            tone_hz        = p1.tone_hz() - p1.rf_ref_freq_hz(),
+            tone_hz        = p1.tone_hz() - rf_ref1,
             signal_type    = p1.signal_type(),
             bandwidth_hz   = p1.bandwidth_hz(),
-            rf_ref_freq_hz = p1.rf_ref_freq_hz(),
+            rf_ref_freq_hz = rf_ref1,
             ref_level_dbm  = p1.amplitude_dbm(),
         )
         gen2.update_params(
-            tone_hz        = p2.tone_hz() - p2.rf_ref_freq_hz(),
+            tone_hz        = p2.tone_hz() - rf_ref2,
             signal_type    = p2.signal_type(),
             bandwidth_hz   = p2.bandwidth_hz(),
-            rf_ref_freq_hz = p2.rf_ref_freq_hz(),
+            rf_ref_freq_hz = rf_ref2,
             ref_level_dbm  = p2.amplitude_dbm(),
         )
         rx = self._modules.get("receiver")
@@ -480,19 +556,19 @@ class MainWindow(QMainWindow):
         self._ref_line.setValue(amp_top)
 
     def _auto_display(self):
-        """Fit display to full IQ band: rf_ref ± fs/2."""
+        """Fit display to the combined stream's actual band: rf_ref ± fs/2."""
         if not self._pipeline_running:
             return
-        fs  = self._shared_fs.value_hz()
         rx  = self._modules.get("receiver")
         ctx = rx.context if rx else None
         if ctx is None:
             QTimer.singleShot(300, self._auto_display)
             return
-        rf_ref = ctx.rf_ref_freq_hz
 
-        center = rf_ref
-        span   = fs
+        # Use the received context — after freq-stitching this carries the
+        # correct combined center frequency and combined sample rate.
+        center = ctx.rf_ref_freq_hz
+        span   = ctx.sample_rate_hz
 
         def pick_unit(hz):
             a = abs(hz)
@@ -557,6 +633,137 @@ class MainWindow(QMainWindow):
             widget._spin.setValue(val)
             widget._spin.blockSignals(False)
             widget._unit.blockSignals(False)
+
+    def _start_sweep(self):
+        if not self._pipeline_running:
+            self._status.showMessage("Start the pipeline first, then start sweep.")
+            return
+        start = self._sw_start.value_hz()
+        stop  = self._sw_stop.value_hz()
+        step  = self._sw_step.value_hz()
+        if step <= 0 or stop <= start:
+            self._status.showMessage("Sweep: stop must be > start and step must be > 0.")
+            return
+        self._sweep_positions          = np.arange(start, stop + step * 0.5, step)
+        self._sweep_pos_idx            = 0
+        self._sweep_snap_count         = 0
+        self._sweep_snap_acc           = np.array([])
+        self._sweep_composite_freqs    = np.array([])
+        self._sweep_composite_data_raw = np.array([])
+        self._sweep_active             = True
+        self._sw_run_btn.setEnabled(False)
+        self._sw_stop_btn.setEnabled(True)
+        self._timer.setInterval(25)   # fast sweep ticks
+        self._move_lo_to(self._sweep_positions[0])
+
+        # Auto-fit display to the full sweep range
+        self._set_disp_range((start + stop) / 2.0, stop - start + step)
+
+    def _set_disp_range(self, center_hz: float, span_hz: float):
+        def pick_unit(hz):
+            a = abs(hz)
+            if a >= 1e9: return "GHz", hz / 1e9
+            if a >= 1e6: return "MHz", hz / 1e6
+            if a >= 1e3: return "kHz", hz / 1e3
+            return "Hz", hz
+        c_unit, c_val = pick_unit(center_hz)
+        s_unit, s_val = pick_unit(span_hz)
+        self._disp_center._unit.setCurrentText(c_unit)
+        self._disp_center._spin.setValue(c_val)
+        self._disp_span._unit.setCurrentText(s_unit)
+        self._disp_span._spin.setValue(s_val)
+        self._apply_range()
+
+    def _stop_sweep(self):
+        self._sweep_active = False
+        self._timer.setInterval(100)  # restore normal display rate
+        self._sw_run_btn.setEnabled(True)
+        self._sw_stop_btn.setEnabled(False)
+
+    def _move_lo_to(self, lo_hz: float):
+        gen1    = self._modules.get("gen1")
+        gen2    = self._modules.get("gen2")
+        p1, p2  = self._panel1, self._panel2
+        nyquist = self._shared_fs.value_hz() / 2.0
+
+        for gen, p in [(gen1, p1), (gen2, p2)]:
+            if not gen:
+                continue
+            tone_bb = p.tone_hz() - lo_hz
+            if abs(tone_bb) >= nyquist:
+                # Signal is outside this LO position's Nyquist band.
+                # Output silence so the sweep composite shows noise floor here,
+                # not an aliased copy of the signal at the wrong frequency.
+                gen.update_params(
+                    tone_hz        = 0.0,
+                    signal_type    = SIGNAL_OFF,
+                    bandwidth_hz   = p.bandwidth_hz(),
+                    rf_ref_freq_hz = lo_hz,
+                    ref_level_dbm  = p.amplitude_dbm(),
+                )
+            else:
+                gen.update_params(
+                    tone_hz        = tone_bb,
+                    signal_type    = p.signal_type(),
+                    bandwidth_hz   = p.bandwidth_hz(),
+                    rf_ref_freq_hz = lo_hz,
+                    ref_level_dbm  = p.amplitude_dbm(),
+                )
+
+        rx = self._modules.get("receiver")
+        if rx:
+            rx.flush()
+
+    def _sweep_step(self, freqs: np.ndarray, mag_db: np.ndarray):
+        dwell  = self._sw_dwell.value()
+        n_pos  = len(self._sweep_positions)
+        n_bins = len(freqs)
+
+        # Accumulate (peak-hold) at current LO position
+        if self._sweep_snap_count == 0:
+            self._sweep_snap_acc = mag_db.copy()
+        else:
+            self._sweep_snap_acc = np.maximum(self._sweep_snap_acc, mag_db)
+        self._sweep_snap_count += 1
+
+        if self._sweep_snap_count < dwell:
+            return  # still dwelling at this position
+
+        pos_idx = self._sweep_pos_idx
+
+        # Re-initialise composite arrays at the start of each pass
+        if pos_idx == 0:
+            self._sweep_composite_freqs    = np.zeros(n_pos * n_bins)
+            self._sweep_composite_data_raw = np.full(n_pos * n_bins, -140.0)
+
+        # Store snapshot for this position
+        sl = slice(pos_idx * n_bins, (pos_idx + 1) * n_bins)
+        self._sweep_composite_freqs[sl]    = freqs
+        self._sweep_composite_data_raw[sl] = self._sweep_snap_acc
+
+        # Advance counters
+        self._sweep_pos_idx   += 1
+        self._sweep_snap_count  = 0
+        self._sweep_snap_acc    = np.array([])
+
+        # Render whatever has been filled so far — live, position by position
+        n_filled  = self._sweep_pos_idx * n_bins
+        partial_f = self._sweep_composite_freqs[:n_filled]
+        partial_m = self._sweep_composite_data_raw[:n_filled]
+        sort_idx  = np.argsort(partial_f)
+        self._curve.setData(partial_f[sort_idx], partial_m[sort_idx])
+
+        # Wrap around to position 0 when the pass is complete
+        if self._sweep_pos_idx >= n_pos:
+            self._sweep_pos_idx = 0
+
+        self._move_lo_to(self._sweep_positions[self._sweep_pos_idx])
+
+        n_done = self._sweep_pos_idx
+        self._status.showMessage(
+            f"Sweeping — position {n_done + 1}/{n_pos} "
+            f"@ {self._sweep_positions[n_done] / 1e6:.3f} MHz"
+        )
 
     def closeEvent(self, event):
         self._stop_pipeline()

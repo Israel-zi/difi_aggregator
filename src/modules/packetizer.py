@@ -6,17 +6,29 @@ DIFI Packetizer module.
 Receives AggregatedChunk objects from the Aggregator and converts them
 into valid DIFI Data + Context packets ready for transmission.
 
-Aggregation strategy for the unified stream
--------------------------------------------
-  Each AggregatedChunk contains blocks from N streams.
-  The Packetizer concatenates all IQ samples into a single payload and
-  emits ONE Data packet per chunk, tagged with a unified stream ID.
+Frequency-stitching combiner
+-----------------------------
+  Each input stream carries IQ data sampled relative to its own LO
+  (rf_ref_freq_hz).  Simply adding the raw samples is wrong when the LOs
+  differ — you would be adding signals referenced to different carrier
+  frequencies.
 
-  Stream IDs of the original sources are preserved in the Context packet
-  via the reference_point and rf_ref_freq fields (in a real system, a
-  vendor extension would carry them — for this PoC we log them).
+  Instead the Packetizer performs proper frequency stitching:
 
-  The unified stream uses stream_id = 0xAGGR0000.
+    1. Compute the combined wideband parameters from all stream contexts:
+         new_center = midpoint of all (LO ± fs/2) edges
+         new_fs     = orig_fs × ceil(total_span / orig_fs)   [integer multiple]
+
+    2. For each stream, upsample to new_fs via FFT zero-padding and then
+       frequency-shift by (stream_LO − new_center) so every stream is
+       expressed relative to the same carrier.
+
+    3. Sum the shifted streams.  The result is a single wideband IQ signal
+       at new_center / new_fs that contains all input signals at their
+       correct spectral positions.
+
+  When all streams share the same LO the shift is zero and new_fs == orig_fs,
+  so the fast path reduces to a plain element-wise sum — no extra cost.
 """
 
 import queue
@@ -40,6 +52,10 @@ from modules.aggregator import Aggregator, AggregatedChunk
 
 UNIFIED_STREAM_ID      = 0xAA000000   # aggregated stream ID
 CONTEXT_MIN_INTERVAL_S = 0.05         # max 20 context packets/s per DIFI standard (Section 4.3.1)
+MAX_UPSAMPLE           = 32           # cap for freq-stitching upsample factor.
+                                      # Beyond this the LO separation exceeds ~16× fs, and
+                                      # creating a dense time-domain wideband signal is
+                                      # impractical.  Falls back to plain sum (same-LO path).
 
 
 # ─────────────────────────────────────────────
@@ -110,9 +126,108 @@ class Packetizer:
         self._ctx_seq = (self._ctx_seq + 1) & 0xF
         return seq
 
-    def _build_context(self, chunk: AggregatedChunk) -> bytes:
-        """Build a Context packet from the first stream's metadata."""
-        ctx_src        = chunk.streams[0].context
+    # ── wideband combining ─────────────────────────────────────────────────
+
+    @staticmethod
+    def _compute_wideband_params(chunk: AggregatedChunk) -> tuple:
+        """
+        Derive the combined stream's center frequency, sample rate, total
+        bandwidth, upsample factor, and output FFT length from the incoming
+        stream contexts.
+
+        Each stream occupies  LO ± orig_fs/2  (its full Nyquist band).
+        n_new is rounded up to the next power of 2 so that IFFT is fast.
+        Returns (new_center_hz, new_fs_hz, total_bw_hz, upsample_factor, n_new).
+        """
+        orig_fs  = chunk.streams[0].context.sample_rate_hz
+        n_orig   = len(chunk.streams[0].samples)
+
+        # Only active (non-zero) streams define the combined center frequency.
+        # A SIGNAL_OFF stream sends exactly-zero samples; including its LO would
+        # pull the combined center toward an irrelevant midpoint.
+        active = [s for s in chunk.streams if np.any(s.samples != 0)]
+        if not active:
+            active = chunk.streams   # all streams OFF — fallback to prevent empty list
+
+        edges    = []
+        for s in active:
+            lo = s.context.rf_ref_freq_hz
+            edges.append(lo - orig_fs / 2.0)
+            edges.append(lo + orig_fs / 2.0)
+
+        min_edge   = min(edges)
+        max_edge   = max(edges)
+        total_bw   = max_edge - min_edge
+        new_center = (min_edge + max_edge) / 2.0
+        upsample   = max(1, int(np.ceil(total_bw / orig_fs)))
+
+        if upsample > MAX_UPSAMPLE:
+            # LO separation is too large to bridge at the current sample rate.
+            # Fall back to the same-LO fast path: sum samples as-is, use average LO.
+            upsample = 1
+
+        if upsample > 1:
+            # round up to next power of 2 for fast FFT/IFFT
+            n_new  = 1 << int(np.ceil(np.log2(n_orig * upsample)))
+            new_fs = orig_fs * n_new / n_orig
+        else:
+            n_new  = n_orig
+            new_fs = orig_fs
+
+        return new_center, new_fs, total_bw, upsample, n_new
+
+    @staticmethod
+    def _freq_stitch(chunk: AggregatedChunk,
+                     new_center: float,
+                     new_fs: float,
+                     upsample: int,
+                     n_new: int) -> np.ndarray:
+        """
+        Combine all streams into one wideband IQ signal.
+
+        Fast path (upsample == 1, same LO): plain element-wise sum, no FFT.
+
+        Stitching path: all work stays in the frequency domain —
+          1. FFT each stream's n_orig samples.
+          2. Zero-pad to n_new bins (power-of-2 for fast IFFT).
+          3. Circular-shift the spectrum by delta_k bins to place the stream's
+             carrier at the correct position relative to new_center.
+          4. Accumulate into X_combined.
+          5. Single IFFT at the end → one fast transform total.
+        """
+        n_orig = len(chunk.streams[0].samples)
+
+        if upsample == 1:
+            combined = np.zeros(n_orig, dtype=np.complex128)
+            for s in chunk.streams:
+                combined += s.samples.astype(np.complex128)
+            return combined.astype(np.complex64)
+
+        half    = n_orig // 2
+        neg_len = n_orig - half - 1
+        X_combined = np.zeros(n_new, dtype=np.complex128)
+
+        for s in chunk.streams:
+            X    = np.fft.fft(s.samples)
+            X_up = np.zeros(n_new, dtype=np.complex128)
+            X_up[:half + 1] = X[:half + 1]          # DC + positive freqs
+            if neg_len:
+                X_up[n_new - neg_len:] = X[half + 1:]   # negative freqs
+
+            delta_k = round((s.context.rf_ref_freq_hz - new_center) / new_fs * n_new)
+            if delta_k != 0:
+                X_up = np.roll(X_up, delta_k)
+
+            X_combined += X_up
+
+        # single IFFT; scale so amplitude matches orig (zero-padding alone scales by n_new/n_orig)
+        return (np.fft.ifft(X_combined) * (n_new / n_orig)).astype(np.complex64)
+
+    # ── packet builders ────────────────────────────────────────────────────
+
+    def _build_context(self, chunk: AggregatedChunk, params: tuple) -> bytes:
+        new_center, new_fs, total_bw, _, _n = params
+        ctx_src         = chunk.streams[0].context
         ts_int, ts_frac = now_timestamp()
 
         ctx = DifiContextPacket(
@@ -120,10 +235,10 @@ class Packetizer:
             seq_num             = self._next_ctx_seq(),
             timestamp_int       = ts_int,
             timestamp_frac      = ts_frac,
-            sample_rate_hz      = ctx_src.sample_rate_hz,
-            rf_ref_freq_hz      = ctx_src.rf_ref_freq_hz,
+            sample_rate_hz      = new_fs,
+            rf_ref_freq_hz      = new_center,
             if_ref_freq_hz      = ctx_src.if_ref_freq_hz,
-            bandwidth_hz        = ctx_src.bandwidth_hz * chunk.num_streams,
+            bandwidth_hz        = total_bw,
             reference_level_dbm = ctx_src.reference_level_dbm,
             sample_bit_depth    = ctx_src.sample_bit_depth,
             context_changed     = True,
@@ -132,9 +247,9 @@ class Packetizer:
         )
         return ctx.to_bytes()
 
-    def _build_data(self, chunk: AggregatedChunk) -> bytes:
-        combined = sum(s.samples for s in chunk.streams)
-
+    def _build_data(self, chunk: AggregatedChunk, params: tuple) -> bytes:
+        new_center, new_fs, _, upsample, n_new = params
+        combined        = self._freq_stitch(chunk, new_center, new_fs, upsample, n_new)
         ts_int, ts_frac = now_timestamp()
 
         pkt = DifiDataPacket(
@@ -157,13 +272,31 @@ class Packetizer:
             if chunk is None:
                 continue
 
+            # Compute wideband params once; reuse for both context and data.
+            params = self._compute_wideband_params(chunk)
+            _, new_fs, _, upsample, n_new = params
+            if self.packets_produced == 0:
+                if upsample > 1:
+                    print(
+                        f"[Packetizer] Freq-stitch: upsample x{upsample} "
+                        f"n_new={n_new} "
+                        f"-> combined fs={new_fs/1e6:.1f} MHz "
+                        f"center={params[0]/1e6:.3f} MHz"
+                    )
+                else:
+                    print(
+                        f"[Packetizer] Same-LO fast path "
+                        f"(or LO sep > {MAX_UPSAMPLE}x fs, capped) "
+                        f"center={params[0]/1e6:.3f} MHz"
+                    )
+
             now       = time.monotonic()
             ctx_bytes = None
             if (now - self._last_ctx_time) >= CONTEXT_MIN_INTERVAL_S:
-                ctx_bytes = self._build_context(chunk)
+                ctx_bytes = self._build_context(chunk, params)
                 self._last_ctx_time = now
 
-            data_bytes = self._build_data(chunk)
+            data_bytes = self._build_data(chunk, params)
 
             try:
                 self._out_queue.put_nowait((ctx_bytes, data_bytes))

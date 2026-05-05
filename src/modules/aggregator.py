@@ -147,6 +147,7 @@ class Aggregator:
         # stats
         self.chunks_emitted  = 0
         self.packets_dropped = 0
+        self._drop_warn_count = 0
 
     # ── lifecycle ──────────────────────────────────────────────────────────
 
@@ -228,7 +229,9 @@ class Aggregator:
             self.chunks_emitted += 1
         except queue.Full:
             self.packets_dropped += 1
-            print("[Aggregator] Output queue full — chunk dropped")
+            self._drop_warn_count += 1
+            if self._drop_warn_count <= 3 or self._drop_warn_count % 1000 == 0:
+                print(f"[Aggregator] Output queue full — chunk dropped (total: {self.packets_dropped})")
 
     # ── diagnostics ────────────────────────────────────────────────────────
 

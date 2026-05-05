@@ -9,7 +9,8 @@
       "PowerShell(& \"C:\\\\Users\\\\276709\\\\PycharmProjects\\\\difi_aggregator\\\\.venv\\\\Scripts\\\\python.exe\" -c \"import pdfminer; print\\('ok'\\)\" 2>&1)",
       "PowerShell(& \"C:\\\\Users\\\\276709\\\\PycharmProjects\\\\difi_aggregator\\\\.venv\\\\Scripts\\\\pip.exe\" install pypdf --quiet)",
       "Bash(pip show *)",
-      "Bash(python *)"
+      "Bash(python *)",
+      "PowerShell(cd C:\\\\Users\\\\276709\\\\PycharmProjects\\\\difi_aggregator; python test_perf.py 2>&1; Write-Host \"EXIT:$LASTEXITCODE\")"
     ]
   }
 }
