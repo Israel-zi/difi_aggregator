@@ -16,55 +16,16 @@ if _src not in sys.path:
 
 import numpy as np
 
-from PySide6.QtCore import Qt, QTimer, Signal
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QGridLayout, QLabel, QDoubleSpinBox, QComboBox, QPushButton,
+    QGridLayout, QLabel, QDoubleSpinBox, QPushButton,
     QGroupBox, QStatusBar, QSpinBox, QSplitter,
 )
 import pyqtgraph as pg
 
 from modules.receiver import DifiReceiver
-
-UNIT_MUL    = {"Hz": 1.0, "kHz": 1_000.0, "MHz": 1_000_000.0, "GHz": 1_000_000_000.0}
-UNIT_LABELS = ["Hz", "kHz", "MHz", "GHz"]
-
-
-class FreqInput(QWidget):
-    changed = Signal()
-
-    def __init__(self, default_hz: float = 1e6, parent=None):
-        super().__init__(parent)
-        if default_hz >= 1e9:
-            unit, val = "GHz", default_hz / 1e9
-        elif default_hz >= 1e6:
-            unit, val = "MHz", default_hz / 1e6
-        elif default_hz >= 1e3:
-            unit, val = "kHz", default_hz / 1e3
-        else:
-            unit, val = "Hz", default_hz
-
-        self._spin = QDoubleSpinBox()
-        self._spin.setDecimals(3)
-        self._spin.setRange(0.0, 999_999.999)
-        self._spin.setValue(val)
-        self._spin.setFixedWidth(115)
-
-        self._unit = QComboBox()
-        self._unit.addItems(UNIT_LABELS)
-        self._unit.setCurrentText(unit)
-        self._unit.setFixedWidth(70)
-
-        lay = QHBoxLayout(self)
-        lay.setContentsMargins(0, 0, 0, 0)
-        lay.addWidget(self._spin)
-        lay.addWidget(self._unit)
-
-        self._spin.valueChanged.connect(self.changed)
-        self._unit.currentIndexChanged.connect(self.changed)
-
-    def value_hz(self) -> float:
-        return self._spin.value() * UNIT_MUL[self._unit.currentText()]
+from ui.freq_input    import FreqInput
 
 
 class ReceiverWindow(QMainWindow):
@@ -291,9 +252,9 @@ class ReceiverWindow(QMainWindow):
 
         # FFT — full complex IQ spectrum (-fs/2 to +fs/2) shifted to RF
         window = np.hanning(n)
-        X      = np.fft.fftshift(np.fft.fft(iq * window))
+        x_fft  = np.fft.fftshift(np.fft.fft(iq * window))
         freqs  = np.fft.fftshift(np.fft.fftfreq(n, d=1.0 / fs)) + rf_ref
-        mag_db = 20 * np.log10(np.abs(X) / n + 1e-7)
+        mag_db = 20 * np.log10(np.abs(x_fft) / n + 1e-7)
         self._curve.setData(freqs, mag_db)
 
         if not self._y_range_applied:
@@ -325,57 +286,19 @@ class ReceiverWindow(QMainWindow):
             # Context not yet received — retry after 500 ms
             QTimer.singleShot(500, self._auto_display)
             return
-        fs     = ctx.sample_rate_hz
-        rf_ref = ctx.rf_ref_freq_hz
-        center = rf_ref
-        span   = fs
-
-        def pick_unit(hz):
-            a = abs(hz)
-            if a >= 1e9: return "GHz", hz / 1e9
-            if a >= 1e6: return "MHz", hz / 1e6
-            if a >= 1e3: return "kHz", hz / 1e3
-            return "Hz", hz
-
-        s_unit, s_val = pick_unit(span)
-        c_unit, c_val = (s_unit, 0.0) if center == 0.0 else pick_unit(center)
-
-        self._center._unit.setCurrentText(c_unit)
-        self._center._spin.setValue(c_val)
-        self._span._unit.setCurrentText(s_unit)
-        self._span._spin.setValue(s_val)
+        self._center.set_hz(ctx.rf_ref_freq_hz)
+        self._span.set_hz(ctx.sample_rate_hz)
         self._amp_top.setValue(-10.0)
         self._db_div.setValue(10.0)
-        self._apply_range()   # force-apply even if spinbox values didn't change
+        self._apply_range()
 
     def _sync_viewport_to_spinboxes(self, ranges):
         """Keep X-axis display spinboxes in sync when user pans/zooms the plot."""
         x_lo, x_hi = ranges[0]
         if x_hi <= x_lo:
             return
-        center_hz = (x_lo + x_hi) / 2.0
-        span_hz   = x_hi - x_lo
-
-        def unit_val(hz):
-            a = abs(hz)
-            if a >= 1e9: return "GHz", hz / 1e9
-            if a >= 1e6: return "MHz", hz / 1e6
-            if a >= 1e3: return "kHz", hz / 1e3
-            return "Hz", hz
-
-        c_unit, c_val = unit_val(center_hz)
-        s_unit, s_val = unit_val(span_hz)
-
-        for widget, unit, val in [
-            (self._center, c_unit, c_val),
-            (self._span,   s_unit, s_val),
-        ]:
-            widget._spin.blockSignals(True)
-            widget._unit.blockSignals(True)
-            widget._unit.setCurrentText(unit)
-            widget._spin.setValue(val)
-            widget._spin.blockSignals(False)
-            widget._unit.blockSignals(False)
+        self._center.set_hz((x_lo + x_hi) / 2.0)
+        self._span.set_hz(x_hi - x_lo)
 
     def closeEvent(self, event):
         self._stop()

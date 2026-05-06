@@ -39,7 +39,6 @@ import numpy as np
 from core.difi_packet import (
     DifiDataPacket,
     DifiContextPacket,
-    now_timestamp,
     TSI_UTC,
     TSF_REAL_TIME,
 )
@@ -56,6 +55,8 @@ MAX_UPSAMPLE           = 32           # cap for freq-stitching upsample factor.
                                       # Beyond this the LO separation exceeds ~16× fs, and
                                       # creating a dense time-domain wideband signal is
                                       # impractical.  Falls back to plain sum (same-LO path).
+UDP_MAX_PAYLOAD        = 65507        # bytes: IPv4 max UDP payload (65535 − 20 IP − 8 UDP)
+DIFI_DATA_HEADER_B     = 28           # bytes: 7 DIFI prologue words × 4 bytes each
 
 
 # ─────────────────────────────────────────────
@@ -162,14 +163,21 @@ class Packetizer:
         upsample   = max(1, int(np.ceil(total_bw / orig_fs)))
 
         if upsample > MAX_UPSAMPLE:
-            # LO separation is too large to bridge at the current sample rate.
-            # Fall back to the same-LO fast path: sum samples as-is, use average LO.
             upsample = 1
 
         if upsample > 1:
-            # round up to next power of 2 for fast FFT/IFFT
-            n_new  = 1 << int(np.ceil(np.log2(n_orig * upsample)))
-            new_fs = orig_fs * n_new / n_orig
+            n_new_candidate  = 1 << int(np.ceil(np.log2(n_orig * upsample)))
+            # Reject if the combined DIFI data packet would exceed the UDP MTU.
+            # bit_depth bits per I and Q → 2 × ceil(bit_depth/8) bytes per complex sample.
+            bit_depth        = chunk.streams[0].context.sample_bit_depth
+            bytes_per_sample = 2 * max(1, (bit_depth + 7) // 8)
+            if n_new_candidate * bytes_per_sample + DIFI_DATA_HEADER_B <= UDP_MAX_PAYLOAD:
+                n_new  = n_new_candidate
+                new_fs = orig_fs * n_new / n_orig
+            else:
+                upsample = 1
+                n_new    = n_orig
+                new_fs   = orig_fs
         else:
             n_new  = n_orig
             new_fs = orig_fs
@@ -203,32 +211,35 @@ class Packetizer:
                 combined += s.samples.astype(np.complex128)
             return combined.astype(np.complex64)
 
-        half    = n_orig // 2
-        neg_len = n_orig - half - 1
-        X_combined = np.zeros(n_new, dtype=np.complex128)
+        half       = n_orig // 2
+        neg_len    = n_orig - half - 1
+        x_combined = np.zeros(n_new, dtype=np.complex128)
 
         for s in chunk.streams:
-            X    = np.fft.fft(s.samples)
-            X_up = np.zeros(n_new, dtype=np.complex128)
-            X_up[:half + 1] = X[:half + 1]          # DC + positive freqs
+            x_fft = np.fft.fft(s.samples)
+            x_up  = np.zeros(n_new, dtype=np.complex128)
+            x_up[:half + 1] = x_fft[:half + 1]          # DC + positive freqs
             if neg_len:
-                X_up[n_new - neg_len:] = X[half + 1:]   # negative freqs
+                x_up[n_new - neg_len:] = x_fft[half + 1:]   # negative freqs
 
             delta_k = round((s.context.rf_ref_freq_hz - new_center) / new_fs * n_new)
             if delta_k != 0:
-                X_up = np.roll(X_up, delta_k)
+                x_up = np.roll(x_up, delta_k)
 
-            X_combined += X_up
+            x_combined += x_up
 
         # single IFFT; scale so amplitude matches orig (zero-padding alone scales by n_new/n_orig)
-        return (np.fft.ifft(X_combined) * (n_new / n_orig)).astype(np.complex64)
+        return (np.fft.ifft(x_combined) * (n_new / n_orig)).astype(np.complex64)
 
     # ── packet builders ────────────────────────────────────────────────────
 
     def _build_context(self, chunk: AggregatedChunk, params: tuple) -> bytes:
         new_center, new_fs, total_bw, _, _n = params
-        ctx_src         = chunk.streams[0].context
-        ts_int, ts_frac = now_timestamp()
+        ctx_src = chunk.streams[0].context
+        # Use the source stream's data timestamp so the context packet is
+        # anchored to sample capture time, not the combiner's wall-clock.
+        ts_int  = chunk.streams[0].data_ts_int
+        ts_frac = chunk.streams[0].data_ts_frac
 
         ctx = DifiContextPacket(
             stream_id           = self._stream_id,
@@ -249,8 +260,11 @@ class Packetizer:
 
     def _build_data(self, chunk: AggregatedChunk, params: tuple) -> bytes:
         new_center, new_fs, _, upsample, n_new = params
-        combined        = self._freq_stitch(chunk, new_center, new_fs, upsample, n_new)
-        ts_int, ts_frac = now_timestamp()
+        combined = self._freq_stitch(chunk, new_center, new_fs, upsample, n_new)
+        # Preserve the source timestamp: the combined packet's sample epoch
+        # is the same as the input streams' sample epoch.
+        ts_int  = chunk.streams[0].data_ts_int
+        ts_frac = chunk.streams[0].data_ts_frac
 
         pkt = DifiDataPacket(
             stream_id        = self._stream_id,
@@ -274,20 +288,31 @@ class Packetizer:
 
             # Compute wideband params once; reuse for both context and data.
             params = self._compute_wideband_params(chunk)
-            _, new_fs, _, upsample, n_new = params
+            new_center, new_fs, _, upsample, n_new = params
             if self.packets_produced == 0:
                 if upsample > 1:
                     print(
                         f"[Packetizer] Freq-stitch: upsample x{upsample} "
                         f"n_new={n_new} "
                         f"-> combined fs={new_fs/1e6:.1f} MHz "
-                        f"center={params[0]/1e6:.3f} MHz"
+                        f"center={new_center/1e6:.3f} MHz"
                     )
                 else:
                     print(
                         f"[Packetizer] Same-LO fast path "
                         f"(or LO sep > {MAX_UPSAMPLE}x fs, capped) "
-                        f"center={params[0]/1e6:.3f} MHz"
+                        f"center={new_center/1e6:.3f} MHz"
+                    )
+                # Show where each stream's signal appears in the combined spectrum.
+                # Combined rf_ref = midpoint; signals stay at their original LO positions.
+                for s in chunk.streams:
+                    lo  = s.context.rf_ref_freq_hz
+                    off = (lo - new_center) / 1e6
+                    active_flag = "(active)" if np.any(s.samples != 0) else "(OFF/silent)"
+                    print(
+                        f"[Packetizer]   stream=0x{s.stream_id:08X} "
+                        f"LO={lo/1e6:.3f} MHz  offset={off:+.3f} MHz  "
+                        f"-> signal at {lo/1e6:.3f} MHz in display {active_flag}"
                     )
 
             now       = time.monotonic()
@@ -310,76 +335,63 @@ class Packetizer:
 # ─────────────────────────────────────────────
 
 if __name__ == "__main__":
-    import numpy as np
     from core.difi_packet import DifiDataPacket, DifiContextPacket, now_timestamp
-    from modules.aggregator import AggregatedChunk, StreamBlock
+    from modules.aggregator import StreamBlock
 
     print("=== Packetizer Self-Test (synthetic data) ===\n")
 
-    # build a fake context
-    ts_int, ts_frac = now_timestamp()
-    fake_ctx = DifiContextPacket(
+    _ts_int, _ts_frac = now_timestamp()
+    _fake_ctx = DifiContextPacket(
         stream_id      = 0x00000001,
         seq_num        = 0,
-        timestamp_int  = ts_int,
-        timestamp_frac = ts_frac,
+        timestamp_int  = _ts_int,
+        timestamp_frac = _ts_frac,
         sample_rate_hz = 48_000.0,
         rf_ref_freq_hz = 437_000_000.0,
         bandwidth_hz   = 24_000.0,
     )
 
-    # build fake chunks
-    def make_chunk(sid1, sid2, n=1024):
+    def _make_chunk(sid1, sid2, n=1024):
         s1 = np.exp(1j * 2 * np.pi * 2000 * np.arange(n) / 48000).astype(np.complex64)
         s2 = np.exp(1j * 2 * np.pi * 6000 * np.arange(n) / 48000).astype(np.complex64)
         return AggregatedChunk(streams=[
-            StreamBlock(stream_id=sid1, samples=s1, context=fake_ctx, received_at=time.monotonic()),
-            StreamBlock(stream_id=sid2, samples=s2, context=fake_ctx, received_at=time.monotonic()),
+            StreamBlock(stream_id=sid1, samples=s1, context=_fake_ctx, received_at=time.monotonic()),
+            StreamBlock(stream_id=sid2, samples=s2, context=_fake_ctx, received_at=time.monotonic()),
         ])
 
-    from modules.input_capture import InputCapture
-    from modules.aggregator import Aggregator
-
-    # we need a real aggregator instance for the packetizer constructor,
-    # but we'll inject chunks manually via monkey-patching for the test
-    class FakeAggregator:
+    class _FakeAggregator:
         def __init__(self, chunks):
             self._chunks = iter(chunks)
-            self._done   = False
 
-        def get(self, timeout=0.1):
+        def get(self, **_):
             try:
                 return next(self._chunks)
             except StopIteration:
-                self._done = True
                 return None
 
-    fake_agg   = FakeAggregator([make_chunk(0x1, 0x2) for _ in range(5)])
-    packetizer = Packetizer(aggregator=fake_agg)
+    _fake_agg = _FakeAggregator([_make_chunk(0x1, 0x2) for _ in range(5)])
+    _pktzr    = Packetizer(aggregator=_fake_agg)  # type: ignore[arg-type]
+    _pktzr.start()
 
-    # run manually (no thread)
-    produced = []
+    _produced = []
     for _ in range(5):
-        chunk = fake_agg.get()
-        if chunk is None:
+        _item = _pktzr.get(timeout=1.0)
+        if _item is None:
             break
+        _produced.append(_item)
 
-        ctx_b  = None
-        if len(produced) % CONTEXT_INTERVAL_PKTS == 0:
-            ctx_b = packetizer._build_context(chunk)
-        data_b = packetizer._build_data(chunk)
-        produced.append((ctx_b, data_b))
+    _pktzr.stop()
 
-    print(f"Produced {len(produced)} packet pair(s)")
-    for i, (ctx_b, data_b) in enumerate(produced):
-        pkt = DifiDataPacket.from_bytes(data_b)
+    print(f"Produced {len(_produced)} packet pair(s)")
+    for _i, (_ctx_b, _data_b) in enumerate(_produced):
+        _pkt = DifiDataPacket.from_bytes(_data_b)
         print(
-            f"  [{i}] stream=0x{pkt.stream_id:08X} | "
-            f"samples={len(pkt.payload)} | "
-            f"ctx={'yes' if ctx_b else 'no'}"
+            f"  [{_i}] stream=0x{_pkt.stream_id:08X} | "
+            f"samples={len(_pkt.payload)} | "
+            f"ctx={'yes' if _ctx_b else 'no'}"
         )
-        if ctx_b:
-            ctx = DifiContextPacket.from_bytes(ctx_b)
-            print(f"       ctx: fs={ctx.sample_rate_hz:.0f}Hz bw={ctx.bandwidth_hz:.0f}Hz")
+        if _ctx_b:
+            _ctx = DifiContextPacket.from_bytes(_ctx_b)
+            print(f"       ctx: fs={_ctx.sample_rate_hz:.0f}Hz bw={_ctx.bandwidth_hz:.0f}Hz")
 
     print("\n✅ Packetizer self-test passed!")

@@ -214,8 +214,6 @@ class InputCapture:
 # ─────────────────────────────────────────────
 
 if __name__ == "__main__":
-    import sys
-
     TEST_PORTS = [50001, 50002]
     capture    = InputCapture(ports=TEST_PORTS)
     capture.start()

@@ -19,52 +19,13 @@ import threading
 from PySide6.QtCore import QTimer, Signal
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QGridLayout, QLabel, QDoubleSpinBox, QComboBox, QPushButton,
+    QGridLayout, QLabel, QDoubleSpinBox, QPushButton,
     QGroupBox, QStatusBar, QLineEdit, QSpinBox, QButtonGroup, QRadioButton,
 )
 import pyqtgraph as pg
 
 from modules.generator import DifiGenerator, SIGNAL_CW, SIGNAL_BW, SIGNAL_OFF
-
-UNIT_MUL    = {"Hz": 1.0, "kHz": 1_000.0, "MHz": 1_000_000.0, "GHz": 1_000_000_000.0}
-UNIT_LABELS = ["Hz", "kHz", "MHz", "GHz"]
-
-
-class FreqInput(QWidget):
-    changed = Signal()
-
-    def __init__(self, default_hz: float = 1e6, parent=None):
-        super().__init__(parent)
-        if default_hz >= 1e9:
-            unit, val = "GHz", default_hz / 1e9
-        elif default_hz >= 1e6:
-            unit, val = "MHz", default_hz / 1e6
-        elif default_hz >= 1e3:
-            unit, val = "kHz", default_hz / 1e3
-        else:
-            unit, val = "Hz", default_hz
-
-        self._spin = QDoubleSpinBox()
-        self._spin.setDecimals(3)
-        self._spin.setRange(0.0, 999_999.999)
-        self._spin.setValue(val)
-        self._spin.setFixedWidth(115)
-
-        self._unit = QComboBox()
-        self._unit.addItems(UNIT_LABELS)
-        self._unit.setCurrentText(unit)
-        self._unit.setFixedWidth(70)
-
-        lay = QHBoxLayout(self)
-        lay.setContentsMargins(0, 0, 0, 0)
-        lay.addWidget(self._spin)
-        lay.addWidget(self._unit)
-
-        self._spin.valueChanged.connect(self.changed)
-        self._unit.currentIndexChanged.connect(self.changed)
-
-    def value_hz(self) -> float:
-        return self._spin.value() * UNIT_MUL[self._unit.currentText()]
+from ui.freq_input     import FreqInput
 
 
 class GeneratorPanel(QGroupBox):
@@ -94,10 +55,10 @@ class GeneratorPanel(QGroupBox):
         self._bw_rb  = QRadioButton("BW")
         self._off_rb = QRadioButton("OFF")
         self._cw_rb.setChecked(True)
-        grp = QButtonGroup(self)
-        grp.addButton(self._cw_rb)
-        grp.addButton(self._bw_rb)
-        grp.addButton(self._off_rb)
+        self._grp = QButtonGroup(self)
+        self._grp.addButton(self._cw_rb)
+        self._grp.addButton(self._bw_rb)
+        self._grp.addButton(self._off_rb)
         type_lay.addWidget(self._cw_rb)
         type_lay.addWidget(self._bw_rb)
         type_lay.addWidget(self._off_rb)
@@ -307,8 +268,8 @@ class TransmitterWindow(QMainWindow):
     def _tick(self):
         if not self._running:
             return
-        c1 = self._gen1._pkt_count if self._gen1 else 0
-        c2 = self._gen2._pkt_count if self._gen2 else 0
+        c1 = self._gen1.pkt_count if self._gen1 else 0
+        c2 = self._gen2.pkt_count if self._gen2 else 0
         self._panel1.set_status(True, c1)
         self._panel2.set_status(True, c2)
         self._status.showMessage(

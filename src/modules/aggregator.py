@@ -37,10 +37,12 @@ from modules.input_capture import CapturedPacket, InputCapture
 @dataclass
 class StreamBlock:
     """One stream's worth of IQ data inside an aggregated chunk."""
-    stream_id:   int
-    samples:     np.ndarray          # complex64
-    context:     DifiContextPacket   # most recent context for this stream
-    received_at: float               # time.monotonic() of last sample
+    stream_id:    int
+    samples:      np.ndarray          # complex64
+    context:      DifiContextPacket   # most recent context for this stream
+    received_at:  float               # time.monotonic() of last sample
+    data_ts_int:  int  = 0            # DIFI integer timestamp of the last data packet
+    data_ts_frac: int  = 0            # DIFI fractional timestamp of the last data packet
 
 
 @dataclass
@@ -69,13 +71,23 @@ class StreamBuffer:
     """Accumulates IQ samples and tracks the latest Context for one stream."""
 
     def __init__(self, stream_id: int):
-        self.stream_id   = stream_id
-        self._samples    = []          # list of np.ndarray chunks
-        self._total      = 0           # total samples buffered
-        self.context     = None        # latest DifiContextPacket
-        self.last_update = time.monotonic()
+        self.stream_id      = stream_id
+        self._samples       = []          # list of np.ndarray chunks
+        self._total         = 0           # total samples buffered
+        self.context        = None        # latest DifiContextPacket
+        self.last_update    = time.monotonic()
+        # DIFI timestamp of the most recently received data packet.
+        # Carried through to the combined output so the downstream receiver
+        # sees timestamps tied to sample capture time, not combiner wall-clock.
+        self.data_ts_int    = 0
+        self.data_ts_frac   = 0
 
     def add_data(self, pkt: DifiDataPacket):
+        # Per DIFI standard: timestamp = time of FIRST sample in the returned chunk.
+        # Only latch when buffer is empty so we always carry the oldest sample's epoch.
+        if self._total == 0:
+            self.data_ts_int  = pkt.timestamp_int
+            self.data_ts_frac = pkt.timestamp_frac
         self._samples.append(pkt.payload.copy())
         self._total      += len(pkt.payload)
         self.last_update  = time.monotonic()
@@ -143,6 +155,10 @@ class Aggregator:
         self._thread           = threading.Thread(
             target=self._run, daemon=True, name="aggregator"
         )
+
+        # display tap — latest chunk written by aggregator thread, read by GUI thread.
+        # Assignment is atomic in CPython; chunks are immutable after creation.
+        self.last_chunk        = None
 
         # stats
         self.chunks_emitted  = 0
@@ -216,13 +232,16 @@ class Aggregator:
         for sid in sorted(self._expected):
             buf = self._buffers[sid]
             blocks.append(StreamBlock(
-                stream_id   = sid,
-                samples     = buf.consume(self._chunk_size),
-                context     = buf.context,
-                received_at = buf.last_update,
+                stream_id    = sid,
+                samples      = buf.consume(self._chunk_size),
+                context      = buf.context,
+                received_at  = buf.last_update,
+                data_ts_int  = buf.data_ts_int,
+                data_ts_frac = buf.data_ts_frac,
             ))
 
         chunk = AggregatedChunk(streams=blocks)
+        self.last_chunk = chunk   # display tap — no queue consumption required
 
         try:
             self._out_queue.put_nowait(chunk)
@@ -272,15 +291,16 @@ if __name__ == "__main__":
     try:
         while True:
             chunk = aggregator.get(timeout=1.0)
-            if chunk:
-                chunks += 1
-                print(
-                    f"  Chunk #{chunks} | "
-                    f"streams={[hex(s) for s in chunk.stream_ids]} | "
-                    f"samples/stream={chunk.streams[0].samples.shape}"
-                )
-                if chunks >= 10:
-                    break
+            if chunk is None:
+                continue
+            chunks += 1
+            print(
+                f"  Chunk #{chunks} | "
+                f"streams={[hex(s) for s in chunk.stream_ids]} | "
+                f"samples/stream={chunk.streams[0].samples.shape}"
+            )
+            if chunks >= 10:
+                break
     except KeyboardInterrupt:
         pass
     finally:

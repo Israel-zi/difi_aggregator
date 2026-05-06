@@ -145,7 +145,7 @@ class DifiReceiver:
                 self.context = pkt
                 self.context_received += 1
 
-        except (ValueError, Exception) as exc:
+        except Exception as exc:
             self.parse_errors += 1
             print(f"[Receiver] Parse error: {exc}")
 
@@ -188,9 +188,9 @@ def run_spectrum_display(receiver: DifiReceiver):
         n       = len(iq)
 
         window  = np.hanning(n)
-        X       = np.fft.fftshift(np.fft.fft(iq * window))
+        x_fft   = np.fft.fftshift(np.fft.fft(iq * window))
         freqs   = np.fft.fftshift(np.fft.fftfreq(n, d=1.0 / fs))
-        mag_db  = 20 * np.log10(np.abs(X) / n + 1e-12)
+        mag_db  = 20 * np.log10(np.abs(x_fft) / n + 1e-12)
 
         line.set_data(freqs, mag_db)
         ax.set_xlim(freqs[0], freqs[-1])
@@ -207,7 +207,7 @@ def run_spectrum_display(receiver: DifiReceiver):
 
         return line, info_text
 
-    ani = animation.FuncAnimation(
+    _ani = animation.FuncAnimation(
         fig, update, interval=100, blit=True, cache_frame_data=False
     )
     plt.tight_layout()

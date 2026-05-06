@@ -78,7 +78,8 @@ class DifiGenerator:
         self._phase         = 0.0
         self._running       = True
         self._bw_filter     = None
-        self._bw_zi         = None
+        self._bw_zi_i       = None   # lowpass filter state for I channel
+        self._bw_zi_q       = None   # lowpass filter state for Q channel
         self._last_ctx_time = 0.0   # 0 ensures context is sent before the first data packet
 
         self._build_bw_filter()
@@ -88,16 +89,17 @@ class DifiGenerator:
     def _build_bw_filter(self):
         """Build a lowpass FIR filter for BW mode.
 
-        _generate_bw mixes the filtered noise up to tone_hz, so the filter
-        only needs to define the bandwidth — a lowpass at BW/2 is correct.
-        A bandpass at tone_hz here would double-shift the signal to 2*tone_hz.
+        Applied independently to two real AWGN channels (I and Q) to produce
+        a symmetric two-sided complex baseband signal.  A lowpass at BW/2 is
+        correct; _generate_bw then mixes the result up to tone_hz.
         """
         nyq    = self.sample_rate_hz / 2.0
         cutoff = max(min(self.bandwidth_hz / 2.0 / nyq, 0.499), 1e-4)
         self._bw_filter = scipy_signal.firwin(101, cutoff)
 
         zi = scipy_signal.lfilter_zi(self._bw_filter, [1.0])
-        self._bw_zi = zi * 0
+        self._bw_zi_i = zi * 0
+        self._bw_zi_q = zi * 0
 
     def _generate_cw(self) -> np.ndarray:
         """Generate one packet of pure CW (complex sinusoid)."""
@@ -116,22 +118,24 @@ class DifiGenerator:
     def _generate_bw(self) -> np.ndarray:
         """Generate one packet of bandlimited complex noise centered at tone_hz.
 
-        Uses a single real noise source → lowpass filter → Hilbert transform to
-        produce an analytic (single-sideband) baseband signal before mixing.
-        This eliminates the mirror image at -tone_hz that the old dual-channel
-        approach produced.
+        Two independent real AWGN channels are lowpass-filtered and combined as
+        I+jQ.  This produces a symmetric two-sided baseband signal spanning
+        [-BW/2, +BW/2], which the freq-stitcher can correctly place at the
+        stream's LO position in the combined wideband spectrum.
         """
         n   = self.samples_per_pkt
         amp = 10 ** (self.ref_level_dbm / 20.0)
 
-        # real AWGN → lowpass filter (state-continuous across packets)
-        noise = np.random.randn(n).astype(np.float32)
-        filt, self._bw_zi = scipy_signal.lfilter(
-            self._bw_filter, [1.0], noise, zi=self._bw_zi
+        # independent I and Q noise → each lowpass-filtered (state-continuous)
+        noise_i = np.random.randn(n).astype(np.float32)
+        noise_q = np.random.randn(n).astype(np.float32)
+        filt_i, self._bw_zi_i = scipy_signal.lfilter(
+            self._bw_filter, [1.0], noise_i, zi=self._bw_zi_i
         )
-
-        # analytic signal: energy at positive frequencies only → no mirror image
-        baseband = scipy_signal.hilbert(filt).astype(np.complex64)
+        filt_q, self._bw_zi_q = scipy_signal.lfilter(
+            self._bw_filter, [1.0], noise_q, zi=self._bw_zi_q
+        )
+        baseband = (filt_i + 1j * filt_q).astype(np.complex64)
 
         # shift to center frequency
         t   = np.arange(n) / self.sample_rate_hz
@@ -245,6 +249,10 @@ class DifiGenerator:
                         time.sleep(sleep)
         except (KeyboardInterrupt, OSError):
             pass
+
+    @property
+    def pkt_count(self) -> int:
+        return self._pkt_count
 
     def close(self):
         self._running = False
