@@ -10,9 +10,10 @@ Listens for the unified DIFI stream and displays a live FFT spectrum.
 import os
 import sys
 
-_src = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if _src not in sys.path:
-    sys.path.insert(0, _src)
+if not getattr(sys, 'frozen', False):
+    _src = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if _src not in sys.path:
+        sys.path.insert(0, _src)
 
 import numpy as np
 
@@ -60,7 +61,7 @@ class ReceiverWindow(QMainWindow):
         self._port = QSpinBox()
         self._port.setRange(1024, 65535)
         self._port.setValue(50010)
-        self._port.setFixedWidth(90)
+        self._port.setFixedWidth(110)
         port_w = QWidget()
         port_l = QHBoxLayout(port_w)
         port_l.setContentsMargins(0, 0, 0, 0)
@@ -200,10 +201,8 @@ class ReceiverWindow(QMainWindow):
         self._start_btn.setEnabled(False)
         self._stop_btn.setEnabled(True)
         self._timer.start()
-        self._apply_range()   # immediately restore Y range and spinbox-tracked X range
+        self._apply_range()
         self._status.showMessage(f"Listening on 0.0.0.0:{port}")
-
-        QTimer.singleShot(600, self._auto_display)
 
     def _stop(self):
         if not self._running:
@@ -222,49 +221,64 @@ class ReceiverWindow(QMainWindow):
         if not self._receiver:
             return
 
-        rx  = self._receiver
-        ctx = rx.context
+        rx = self._receiver
 
         # Always update counters so the user can see data flowing
         self._lbl_data.setText(f"{rx.data_received:,}")
         self._lbl_ctx.setText(f"{rx.context_received:,}")
         self._lbl_errs.setText(str(rx.parse_errors))
 
+        snaps = rx.get_stream_snapshots()
+
+        # Pick any available context for stats labels
+        ctx = rx.context
         if ctx:
             self._lbl_fs.setText(f"{ctx.sample_rate_hz / 1e6:.3f} MHz")
             self._lbl_rf.setText(f"{ctx.rf_ref_freq_hz / 1e6:.3f} MHz")
-            self._lbl_sid.setText(f"0x{ctx.stream_id:08X}")
 
-        # Wait for context before drawing — RF shift is unknown without it
-        if ctx is None:
+        # Show all active stream IDs
+        if snaps:
+            sid_str = ", ".join(f"0x{s:08X}" for s in snaps)
+            self._lbl_sid.setText(sid_str)
+
+        # Wait for at least one context before drawing
+        if not snaps or all(c is None for _, c in snaps.values()):
             self._status.showMessage(
                 f"Listening | data={rx.data_received:,} | waiting for context packet…"
             )
             return
 
-        rf_ref = ctx.rf_ref_freq_hz
-        fs     = ctx.sample_rate_hz
+        # FFT each stream independently at its absolute RF position
+        all_freqs = []
+        all_mags  = []
+        for _sid, (iq, sctx) in snaps.items():
+            if sctx is None or len(iq) == 0:
+                continue
+            n      = len(iq)
+            fs     = sctx.sample_rate_hz
+            rf_ref = sctx.rf_ref_freq_hz
+            window = np.hanning(n)
+            x_fft  = np.fft.fftshift(np.fft.fft(iq * window))
+            freqs  = np.fft.fftshift(np.fft.fftfreq(n, d=1.0 / fs)) + rf_ref
+            mag_db = 20 * np.log10(np.abs(x_fft) / n + 1e-7)
+            all_freqs.append(freqs)
+            all_mags.append(mag_db)
 
-        iq = rx.get_iq_snapshot()
-        n  = len(iq)
-        if n == 0:
-            return
-
-        # FFT — full complex IQ spectrum (-fs/2 to +fs/2) shifted to RF
-        window = np.hanning(n)
-        x_fft  = np.fft.fftshift(np.fft.fft(iq * window))
-        freqs  = np.fft.fftshift(np.fft.fftfreq(n, d=1.0 / fs)) + rf_ref
-        mag_db = 20 * np.log10(np.abs(x_fft) / n + 1e-7)
-        self._curve.setData(freqs, mag_db)
+        if all_freqs:
+            combined_freqs = np.concatenate(all_freqs)
+            combined_mags  = np.concatenate(all_mags)
+            sort_idx       = np.argsort(combined_freqs)
+            self._curve.setData(combined_freqs[sort_idx], combined_mags[sort_idx])
 
         if not self._y_range_applied:
             self._apply_range()
             self._y_range_applied = True
 
+        n_streams = len([c for _, c in snaps.values() if c is not None])
+        fs_str = f"{ctx.sample_rate_hz / 1e6:.3f} MHz" if ctx else "?"
         self._status.showMessage(
             f"Listening | data={rx.data_received:,} | "
-            f"fs={fs / 1e6:.3f} MHz"
-            + (f" | RF={rf_ref/1e6:.3f} MHz" if rf_ref else "")
+            f"streams={n_streams} | fs={fs_str}"
         )
 
     # ── helpers ────────────────────────────────────────────────────────────
@@ -281,13 +295,19 @@ class ReceiverWindow(QMainWindow):
     def _auto_display(self):
         if not self._receiver:
             return
-        ctx = self._receiver.context
-        if ctx is None:
-            # Context not yet received — retry after 500 ms
+        snaps = self._receiver.get_stream_snapshots()
+        contexts = [c for _, c in snaps.values() if c is not None]
+        if not contexts:
             QTimer.singleShot(500, self._auto_display)
             return
-        self._center.set_hz(ctx.rf_ref_freq_hz)
-        self._span.set_hz(ctx.sample_rate_hz)
+        # Center on the mean RF of all active streams; span covers all of them
+        rf_refs = [c.rf_ref_freq_hz for c in contexts]
+        fs_vals = [c.sample_rate_hz for c in contexts]
+        center  = sum(rf_refs) / len(rf_refs)
+        span    = (max(rf_refs) - min(rf_refs)) + max(fs_vals)
+        span    = max(span, max(fs_vals))
+        self._center.set_hz(center)
+        self._span.set_hz(span)
         self._amp_top.setValue(-10.0)
         self._db_div.setValue(10.0)
         self._apply_range()

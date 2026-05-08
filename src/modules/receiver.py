@@ -3,21 +3,18 @@ receiver.py
 -----------
 DIFI Receiver module.
 
-Listens on UDP port 50010 for the unified DIFI stream emitted by the Sender,
-parses incoming Data + Context packets, reconstructs the IQ signal, and
-displays a live spectrum for verification.
+Listens on a single UDP port for the multiplexed DIFI stream emitted by
+the Sender.  Incoming packets carry their original Stream IDs (as defined
+in IEEE-ISTO Std 4900-2021 Figure 7), so each stream is tracked
+independently.
 
-This confirms that the aggregated stream contains the carriers from
-both original Generator streams.
+Per-stream rolling IQ buffers are maintained; callers use
+get_stream_snapshots() to retrieve all active streams at once for display.
 """
 
 import socket
 import threading
-import queue
-import time
 import numpy as np
-import matplotlib.pyplot as plt
-import matplotlib.animation as animation
 
 from core.difi_packet import (
     DifiDataPacket,
@@ -27,27 +24,23 @@ from core.difi_packet import (
 )
 
 
-# ─────────────────────────────────────────────
-# Receiver
-# ─────────────────────────────────────────────
-
 class DifiReceiver:
     """
-    Receives the unified DIFI stream and stores IQ data for display/analysis.
+    Receives a multiplexed DIFI stream and maintains per-stream IQ buffers.
 
     Parameters
     ----------
     host        : local address to bind
     port        : UDP port to listen on
-    buffer_size : number of IQ samples to keep in the rolling display buffer
+    buffer_size : number of IQ samples per stream in the rolling display buffer
     """
 
     MAX_UDP_SIZE = 65535
 
     def __init__(
         self,
-        host: str       = "0.0.0.0",
-        port: int       = 50010,
+        host: str        = "0.0.0.0",
+        port: int        = 50010,
         buffer_size: int = 8192,
     ):
         self._host        = host
@@ -59,12 +52,10 @@ class DifiReceiver:
             target=self._run, daemon=True, name="receiver"
         )
 
-        # rolling IQ buffer (latest N samples)
-        self._iq_buffer   = np.zeros(buffer_size, dtype=np.complex64)
+        # per-stream state — keyed by stream_id (int)
+        self._iq_buffers: dict = {}   # stream_id -> np.ndarray[complex64]
+        self._contexts:   dict = {}   # stream_id -> DifiContextPacket
         self._lock        = threading.Lock()
-
-        # latest context
-        self.context      = None
 
         # stats
         self.data_received    = 0
@@ -83,7 +74,6 @@ class DifiReceiver:
 
     def stop(self):
         self._stop_evt.set()
-        # Close socket immediately to unblock recvfrom — no 1-second timeout wait
         if self._sock is not None:
             try:
                 self._sock.close()
@@ -93,26 +83,52 @@ class DifiReceiver:
         self._thread.join(timeout=2.0)
         print(
             f"[Receiver] Stopped | "
-            f"data={self.data_received} ctx={self.context_received}"
+            f"data={self.data_received} ctx={self.context_received} "
+            f"streams={list(f'0x{s:08X}' for s in self._contexts)}"
         )
 
     # ── data access ────────────────────────────────────────────────────────
 
-    def get_iq_snapshot(self) -> np.ndarray:
-        """Return a copy of the current IQ buffer (thread-safe)."""
+    def get_stream_snapshots(self) -> dict:
+        """
+        Return a dict of {stream_id: (iq_array, context)} for all active streams.
+        Both arrays are copies (thread-safe).  Streams without a context packet
+        yet are included with context=None.
+        """
         with self._lock:
-            return self._iq_buffer.copy()
+            return {
+                sid: (buf.copy(), self._contexts.get(sid))
+                for sid, buf in self._iq_buffers.items()
+            }
+
+    def get_iq_snapshot(self) -> np.ndarray:
+        """
+        Return combined IQ snapshot across all streams (concatenated, not interleaved).
+        Preserves backwards compatibility with single-stream callers.
+        """
+        with self._lock:
+            if not self._iq_buffers:
+                return np.zeros(self._buffer_size, dtype=np.complex64)
+            return np.concatenate(list(self._iq_buffers.values()))
+
+    @property
+    def context(self):
+        """Return context for the first available stream (backwards compatibility)."""
+        with self._lock:
+            if self._contexts:
+                return next(iter(self._contexts.values()))
+            return None
 
     def flush(self):
-        """Zero the IQ buffer so the display refreshes cleanly after a param change."""
+        """Zero all IQ buffers (call after parameter changes to clear stale data)."""
         with self._lock:
-            self._iq_buffer[:] = 0
+            for sid in self._iq_buffers:
+                self._iq_buffers[sid][:] = 0
 
     def get_sample_rate(self) -> float:
-        """Return sample rate from the latest context packet (or default)."""
-        if self.context:
-            return self.context.sample_rate_hz
-        return 48_000.0
+        """Return sample rate from the first available context (or default)."""
+        ctx = self.context
+        return ctx.sample_rate_hz if ctx else 48_000.0
 
     # ── main loop ──────────────────────────────────────────────────────────
 
@@ -127,91 +143,47 @@ class DifiReceiver:
                 break
 
     def _handle(self, data: bytes):
-        if len(data) < 4:
+        if len(data) < 8:
             return
 
         word1    = int.from_bytes(data[:4], "big")
         pkt_type = (word1 >> 28) & 0xF
+        sid      = int.from_bytes(data[4:8], "big")   # Stream ID is always word 2
 
         try:
             if pkt_type == PACKET_TYPE_DATA:
-                bit_depth = self.context.sample_bit_depth if self.context else 16
+                ctx = self._contexts.get(sid)
+                bit_depth = ctx.sample_bit_depth if ctx else 16
                 pkt = DifiDataPacket.from_bytes(data, sample_bit_depth=bit_depth)
-                self._update_buffer(pkt.payload)
+                self._update_stream_buffer(pkt.stream_id, pkt.payload)
                 self.data_received += 1
 
             elif pkt_type == PACKET_TYPE_CONTEXT:
-                pkt          = DifiContextPacket.from_bytes(data)
-                self.context = pkt
+                pkt = DifiContextPacket.from_bytes(data)
+                with self._lock:
+                    self._contexts[pkt.stream_id] = pkt
+                    if pkt.stream_id not in self._iq_buffers:
+                        self._iq_buffers[pkt.stream_id] = np.zeros(
+                            self._buffer_size, dtype=np.complex64
+                        )
+                        print(f"[Receiver] New stream: 0x{pkt.stream_id:08X}")
                 self.context_received += 1
 
         except Exception as exc:
             self.parse_errors += 1
-            print(f"[Receiver] Parse error: {exc}")
+            print(f"[Receiver] Parse error (sid=0x{sid:08X}): {exc}")
 
-    def _update_buffer(self, new_samples: np.ndarray):
-        """Append new samples to the rolling buffer."""
+    def _update_stream_buffer(self, sid: int, new_samples: np.ndarray):
         n = len(new_samples)
         with self._lock:
+            if sid not in self._iq_buffers:
+                self._iq_buffers[sid] = np.zeros(self._buffer_size, dtype=np.complex64)
+            buf = self._iq_buffers[sid]
             if n >= self._buffer_size:
-                self._iq_buffer[:] = new_samples[-self._buffer_size:]
+                buf[:] = new_samples[-self._buffer_size:]
             else:
-                self._iq_buffer = np.roll(self._iq_buffer, -n)
-                self._iq_buffer[-n:] = new_samples
-
-
-# ─────────────────────────────────────────────
-# Live spectrum display
-# ─────────────────────────────────────────────
-
-def run_spectrum_display(receiver: DifiReceiver):
-    """Display a live FFT spectrum of the received aggregated DIFI stream."""
-
-    fig, ax = plt.subplots(figsize=(10, 5))
-    ax.set_title("DIFI Receiver — Aggregated Stream Spectrum")
-    ax.set_xlabel("Frequency (Hz)")
-    ax.set_ylabel("Magnitude (dB)")
-    ax.set_ylim(-80, 10)
-    ax.grid(True, alpha=0.4)
-
-    line, = ax.plot([], [], color="cyan", linewidth=1.2)
-    info_text = ax.text(
-        0.02, 0.95, "", transform=ax.transAxes,
-        fontsize=9, verticalalignment="top",
-        bbox=dict(boxstyle="round", facecolor="black", alpha=0.5),
-        color="white"
-    )
-
-    def update(_frame):
-        iq      = receiver.get_iq_snapshot()
-        fs      = receiver.get_sample_rate()
-        n       = len(iq)
-
-        window  = np.hanning(n)
-        x_fft   = np.fft.fftshift(np.fft.fft(iq * window))
-        freqs   = np.fft.fftshift(np.fft.fftfreq(n, d=1.0 / fs))
-        mag_db  = 20 * np.log10(np.abs(x_fft) / n + 1e-12)
-
-        line.set_data(freqs, mag_db)
-        ax.set_xlim(freqs[0], freqs[-1])
-
-        ctx = receiver.context
-        info = (
-            f"Data pkts : {receiver.data_received}\n"
-            f"Ctx pkts  : {receiver.context_received}\n"
-            f"Fs        : {fs:.0f} Hz"
-        )
-        if ctx:
-            info += f"\nRF freq : {ctx.rf_ref_freq_hz / 1e6:.3f} MHz"
-        info_text.set_text(info)
-
-        return line, info_text
-
-    _ani = animation.FuncAnimation(
-        fig, update, interval=100, blit=True, cache_frame_data=False
-    )
-    plt.tight_layout()
-    plt.show()
+                self._iq_buffers[sid] = np.roll(buf, -n)
+                self._iq_buffers[sid][-n:] = new_samples
 
 
 # ─────────────────────────────────────────────
@@ -219,15 +191,29 @@ def run_spectrum_display(receiver: DifiReceiver):
 # ─────────────────────────────────────────────
 
 if __name__ == "__main__":
+    import time
+
     receiver = DifiReceiver(port=50010)
     receiver.start()
 
-    print("\n[Receiver] Waiting for unified DIFI stream on port 50010 ...")
-    print("           Run main.py to start the full pipeline.")
+    print("\n[Receiver] Waiting for multiplexed DIFI stream on port 50010 ...")
+    print("           Run main.py or the Packetizer GUI to start the pipeline.")
     print("           Press Ctrl+C to stop.\n")
 
     try:
-        run_spectrum_display(receiver)
+        while True:
+            time.sleep(2.0)
+            snaps = receiver.get_stream_snapshots()
+            if snaps:
+                for sid, (iq, ctx) in snaps.items():
+                    fs_str = f"{ctx.sample_rate_hz/1e6:.3f} MHz" if ctx else "?"
+                    rf_str = f"{ctx.rf_ref_freq_hz/1e6:.3f} MHz" if ctx else "?"
+                    print(
+                        f"  stream=0x{sid:08X}  samples={len(iq):,} "
+                        f"fs={fs_str}  RF={rf_str}"
+                    )
+            else:
+                print("  (no streams yet)")
     except KeyboardInterrupt:
         pass
     finally:

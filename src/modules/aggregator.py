@@ -131,7 +131,11 @@ class Aggregator:
     Parameters
     ----------
     capture          : InputCapture instance to read from
-    expected_streams : list of stream IDs we expect to aggregate
+    expected_streams : explicit list of stream IDs to wait for, OR None to
+                       auto-discover stream IDs from incoming packets
+    expected_count   : when expected_streams=None, how many unique streams to
+                       wait for before emitting (typically = number of listen
+                       ports).  If also None, emit as soon as any stream is ready.
     chunk_size       : samples per stream per aggregated chunk
     out_queue_size   : max depth of the output queue
     stale_timeout    : seconds before a stream is considered stale/missing
@@ -140,13 +144,17 @@ class Aggregator:
     def __init__(
         self,
         capture: InputCapture,
-        expected_streams: list,
-        chunk_size: int       = 1024,
-        out_queue_size: int   = 8,
-        stale_timeout: float  = 5.0,
+        expected_streams: list  = None,
+        expected_count: int     = None,
+        chunk_size: int         = 1024,
+        out_queue_size: int     = 8,
+        stale_timeout: float    = 5.0,
     ):
         self._capture          = capture
-        self._expected         = set(expected_streams)
+        self._expected         = set(expected_streams) if expected_streams else None
+        self._expected_count   = (
+            len(expected_streams) if expected_streams else expected_count
+        )
         self._chunk_size       = chunk_size
         self._stale_timeout    = stale_timeout
         self._out_queue        = queue.Queue(maxsize=out_queue_size)
@@ -169,11 +177,10 @@ class Aggregator:
 
     def start(self):
         self._thread.start()
-        print(
-            f"[Aggregator] Started | "
-            f"streams={[hex(s) for s in self._expected]} | "
-            f"chunk_size={self._chunk_size}"
-        )
+        if self._expected:
+            print(f"[Aggregator] Started | streams={[hex(s) for s in self._expected]} | chunk_size={self._chunk_size}")
+        else:
+            print(f"[Aggregator] Started | auto-detect mode | expecting {self._expected_count} stream(s) | chunk_size={self._chunk_size}")
 
     def stop(self):
         self._stop_evt.set()
@@ -202,13 +209,15 @@ class Aggregator:
         pkt       = captured.packet
         stream_id = pkt.stream_id
 
-        # only process streams we expect
-        if stream_id not in self._expected:
+        # fixed mode: ignore streams not in the expected set
+        if self._expected is not None and stream_id not in self._expected:
             return
 
         # lazy-create buffer
         if stream_id not in self._buffers:
             self._buffers[stream_id] = StreamBuffer(stream_id)
+            if self._expected is None:
+                print(f"[Aggregator] Discovered stream 0x{stream_id:08X} ({len(self._buffers)} of {self._expected_count or '?'})")
 
         buf = self._buffers[stream_id]
 
@@ -218,18 +227,30 @@ class Aggregator:
             buf.add_context(pkt)
 
     def _try_emit_chunk(self):
-        """Emit one AggregatedChunk if ALL expected streams are ready."""
+        """Emit one AggregatedChunk if ALL expected/discovered streams are ready."""
 
-        # check all expected streams have a buffer and are ready
-        if not all(
-            sid in self._buffers and self._buffers[sid].ready(self._chunk_size)
-            for sid in self._expected
-        ):
-            return
+        if self._expected is not None:
+            # Fixed mode: wait for exactly the configured stream IDs
+            active = self._expected
+            if not all(
+                sid in self._buffers and self._buffers[sid].ready(self._chunk_size)
+                for sid in active
+            ):
+                return
+        else:
+            # Auto-detect mode: wait until we have seen enough unique streams
+            # AND all of them have enough samples
+            if self._expected_count and len(self._buffers) < self._expected_count:
+                return
+            if not self._buffers:
+                return
+            active = set(self._buffers.keys())
+            if not all(self._buffers[sid].ready(self._chunk_size) for sid in active):
+                return
 
         # build one StreamBlock per stream
         blocks = []
-        for sid in sorted(self._expected):
+        for sid in sorted(active):
             buf = self._buffers[sid]
             blocks.append(StreamBlock(
                 stream_id    = sid,
@@ -263,6 +284,16 @@ class Aggregator:
     def stream_last_seen(self) -> dict:
         """Return {stream_id: last_update monotonic time} for all known streams."""
         return {sid: buf.last_update for sid, buf in self._buffers.items()}
+
+    def get_stream_previews(self) -> list:
+        """Return [(stream_id, samples, context)] for any stream that has data.
+        Does NOT consume buffered samples — read-only snapshot for display."""
+        result = []
+        for sid, buf in self._buffers.items():
+            if buf.context is not None and buf._total > 0:
+                samples = np.concatenate(buf._samples).astype(np.complex64)
+                result.append((sid, samples, buf.context))
+        return result
 
 
 # ─────────────────────────────────────────────

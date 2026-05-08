@@ -29,7 +29,7 @@ from ui.freq_input         import FreqInput
 class GeneratorPanel(QGroupBox):
     changed = Signal()
 
-    def __init__(self, n: int, parent=None):
+    def __init__(self, n: int, default_signal_type: str = SIGNAL_CW, parent=None):
         super().__init__(f"Generator {n}  —  Stream 0x0000000{n}", parent)
         grid = QGridLayout(self)
 
@@ -40,7 +40,12 @@ class GeneratorPanel(QGroupBox):
         self._cw_rb  = QRadioButton("CW")
         self._bw_rb  = QRadioButton("BW")
         self._off_rb = QRadioButton("OFF")
-        self._cw_rb.setChecked(True)
+        if default_signal_type == SIGNAL_BW:
+            self._bw_rb.setChecked(True)
+        elif default_signal_type == SIGNAL_OFF:
+            self._off_rb.setChecked(True)
+        else:
+            self._cw_rb.setChecked(True)
         self._grp = QButtonGroup(self)
         self._grp.addButton(self._cw_rb)
         self._grp.addButton(self._bw_rb)
@@ -52,7 +57,7 @@ class GeneratorPanel(QGroupBox):
         grid.addWidget(type_w, 0, 1)
 
         grid.addWidget(QLabel("RF Frequency:"), 1, 0)
-        self._tone = FreqInput(default_hz=1e6 if n == 1 else 2e6)
+        self._tone = FreqInput(default_hz=n * 1e6)
         grid.addWidget(self._tone, 1, 1)
 
         grid.addWidget(QLabel("Bandwidth:"), 2, 0)
@@ -74,7 +79,7 @@ class GeneratorPanel(QGroupBox):
 
         for rb in (self._cw_rb, self._bw_rb, self._off_rb):
             rb.toggled.connect(lambda: self._bw.setEnabled(self._bw_rb.isChecked()))
-        self._bw.setEnabled(False)
+        self._bw.setEnabled(default_signal_type == SIGNAL_BW)
 
         # emit changed whenever any control is modified
         for rb in (self._cw_rb, self._bw_rb, self._off_rb):
@@ -95,20 +100,21 @@ class MainWindow(QMainWindow):
 
     SAMPLES_PER_PKT  = 1024
     BIT_DEPTH        = 16
-    CAPTURE_PORTS    = [50001, 50002]
-    EXPECTED_STREAMS = [0x00000001, 0x00000002]
+    CAPTURE_PORTS    = [50001, 50002, 50003]
+    EXPECTED_STREAMS = [0x00000001, 0x00000002, 0x00000003]
     RECEIVER_PORT    = 50010
 
     def __init__(self):
         super().__init__()
         self.setWindowTitle("DIFI Aggregator PoC")
-        self.setMinimumSize(1100, 700)
+        self.setMinimumSize(1100, 820)
         self._pipeline_running = False
         self._modules          = {}
 
         self._build_ui()
         self._panel1.changed.connect(self._live_update_generators)
         self._panel2.changed.connect(self._live_update_generators)
+        self._panel3.changed.connect(self._live_update_generators)
 
     def _build_ui(self):
         central = QWidget()
@@ -131,8 +137,10 @@ class MainWindow(QMainWindow):
 
         self._panel1 = GeneratorPanel(1)
         self._panel2 = GeneratorPanel(2)
+        self._panel3 = GeneratorPanel(3, default_signal_type=SIGNAL_OFF)
         left_layout.addWidget(self._panel1)
         left_layout.addWidget(self._panel2)
+        left_layout.addWidget(self._panel3)
         left_layout.addStretch()
         left_layout.addWidget(self._build_buttons())
         splitter.addWidget(left)
@@ -144,7 +152,9 @@ class MainWindow(QMainWindow):
         right_layout.addWidget(self._build_display_controls())
 
         # ── Plot 1: aggregator (per-stream, pre-pipeline) ──
-        self._plot = pg.PlotWidget(title="Aggregator — per-stream wideband")
+        self._plot = pg.PlotWidget(
+            title="[1] Combiner INPUT  —  raw float32 from generators  (ports 50001/50002/50003)"
+        )
         self._plot.setLabel("bottom", "Frequency", units="Hz")
         self._plot.setLabel("left",   "Magnitude", units="dB")
         self._plot.showGrid(x=True, y=True, alpha=0.3)
@@ -158,9 +168,18 @@ class MainWindow(QMainWindow):
             pen=pg.mkPen("y", width=1, style=Qt.DashLine)
         )
         self._plot.addItem(self._ref_line)
+        # Annotation showing data provenance
+        self._plot1_label = pg.TextItem(
+            text="source: Aggregator.last_chunk  (float32, no encoding)",
+            color=(100, 200, 255), anchor=(0, 1),
+        )
+        self._plot1_label.setPos(0, 0)
+        self._plot.addItem(self._plot1_label)
 
-        # ── Plot 2: DIFI receiver (post-pipeline, combined stream) ──
-        self._plot2 = pg.PlotWidget(title="DIFI Receiver — combined output")
+        # ── Plot 2: DIFI receiver (post-pipeline, per-stream) ──
+        self._plot2 = pg.PlotWidget(
+            title="[2] Receiver OUTPUT  —  decoded int16→float32  (port 50010, post full pipeline)"
+        )
         self._plot2.setLabel("bottom", "Frequency", units="Hz")
         self._plot2.setLabel("left",   "Magnitude", units="dB")
         self._plot2.showGrid(x=True, y=True, alpha=0.3)
@@ -173,11 +192,16 @@ class MainWindow(QMainWindow):
             pen=pg.mkPen("y", width=1, style=Qt.DashLine)
         )
         self._plot2.addItem(self._ref_line2)
+        # Annotation updated live with packet counter — proves data is from receiver
+        self._plot2_label = pg.TextItem(
+            text="waiting for receiver packets…",
+            color=(255, 220, 80), anchor=(0, 1),
+        )
+        self._plot2_label.setPos(0, 0)
+        self._plot2.addItem(self._plot2_label)
 
         # Link X-axes: panning/zooming either plot moves both
         self._plot2.setXLink(self._plot)
-
-        self._y_range_applied = False
 
         # Sync display spinboxes when the user pans/zooms plot 1
         self._plot.getPlotItem().getViewBox().sigRangeChanged.connect(
@@ -216,10 +240,6 @@ class MainWindow(QMainWindow):
         self._disp_span = FreqInput(default_hz=5e6)
         row1.addWidget(self._disp_span)
         row1.addStretch()
-        auto_btn = QPushButton("Auto")
-        auto_btn.setFixedWidth(60)
-        auto_btn.clicked.connect(self._auto_display)
-        row1.addWidget(auto_btn)
         vlay.addLayout(row1)
 
         # row 2 — amplitude axis
@@ -293,12 +313,15 @@ class MainWindow(QMainWindow):
 
         p1 = self._panel1
         p2 = self._panel2
+        p3 = self._panel3
         fs = self._shared_fs.value_hz()
 
         rf_ref1  = self._rf_ref_for(p1)
         rf_ref2  = self._rf_ref_for(p2)
+        rf_ref3  = self._rf_ref_for(p3)
         tone1_bb = p1.tone_hz() - rf_ref1
         tone2_bb = p2.tone_hz() - rf_ref2
+        tone3_bb = p3.tone_hz() - rf_ref3
 
         gen1 = DifiGenerator(
             stream_id       = 0x00000001,
@@ -324,6 +347,18 @@ class MainWindow(QMainWindow):
             bandwidth_hz    = p2.bandwidth_hz(),
             ref_level_dbm   = p2.amplitude_dbm(),
         )
+        gen3 = DifiGenerator(
+            stream_id       = 0x00000003,
+            tone_hz         = tone3_bb,
+            signal_type     = p3.signal_type(),
+            dest_port       = 50003,
+            sample_rate_hz  = fs,
+            samples_per_pkt = self.SAMPLES_PER_PKT,
+            bit_depth       = self.BIT_DEPTH,
+            rf_ref_freq_hz  = rf_ref3,
+            bandwidth_hz    = p3.bandwidth_hz(),
+            ref_level_dbm   = p3.amplitude_dbm(),
+        )
 
         capture    = InputCapture(ports=self.CAPTURE_PORTS)
         aggregator = Aggregator(
@@ -336,7 +371,7 @@ class MainWindow(QMainWindow):
         receiver   = DifiReceiver(port=self.RECEIVER_PORT)
 
         self._modules = dict(
-            gen1=gen1, gen2=gen2,
+            gen1=gen1, gen2=gen2, gen3=gen3,
             capture=capture, aggregator=aggregator,
             packetizer=packetizer, sender=sender, receiver=receiver,
         )
@@ -354,6 +389,8 @@ class MainWindow(QMainWindow):
             alias_warnings.append(f"Gen1 RF={p1.tone_hz()/1e6:.3f}MHz bb={tone1_bb/1e6:.3f}MHz")
         if abs(tone2_bb) >= nyquist:
             alias_warnings.append(f"Gen2 RF={p2.tone_hz()/1e6:.3f}MHz bb={tone2_bb/1e6:.3f}MHz")
+        if abs(tone3_bb) >= nyquist:
+            alias_warnings.append(f"Gen3 RF={p3.tone_hz()/1e6:.3f}MHz bb={tone3_bb/1e6:.3f}MHz")
         if alias_warnings:
             self._status.showMessage(
                 f"⚠ Tone exceeds Nyquist ({nyquist/1e6:.3f}MHz): "
@@ -364,19 +401,19 @@ class MainWindow(QMainWindow):
         pkt_rate = fs / self.SAMPLES_PER_PKT
         threading.Thread(target=gen1.run, kwargs=dict(packet_rate_hz=pkt_rate), daemon=True).start()
         threading.Thread(target=gen2.run, kwargs=dict(packet_rate_hz=pkt_rate), daemon=True).start()
+        threading.Thread(target=gen3.run, kwargs=dict(packet_rate_hz=pkt_rate), daemon=True).start()
 
         self._pipeline_running = True
-        self._y_range_applied  = False      # will re-enforce Y after first real data
         self._shared_fs.setEnabled(False)   # lock sample rate while running
         self._start_btn.setEnabled(False)
         self._stop_btn.setEnabled(True)
         self._timer.start()
-        self._apply_range_from_config()   # snap to generator-configured center at start
 
         self._status.showMessage(
             f"Running — fs={fs/1e6:.1f}MHz | "
             f"Gen1:{p1.signal_type()} {p1.tone_hz()/1e6:.3f}MHz | "
-            f"Gen2:{p2.signal_type()} {p2.tone_hz()/1e6:.3f}MHz"
+            f"Gen2:{p2.signal_type()} {p2.tone_hz()/1e6:.3f}MHz | "
+            f"Gen3:{p3.signal_type()} {p3.tone_hz()/1e6:.3f}MHz"
         )
 
     def _stop_pipeline(self):
@@ -391,6 +428,7 @@ class MainWindow(QMainWindow):
         m["receiver"].stop()
         m["gen1"].close()
         m["gen2"].close()
+        m["gen3"].close()
         self._pipeline_running = False
         self._shared_fs.setEnabled(True)    # unlock sample rate
         self._start_btn.setEnabled(True)
@@ -427,27 +465,48 @@ class MainWindow(QMainWindow):
             combined_freqs = np.concatenate(all_freqs)
             combined_mags  = np.concatenate(all_mags)
             sort_idx       = np.argsort(combined_freqs)
+            # Live annotation: confirms data source and shows chunk counter
+            sids_agg = " + ".join(f"0x{s.stream_id:08X}" for s in chunk.streams)
+            self._plot1_label.setText(
+                f"source: Aggregator.last_chunk  (float32, no encoding)  |  "
+                f"chunks: {agg.chunks_emitted:,}  |  streams: {sids_agg}"
+            )
             self._curve.setData(combined_freqs[sort_idx], combined_mags[sort_idx])
 
-        # ── Plot 2: DIFI receiver — combined output ───────────────────────────
-        # Shows what arrives after the full packetizer → sender → receiver path.
-        rx  = self._modules.get("receiver")
-        ctx = rx.context if rx else None
-        if rx and ctx:
-            iq     = rx.get_iq_snapshot()
-            n      = len(iq)
-            fs     = ctx.sample_rate_hz
-            rf_ref = ctx.rf_ref_freq_hz
-            window = np.hanning(n)
-            X      = np.fft.fftshift(np.fft.fft(iq * window))
-            mag_db = 20 * np.log10(np.abs(X) / n + 1e-7)
-            freqs  = np.fft.fftshift(np.fft.fftfreq(n, d=1.0 / fs)) + rf_ref
-            self._curve2.setData(freqs, mag_db)
-
-        # ── Auto-range on first real frame ────────────────────────────────────
-        if not self._y_range_applied and all_freqs:
-            self._auto_display_from_chunk(chunk)
-            self._y_range_applied = True
+        # ── Plot 2: DIFI receiver — per-stream output ─────────────────────────
+        # Each stream arrives with its original Stream ID; FFT each independently
+        # and paint at its absolute RF position — identical pattern to Plot 1.
+        rx = self._modules.get("receiver")
+        if rx:
+            snaps      = rx.get_stream_snapshots()
+            all_freqs2 = []
+            all_mags2  = []
+            for _sid, (iq2, ctx2) in snaps.items():
+                if ctx2 is None or len(iq2) == 0:
+                    continue
+                n2     = len(iq2)
+                fs2    = ctx2.sample_rate_hz
+                lo2    = ctx2.rf_ref_freq_hz
+                win2   = np.hanning(n2)
+                X2     = np.fft.fftshift(np.fft.fft(iq2 * win2))
+                mdb2   = 20 * np.log10(np.abs(X2) / n2 + 1e-7)
+                frq2   = np.fft.fftshift(np.fft.fftfreq(n2, d=1.0 / fs2)) + lo2
+                all_freqs2.append(frq2)
+                all_mags2.append(mdb2)
+            if all_freqs2:
+                cf2   = np.concatenate(all_freqs2)
+                cm2   = np.concatenate(all_mags2)
+                idx2  = np.argsort(cf2)
+                self._curve2.setData(cf2[idx2], cm2[idx2])
+            # Live annotation proves this data comes from the receiver, not the aggregator
+            n_rx_pkts = rx.data_received
+            n_streams = len(snaps)
+            sid_list  = " + ".join(f"0x{s:08X}" for s in snaps)
+            self._plot2_label.setText(
+                f"source: DifiReceiver  (int16→float32)  |  "
+                f"UDP pkts received: {n_rx_pkts:,}  |  "
+                f"streams: {sid_list if sid_list else 'none yet'}"
+            )
 
         # ── Status bar: streams + pipeline latency ────────────────────────────
         active_los = sorted(
@@ -472,11 +531,13 @@ class MainWindow(QMainWindow):
             return
         gen1 = self._modules.get("gen1")
         gen2 = self._modules.get("gen2")
-        if not gen1 or not gen2:
+        gen3 = self._modules.get("gen3")
+        if not gen1 or not gen2 or not gen3:
             return
-        p1, p2   = self._panel1, self._panel2
+        p1, p2, p3 = self._panel1, self._panel2, self._panel3
         rf_ref1  = self._rf_ref_for(p1)
         rf_ref2  = self._rf_ref_for(p2)
+        rf_ref3  = self._rf_ref_for(p3)
         gen1.update_params(
             tone_hz        = p1.tone_hz() - rf_ref1,
             signal_type    = p1.signal_type(),
@@ -490,6 +551,13 @@ class MainWindow(QMainWindow):
             bandwidth_hz   = p2.bandwidth_hz(),
             rf_ref_freq_hz = rf_ref2,
             ref_level_dbm  = p2.amplitude_dbm(),
+        )
+        gen3.update_params(
+            tone_hz        = p3.tone_hz() - rf_ref3,
+            signal_type    = p3.signal_type(),
+            bandwidth_hz   = p3.bandwidth_hz(),
+            rf_ref_freq_hz = rf_ref3,
+            ref_level_dbm  = p3.amplitude_dbm(),
         )
         rx = self._modules.get("receiver")
         if rx:
@@ -508,89 +576,6 @@ class MainWindow(QMainWindow):
         # plot2 X is linked; only need to set Y independently
         self._plot2.setYRange(y_lo, y_hi, padding=0)
         self._ref_line2.setValue(amp_top)
-
-    def _apply_range_from_config(self):
-        """Snap display to the actual signal frequencies (panel RF Frequency values).
-
-        Uses panel.tone_hz() (absolute RF) for center — not the LO — so that
-        signals near 0 Hz LO are not lost in a full-Nyquist-span view.
-        """
-        p1, p2 = self._panel1, self._panel2
-        active = [(p.tone_hz(), p) for p in [p1, p2]
-                  if p.signal_type() != SIGNAL_OFF]
-        if not active:
-            active = [(p1.tone_hz(), p1), (p2.tone_hz(), p2)]
-
-        tones  = [t for t, _ in active]
-        bws    = [p.bandwidth_hz() for _, p in active if p.signal_type() == SIGNAL_BW]
-
-        center     = sum(tones) / len(tones)
-        tone_span  = max(tones) - min(tones)
-        max_bw     = max(bws) if bws else 0
-        min_span   = self._shared_fs.value_hz() / 20   # at least 5% of Nyquist for context
-
-        span = max(tone_span * 2 + max_bw * 3, max_bw * 4, min_span)
-        span = min(span, self._shared_fs.value_hz())
-        self._set_disp_range(center, span)
-
-    def _auto_display_from_chunk(self, chunk):
-        """Fit display to the actual signal content detected in the chunk.
-
-        Uses power-weighted spectral centroid per stream so the view centers
-        on the actual signal even when LO = 0 Hz and the tone is a small
-        offset inside a large Nyquist band.
-        """
-        active = [s for s in chunk.streams if np.any(s.samples != 0)]
-        if not active:
-            active = chunk.streams
-
-        centers = []
-        bws     = []
-        for s in active:
-            n  = len(s.samples)
-            fs = s.context.sample_rate_hz
-            lo = s.context.rf_ref_freq_hz
-
-            power    = np.abs(np.fft.fft(s.samples)) ** 2
-            power[0] = 0.0   # suppress DC
-            freqs_bb = np.fft.fftfreq(n, d=1.0 / fs)
-
-            total = float(power.sum())
-            centroid_bb = float((freqs_bb * power).sum() / total) if total > 0 else 0.0
-            centers.append(lo + centroid_bb)
-
-            # 3dB bandwidth: count bins above half-max power
-            n_above = int(np.sum(power > power.max() / 2.0))
-            bws.append(n_above / n * fs)
-
-        if not centers:
-            self._apply_range()
-            return
-
-        sig_center = sum(centers) / len(centers)
-        sig_spread = max(centers) - min(centers) if len(centers) > 1 else 0
-        max_bw     = max(bws)
-        min_span   = active[0].context.sample_rate_hz / 20
-
-        span = max(sig_spread * 2 + max_bw * 3, max_bw * 4, min_span)
-        span = min(span, active[0].context.sample_rate_hz)
-
-        self._disp_center.set_hz(sig_center)
-        self._disp_span.set_hz(span)
-        self._disp_amp.setValue(-10.0)
-        self._disp_dbdiv.setValue(10.0)
-        self._apply_range()
-
-    def _auto_display(self):
-        """Fit display to cover all active streams (triggered by Auto button or first frame)."""
-        if not self._pipeline_running:
-            return
-        agg   = self._modules.get("aggregator")
-        chunk = agg.last_chunk if agg else None
-        if chunk is None:
-            QTimer.singleShot(300, self._auto_display)
-            return
-        self._auto_display_from_chunk(chunk)
 
     def _sync_viewport_to_spinboxes(self, ranges):
         """Keep X-axis display spinboxes in sync when user pans/zooms the plot."""
