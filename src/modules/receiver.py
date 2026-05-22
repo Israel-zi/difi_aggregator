@@ -12,9 +12,17 @@ Per-stream rolling IQ buffers are maintained; callers use
 get_stream_snapshots() to retrieve all active streams at once for display.
 """
 
+import os
+import sys
 import socket
 import threading
+
 import numpy as np
+
+if not getattr(sys, 'frozen', False):
+    _src = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if _src not in sys.path:
+        sys.path.insert(0, _src)
 
 from core.difi_packet import (
     DifiDataPacket,

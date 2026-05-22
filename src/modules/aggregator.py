@@ -20,11 +20,19 @@ Aggregation strategy (PoC)
     as separate sub-streams inside the unified DIFI packet stream.
 """
 
+import os
+import sys
 import queue
 import time
 import threading
+
 import numpy as np
 from dataclasses import dataclass, field
+
+if not getattr(sys, 'frozen', False):
+    _src = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if _src not in sys.path:
+        sys.path.insert(0, _src)
 
 from core.difi_packet import DifiDataPacket, DifiContextPacket
 from modules.input_capture import CapturedPacket, InputCapture
@@ -99,8 +107,13 @@ class StreamBuffer:
     def ready(self, chunk_size: int) -> bool:
         return self._total >= chunk_size and self.context is not None
 
-    def consume(self, chunk_size: int) -> np.ndarray:
-        """Return exactly `chunk_size` samples, keeping the remainder."""
+    def consume(self, chunk_size: int, sample_rate_hz: float = 0.0) -> np.ndarray:
+        """Return exactly `chunk_size` samples, keeping the remainder.
+
+        When sample_rate_hz is provided and a remainder exists, advances
+        data_ts_int/frac to the correct start time of the next chunk so
+        that downstream timestamps stay accurate even when packets pile up.
+        """
         all_samples = np.concatenate(self._samples).astype(np.complex64)
         out         = all_samples[:chunk_size]
         remainder   = all_samples[chunk_size:]
@@ -108,9 +121,15 @@ class StreamBuffer:
         if len(remainder) > 0:
             self._samples = [remainder]
             self._total   = len(remainder)
+            if sample_rate_hz > 0:
+                ps_advance        = int(chunk_size * 1_000_000_000_000 / sample_rate_hz)
+                new_frac          = self.data_ts_frac + ps_advance
+                self.data_ts_int  += new_frac // 1_000_000_000_000
+                self.data_ts_frac  = new_frac %  1_000_000_000_000
         else:
             self._samples = []
             self._total   = 0
+            # data_ts will be latched fresh on the next add_data() when _total == 0
 
         return out
 
@@ -251,14 +270,17 @@ class Aggregator:
         # build one StreamBlock per stream
         blocks = []
         for sid in sorted(active):
-            buf = self._buffers[sid]
+            buf     = self._buffers[sid]
+            ts_int  = buf.data_ts_int    # save before consume advances the timestamp
+            ts_frac = buf.data_ts_frac
+            fs      = buf.context.sample_rate_hz if buf.context else 0.0
             blocks.append(StreamBlock(
                 stream_id    = sid,
-                samples      = buf.consume(self._chunk_size),
+                samples      = buf.consume(self._chunk_size, sample_rate_hz=fs),
                 context      = buf.context,
                 received_at  = buf.last_update,
-                data_ts_int  = buf.data_ts_int,
-                data_ts_frac = buf.data_ts_frac,
+                data_ts_int  = ts_int,
+                data_ts_frac = ts_frac,
             ))
 
         chunk = AggregatedChunk(streams=blocks)
@@ -274,6 +296,19 @@ class Aggregator:
                 print(f"[Aggregator] Output queue full — chunk dropped (total: {self.packets_dropped})")
 
     # ── diagnostics ────────────────────────────────────────────────────────
+
+    def update_stream_filter(self, allowed_ids: set):
+        """
+        Dynamically restrict which stream IDs are included in aggregated chunks.
+        Takes effect on the next _try_emit_chunk call (no pipeline restart needed).
+        Pass None to revert to accepting all discovered streams.
+        """
+        if allowed_ids is None:
+            self._expected       = None
+            self._expected_count = None
+        else:
+            self._expected       = frozenset(allowed_ids)
+            self._expected_count = len(allowed_ids)
 
     def flush_queue(self):
         """Drain the output queue so stale chunks don't reach the receiver."""

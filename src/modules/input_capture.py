@@ -12,12 +12,20 @@ Each port corresponds to one DIFI stream:
   Port 50002 -> Stream ID 0x00000002 (Modem 2)
 """
 
+import heapq
+import os
+import sys
 import socket
 import struct
 import threading
 import queue
 import time
 from dataclasses import dataclass
+
+if not getattr(sys, 'frozen', False):
+    _src = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if _src not in sys.path:
+        sys.path.insert(0, _src)
 
 from core.difi_packet import (
     DifiDataPacket,
@@ -207,6 +215,127 @@ class InputCapture:
     @property
     def queue_size(self) -> int:
         return self._out_queue.qsize()
+
+
+# ─────────────────────────────────────────────
+# Jitter / reorder buffer (WAN deployments)
+# ─────────────────────────────────────────────
+
+class JitterBuffer:
+    """
+    Per-stream timestamp-ordered reorder buffer for WAN deployments.
+
+    Sits between InputCapture and Aggregator.  DIFI Data packets are held
+    per stream in a min-heap keyed by (timestamp_int, timestamp_frac) and
+    released in chronological order once they have been in the buffer for at
+    least ``hold_ms`` milliseconds.  This absorbs network jitter up to
+    ``hold_ms`` and corrects out-of-order packet arrival within each stream.
+
+    Context packets are forwarded immediately (stateless, no IQ data).
+
+    With ``hold_ms=0`` (the default, appropriate for LAN) this is a
+    zero-overhead pass-through equivalent to using InputCapture directly.
+
+    Parameters
+    ----------
+    capture  : InputCapture to read raw packets from.
+    hold_ms  : Jitter budget in milliseconds.
+               0  → LAN pass-through (zero added latency).
+               100-300 → typical WAN setting.
+    """
+
+    def __init__(self, capture: InputCapture, hold_ms: float = 0.0):
+        self._capture = capture
+        self._hold_s  = hold_ms / 1000.0
+        self._enabled = hold_ms > 0
+
+        # per-stream min-heap of (ts_int, ts_frac, arrival_mono, CapturedPacket)
+        self._heaps: dict = {}
+        self._lock        = threading.Lock()
+
+        self._out_queue = queue.Queue(maxsize=256)
+        self._stop_evt  = threading.Event()
+        self._thread    = threading.Thread(
+            target=self._run, daemon=True, name="jitter-buffer"
+        )
+
+        self.gaps_detected = 0
+
+    # ── lifecycle ──────────────────────────────────────────────────────────
+
+    def start(self):
+        self._thread.start()
+        mode = f"hold={self._hold_s * 1000:.0f} ms (WAN)" if self._enabled else "pass-through (LAN)"
+        print(f"[JitterBuffer] Started — {mode}")
+
+    def stop(self):
+        self._stop_evt.set()
+        self._thread.join(timeout=3.0)
+        print(f"[JitterBuffer] Stopped | gaps detected: {self.gaps_detected}")
+
+    def get(self, timeout: float = 0.1):
+        """Drop-in replacement for InputCapture.get()."""
+        try:
+            return self._out_queue.get(timeout=timeout)
+        except queue.Empty:
+            return None
+
+    # ── internal ──────────────────────────────────────────────────────────
+
+    def _run(self):
+        while not self._stop_evt.is_set():
+            captured = self._capture.get(timeout=0.02)
+            if captured is not None:
+                if not self._enabled:
+                    try:
+                        self._out_queue.put_nowait(captured)
+                    except queue.Full:
+                        pass
+                else:
+                    self._push(captured)
+            if self._enabled:
+                self._drain(time.monotonic())
+
+    def _push(self, captured: CapturedPacket):
+        pkt = captured.packet
+        sid = pkt.stream_id
+
+        if not isinstance(pkt, DifiDataPacket):
+            # Context packets carry no IQ samples — forward immediately.
+            try:
+                self._out_queue.put_nowait(captured)
+            except queue.Full:
+                pass
+            return
+
+        with self._lock:
+            if sid not in self._heaps:
+                self._heaps[sid] = []
+            heapq.heappush(
+                self._heaps[sid],
+                (pkt.timestamp_int, pkt.timestamp_frac, captured.received_at, captured),
+            )
+
+    def _drain(self, now: float):
+        """
+        Release packets whose hold window has expired.
+
+        Each packet is held for at least hold_s seconds after it arrived.
+        By that time, any packet with a smaller DIFI timestamp that was still
+        in transit across the WAN should have arrived — or is declared lost.
+        Packets are always emitted in ascending (ts_int, ts_frac) order.
+        """
+        with self._lock:
+            for sid, heap in self._heaps.items():
+                while heap:
+                    ts_int, ts_frac, recv_t, captured = heap[0]
+                    if now - recv_t < self._hold_s:
+                        break   # oldest packet hasn't waited long enough yet
+                    heapq.heappop(heap)
+                    try:
+                        self._out_queue.put_nowait(captured)
+                    except queue.Full:
+                        self.gaps_detected += 1
 
 
 # ─────────────────────────────────────────────

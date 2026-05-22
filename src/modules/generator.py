@@ -8,10 +8,18 @@ Signal types:
   BW  — bandpass-filtered AWGN (simulates a real waveform occupying BW Hz)
 """
 
+import os
+import sys
 import socket
 import time
+
 import numpy as np
 from scipy import signal as scipy_signal
+
+if not getattr(sys, 'frozen', False):
+    _src = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if _src not in sys.path:
+        sys.path.insert(0, _src)
 
 from core.difi_packet import (
     DifiDataPacket,
@@ -129,13 +137,15 @@ class DifiGenerator:
         # independent I and Q noise → each lowpass-filtered (state-continuous)
         noise_i = np.random.randn(n).astype(np.float32)
         noise_q = np.random.randn(n).astype(np.float32)
-        filt_i, self._bw_zi_i = scipy_signal.lfilter(
+        filt_i, zi_i = scipy_signal.lfilter(
             self._bw_filter, [1.0], noise_i, zi=self._bw_zi_i
         )
-        filt_q, self._bw_zi_q = scipy_signal.lfilter(
+        self._bw_zi_i = np.asarray(zi_i)
+        filt_q, zi_q = scipy_signal.lfilter(
             self._bw_filter, [1.0], noise_q, zi=self._bw_zi_q
         )
-        baseband = (filt_i + 1j * filt_q).astype(np.complex64)
+        self._bw_zi_q = np.asarray(zi_q)
+        baseband = (np.asarray(filt_i) + 1j * np.asarray(filt_q)).astype(np.complex64)
 
         # shift to center frequency
         t   = np.arange(n) / self.sample_rate_hz
@@ -193,12 +203,12 @@ class DifiGenerator:
 
     def update_params(
         self,
-        tone_hz: float       = None,
-        signal_type: str     = None,
-        bandwidth_hz: float  = None,
-        rf_ref_freq_hz: float = None,
-        ref_level_dbm: float = None,
-        sample_rate_hz: float = None,
+        tone_hz: float | None        = None,
+        signal_type: str | None      = None,
+        bandwidth_hz: float | None   = None,
+        rf_ref_freq_hz: float | None = None,
+        ref_level_dbm: float | None  = None,
+        sample_rate_hz: float | None = None,
     ):
         """Update generator parameters at runtime (thread-safe for simple types)."""
         rebuild_filter = False

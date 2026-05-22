@@ -18,7 +18,7 @@ from PySide6.QtWidgets import (
 import pyqtgraph as pg
 
 from modules.generator     import DifiGenerator, SIGNAL_CW, SIGNAL_BW, SIGNAL_OFF
-from modules.input_capture import InputCapture
+from modules.input_capture import InputCapture, JitterBuffer
 from modules.aggregator    import Aggregator
 from modules.packetizer    import Packetizer
 from modules.sender        import DifiSender
@@ -26,53 +26,32 @@ from modules.receiver      import DifiReceiver
 from ui.freq_input         import FreqInput
 
 
-def _combined_spectrum(streams, seg_len=1024, overlap=0.5):
-    """
-    Welch power spectrum across all streams on a shared frequency grid.
-    Each stream is split into overlapping segments of `seg_len` samples;
-    per-segment powers are averaged (reducing noise variance by ~1/N_segments)
-    then interpolated onto a common axis and summed across streams.
-    """
-    valid = [(iq, ctx) for iq, ctx in streams
-             if ctx is not None and len(iq) > 0]
-    if not valid:
-        return np.array([]), np.array([])
+_STREAM_COLORS = [
+    (100, 220, 255),  # stream index 0 — cyan
+    (255, 170,  50),  # stream index 1 — orange
+    (100, 255, 100),  # stream index 2 — lime
+    (255, 100, 255),  # stream index 3+ — magenta
+]
 
-    edges = [(ctx.rf_ref_freq_hz - ctx.sample_rate_hz / 2,
-              ctx.rf_ref_freq_hz + ctx.sample_rate_hz / 2)
-             for _, ctx in valid]
-    f_lo = min(lo for lo, _ in edges)
-    f_hi = max(hi for _, hi in edges)
 
-    f_grid    = np.linspace(f_lo, f_hi, seg_len)
-    power_sum = np.zeros(seg_len)
+def _stream_color(sid: int):
+    return pg.mkPen(_STREAM_COLORS[(sid - 1) % len(_STREAM_COLORS)], width=1)
 
-    hop   = max(1, int(seg_len * (1.0 - overlap)))
+
+def _stream_fft(iq, ctx, seg_len: int = 1024):
+    """Single-window Hann FFT magnitude spectrum for one IQ buffer."""
     w     = np.hanning(seg_len)
-    w_pow = float(np.sum(w)) ** 2   # amplitude normalisation: tone peak → correct dBm
-
-    for iq, ctx in valid:
-        n     = len(iq)
-        fs    = ctx.sample_rate_hz
-        rf    = ctx.rf_ref_freq_hz
-        freqs = np.fft.fftshift(np.fft.fftfreq(seg_len, d=1.0 / fs)) + rf
-
-        starts = list(range(0, max(1, n - seg_len + 1), hop))
-        if not starts:
-            starts = [0]
-
-        seg_power = np.zeros(seg_len)
-        for s in starts:
-            seg = iq[s : s + seg_len]
-            if len(seg) < seg_len:
-                seg = np.pad(seg, (0, seg_len - len(seg)))
-            X = np.fft.fftshift(np.fft.fft(seg * w))
-            seg_power += np.abs(X) ** 2
-
-        seg_power /= len(starts) * w_pow
-        power_sum += np.interp(f_grid, freqs, seg_power, left=0.0, right=0.0)
-
-    return f_grid, 10 * np.log10(power_sum + 1e-14)
+    w_amp = float(np.sum(w))
+    n     = min(len(iq), seg_len)
+    seg   = iq[-n:].copy()
+    if n < seg_len:
+        seg = np.pad(seg, (0, seg_len - n))
+    X      = np.fft.fftshift(np.fft.fft(seg * w))
+    mag_db = 20.0 * np.log10(np.abs(X) / w_amp + 1e-7)
+    freqs  = np.fft.fftshift(
+        np.fft.fftfreq(seg_len, d=1.0 / ctx.sample_rate_hz)
+    ) + ctx.rf_ref_freq_hz
+    return freqs, mag_db
 
 
 class GeneratorPanel(QGroupBox):
@@ -127,7 +106,7 @@ class GeneratorPanel(QGroupBox):
         grid.addWidget(self._amp, 4, 1)
 
         for rb in (self._cw_rb, self._bw_rb, self._off_rb):
-            rb.toggled.connect(lambda: self._bw.setEnabled(self._bw_rb.isChecked()))
+            rb.toggled.connect(lambda checked: self._bw.setEnabled(self._bw_rb.isChecked()))
         self._bw.setEnabled(default_signal_type == SIGNAL_BW)
 
         # emit changed whenever any control is modified
@@ -169,7 +148,7 @@ class MainWindow(QMainWindow):
         central = QWidget()
         self.setCentralWidget(central)
         root     = QVBoxLayout(central)
-        splitter = QSplitter(Qt.Horizontal)
+        splitter = QSplitter(Qt.Orientation.Horizontal)
         root.addWidget(splitter)
 
         # ── left panel ──
@@ -183,6 +162,24 @@ class MainWindow(QMainWindow):
         self._shared_fs = FreqInput(default_hz=10e6)
         fs_layout.addWidget(self._shared_fs)
         left_layout.addWidget(fs_box)
+
+        net_box    = QGroupBox("Network / Jitter Buffer")
+        net_layout = QHBoxLayout(net_box)
+        net_layout.addWidget(QLabel("Reorder hold:"))
+        self._hold_ms = QSpinBox()
+        self._hold_ms.setRange(0, 2000)
+        self._hold_ms.setValue(0)
+        self._hold_ms.setSuffix(" ms")
+        self._hold_ms.setFixedWidth(90)
+        self._hold_ms.setToolTip(
+            "0 ms = LAN mode (pass-through, no added latency).\n"
+            "Set to the expected one-way WAN jitter (e.g. 100-300 ms)\n"
+            "so that out-of-order packets from each generator are\n"
+            "sorted by timestamp before reaching the aggregator."
+        )
+        net_layout.addWidget(self._hold_ms)
+        net_layout.addStretch()
+        left_layout.addWidget(net_box)
 
         self._panel1 = GeneratorPanel(1)
         self._panel2 = GeneratorPanel(2)
@@ -211,10 +208,10 @@ class MainWindow(QMainWindow):
         self._plot.getPlotItem().getViewBox().enableAutoRange(enable=False)
         self._plot.setYRange(-110, -10, padding=0)
         self._plot.setXRange(0, 5e6, padding=0)
-        self._curve1 = self._plot.plot([], [], pen=pg.mkPen("c", width=1))
+        self._curves1: dict = {}  # stream_id → PlotDataItem
         self._ref_line = pg.InfiniteLine(
             angle=0, movable=False,
-            pen=pg.mkPen("y", width=1, style=Qt.DashLine)
+            pen=pg.mkPen("y", width=1, style=Qt.PenStyle.DashLine)
         )
         self._plot.addItem(self._ref_line)
         # Annotation showing data provenance
@@ -235,10 +232,10 @@ class MainWindow(QMainWindow):
         self._plot2.enableAutoRange(axis="xy", enable=False)
         self._plot2.getPlotItem().getViewBox().enableAutoRange(enable=False)
         self._plot2.setYRange(-110, -10, padding=0)
-        self._curve2 = self._plot2.plot([], [], pen=pg.mkPen("c", width=1))
+        self._curves2: dict = {}  # stream_id → PlotDataItem
         self._ref_line2 = pg.InfiniteLine(
             angle=0, movable=False,
-            pen=pg.mkPen("y", width=1, style=Qt.DashLine)
+            pen=pg.mkPen("y", width=1, style=Qt.PenStyle.DashLine)
         )
         self._plot2.addItem(self._ref_line2)
         # Annotation updated live with packet counter — proves data is from receiver
@@ -257,7 +254,7 @@ class MainWindow(QMainWindow):
             lambda vb, ranges: self._sync_viewport_to_spinboxes(ranges)
         )
 
-        plots_splitter = QSplitter(Qt.Vertical)
+        plots_splitter = QSplitter(Qt.Orientation.Vertical)
         plots_splitter.addWidget(self._plot)
         plots_splitter.addWidget(self._plot2)
         plots_splitter.setSizes([300, 300])
@@ -410,8 +407,9 @@ class MainWindow(QMainWindow):
         )
 
         capture    = InputCapture(ports=self.CAPTURE_PORTS)
+        jitter     = JitterBuffer(capture, hold_ms=self._hold_ms.value())
         aggregator = Aggregator(
-            capture          = capture,
+            capture          = jitter,
             expected_streams = self.EXPECTED_STREAMS,
             chunk_size       = self.SAMPLES_PER_PKT,
         )
@@ -421,12 +419,13 @@ class MainWindow(QMainWindow):
 
         self._modules = dict(
             gen1=gen1, gen2=gen2, gen3=gen3,
-            capture=capture, aggregator=aggregator,
+            capture=capture, jitter=jitter, aggregator=aggregator,
             packetizer=packetizer, sender=sender, receiver=receiver,
         )
 
         receiver.start();  time.sleep(0.05)
         capture.start();   time.sleep(0.05)
+        jitter.start()
         aggregator.start()
         packetizer.start()
         sender.start()
@@ -454,6 +453,7 @@ class MainWindow(QMainWindow):
 
         self._pipeline_running = True
         self._shared_fs.setEnabled(False)   # lock sample rate while running
+        self._hold_ms.setEnabled(False)     # lock jitter budget while running
         self._start_btn.setEnabled(False)
         self._stop_btn.setEnabled(True)
         self._timer.start()
@@ -473,6 +473,7 @@ class MainWindow(QMainWindow):
         m["sender"].stop()
         m["packetizer"].stop()
         m["aggregator"].stop()
+        m["jitter"].stop()
         m["capture"].stop()
         m["receiver"].stop()
         m["gen1"].close()
@@ -480,6 +481,7 @@ class MainWindow(QMainWindow):
         m["gen3"].close()
         self._pipeline_running = False
         self._shared_fs.setEnabled(True)    # unlock sample rate
+        self._hold_ms.setEnabled(True)      # unlock jitter budget
         self._start_btn.setEnabled(True)
         self._stop_btn.setEnabled(False)
         self._status.showMessage("Stopped")
@@ -492,25 +494,34 @@ class MainWindow(QMainWindow):
         if chunk is None:
             return
 
-        # ── Plot 1: aggregator — combined power spectrum ──────────────────────
-        agg_streams = [(s.samples, s.context) for s in chunk.streams]
-        sids_agg    = [f"0x{s.stream_id:08X}" for s in chunk.streams if len(s.samples) > 0]
-        f1, m1 = _combined_spectrum(agg_streams)
-        if len(f1):
-            self._curve1.setData(f1, m1)
+        # ── Plot 1: aggregator — per-stream spectra (generator inputs) ─────────
+        active_sids1 = []
+        for s in chunk.streams:
+            if s.context is None or len(s.samples) == 0:
+                continue
+            sid = s.stream_id
+            active_sids1.append(f"0x{sid:08X}")
+            if sid not in self._curves1:
+                self._curves1[sid] = self._plot.plot([], [], pen=_stream_color(sid))
+            f, m = _stream_fft(s.samples, s.context)
+            self._curves1[sid].setData(f, m)
+        if active_sids1:
             self._plot1_label.setText(
                 f"source: Aggregator.last_chunk  (float32, no encoding)  |  "
-                f"chunks: {agg.chunks_emitted:,}  |  streams: {' + '.join(sids_agg)}"
+                f"chunks: {agg.chunks_emitted:,}  |  streams: {' + '.join(active_sids1)}"
             )
 
-        # ── Plot 2: DIFI receiver — combined power spectrum ───────────────────
+        # ── Plot 2: DIFI receiver — per-stream spectra (combiner output) ────────
         rx = self._modules.get("receiver")
         if rx:
             snaps = rx.get_stream_snapshots()
-            rx_streams = [(iq, ctx) for iq, ctx in snaps.values()]
-            f2, m2 = _combined_spectrum(rx_streams)
-            if len(f2):
-                self._curve2.setData(f2, m2)
+            for sid, (iq, ctx_s) in snaps.items():
+                if ctx_s is None or len(iq) == 0:
+                    continue
+                if sid not in self._curves2:
+                    self._curves2[sid] = self._plot2.plot([], [], pen=_stream_color(sid))
+                f, m = _stream_fft(iq, ctx_s)
+                self._curves2[sid].setData(f, m)
             sid_list = " + ".join(f"0x{s:08X}" for s in snaps)
             self._plot2_label.setText(
                 f"source: DifiReceiver  (int16→float32)  |  "

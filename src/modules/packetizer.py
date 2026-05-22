@@ -15,9 +15,16 @@ IEEE-ISTO Std 4900-2021 Figure 7:
    Stream IDs."
 """
 
+import os
+import sys
 import queue
 import time
 import threading
+
+if not getattr(sys, 'frozen', False):
+    _src = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if _src not in sys.path:
+        sys.path.insert(0, _src)
 
 from core.difi_packet import (
     DifiDataPacket,
@@ -186,8 +193,8 @@ class Packetizer:
 
 if __name__ == "__main__":
     import numpy as np
-    from core.difi_packet import DifiDataPacket, DifiContextPacket, now_timestamp
-    from modules.aggregator import AggregatedChunk, StreamBlock
+    from core.difi_packet import now_timestamp
+    from modules.aggregator import AggregatedChunk
 
     print("=== Packetizer Self-Test (stream-ID preservation) ===\n")
 

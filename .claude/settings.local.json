@@ -19,7 +19,14 @@
       "PowerShell(Get-ChildItem \"C:\\\\Users\\\\276709\\\\PycharmProjects\\\\difi_aggregator\\\\dist\" | Format-Table Name, @{N=\"Size_MB\";E={[math]::Round\\($_.Length/1MB,1\\)}}, LastWriteTime -AutoSize)",
       "PowerShell(Get-ChildItem \"C:\\\\Users\\\\276709\\\\PycharmProjects\\\\difi_aggregator\\\\dist\" | Format-Table Name, @{N=\"MB\";E={[math]::Round\\($_.Length/1MB,1\\)}}, LastWriteTime -AutoSize)",
       "Bash(Get-Item \"C:\\\\Users\\\\276709\\\\PycharmProjects\\\\difi_aggregator\\\\dist\\\\Receiver.exe\")",
-      "Bash(Select-Object Name, Length, LastWriteTime)"
+      "Bash(Select-Object Name, Length, LastWriteTime)",
+      "Bash(dir /s /b *.py)",
+      "Bash(Sort-Object)",
+      "Bash(Select-Object -ExpandProperty FullName)",
+      "Bash(pyinstaller --noconfirm Transmitter.spec)",
+      "Bash(pyinstaller --noconfirm Combiner.spec)",
+      "Bash(pyinstaller --noconfirm Receiver.spec)",
+      "Bash(dir C:\\\\Users\\\\276709\\\\PycharmProjects\\\\difi_aggregator\\\\dist *)"
     ]
   }
 }

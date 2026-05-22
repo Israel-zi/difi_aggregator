@@ -6,10 +6,10 @@ DIFI Aggregator — Combiner GUI.
 Runs on the Combiner VM.
 Receives DIFI streams from Transmitter VMs on configurable listen ports,
 re-packetizes them preserving original Stream IDs (read from the DIFI
-packet header — not configured here), and forwards all streams to a single
-destination port on the Receiver VM.
+packet header — not configured here), and forwards selected streams to a
+single destination port on the Receiver VM.
 
-Includes a live spectrum display of the aggregated streams.
+Includes a live per-stream spectrum display of the aggregated inputs.
 """
 
 import os
@@ -27,27 +27,58 @@ from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QGroupBox, QStatusBar,
-    QLineEdit, QSpinBox, QDoubleSpinBox, QScrollArea, QFrame, QSplitter,
+    QLineEdit, QSpinBox, QDoubleSpinBox, QCheckBox, QSplitter,
 )
 import pyqtgraph as pg
 
-from modules.input_capture import InputCapture
+from modules.input_capture import InputCapture, JitterBuffer
 from modules.aggregator    import Aggregator
 from modules.packetizer    import Packetizer
 from modules.sender        import DifiSender
 from ui.freq_input         import FreqInput
 
 
-class StreamRow(QWidget):
-    """One listen-stream row: index + port + auto-discovered stream ID + LED + remove."""
+_STREAM_COLORS = [
+    (100, 220, 255),  # stream index 0 — cyan
+    (255, 170,  50),  # stream index 1 — orange
+    (100, 255, 100),  # stream index 2 — lime
+    (255, 100, 255),  # stream index 3+ — magenta
+]
 
-    removed = Signal(object)
+
+def _stream_color(sid: int):
+    return pg.mkPen(_STREAM_COLORS[(sid - 1) % len(_STREAM_COLORS)], width=1)
+
+
+def _stream_fft(iq, ctx, seg_len: int = 1024):
+    """Single-window Hann FFT magnitude spectrum for one IQ buffer."""
+    w     = np.hanning(seg_len)
+    w_amp = float(np.sum(w))
+    n     = min(len(iq), seg_len)
+    seg   = iq[-n:].copy()
+    if n < seg_len:
+        seg = np.pad(seg, (0, seg_len - n))
+    X      = np.fft.fftshift(np.fft.fft(seg * w))
+    mag_db = 20.0 * np.log10(np.abs(X) / w_amp + 1e-7)
+    freqs  = np.fft.fftshift(
+        np.fft.fftfreq(seg_len, d=1.0 / ctx.sample_rate_hz)
+    ) + ctx.rf_ref_freq_hz
+    return freqs, mag_db
+
+
+class StreamRow(QWidget):
+    """One listen-stream row: index + port + auto-discovered stream ID + forward checkbox + LED + remove."""
+
+    removed        = Signal(object)
+    filter_changed = Signal()
 
     def __init__(self, index: int, default_port: int, parent=None):
         super().__init__(parent)
         lay = QHBoxLayout(self)
         lay.setContentsMargins(2, 2, 2, 2)
         lay.setSpacing(6)
+
+        self._sid_val: int | None = None
 
         self._idx_lbl = QLabel(f"{index}")
         self._idx_lbl.setFixedWidth(18)
@@ -58,16 +89,26 @@ class StreamRow(QWidget):
         self._port = QSpinBox()
         self._port.setRange(1024, 65535)
         self._port.setValue(default_port)
-        self._port.setFixedWidth(110)
+        self._port.setFixedWidth(100)
         lay.addWidget(self._port)
 
         self._sid_lbl = QLabel("(waiting…)")
         self._sid_lbl.setStyleSheet("color: #666666; font-size: 11px;")
-        self._sid_lbl.setFixedWidth(110)
+        self._sid_lbl.setFixedWidth(120)
         lay.addWidget(self._sid_lbl)
+
+        # Forward checkbox — enabled once stream ID is discovered
+        self._fwd_cb = QCheckBox()
+        self._fwd_cb.setChecked(True)
+        self._fwd_cb.setEnabled(False)
+        self._fwd_cb.setToolTip("Forward this stream to the Receiver")
+        self._fwd_cb.setFixedWidth(28)
+        self._fwd_cb.stateChanged.connect(lambda _: self.filter_changed.emit())
+        lay.addWidget(self._fwd_cb)
 
         self._led = QLabel("●")
         self._led.setStyleSheet("color: #444444; font-size: 18px;")
+        self._led.setFixedWidth(24)
         lay.addWidget(self._led)
 
         self._remove_btn = QPushButton("−")
@@ -85,15 +126,25 @@ class StreamRow(QWidget):
         return self._port.value()
 
     def set_stream_id(self, sid: int):
-        self._sid_lbl.setText(f"0x{sid:08X}")
-        self._sid_lbl.setStyleSheet("color: #aaaaaa; font-size: 11px;")
+        if sid != self._sid_val:
+            self._sid_val = sid
+            self._sid_lbl.setText(f"0x{sid:08X}")
+            self._sid_lbl.setStyleSheet("color: #aaaaaa; font-size: 11px;")
+            self._fwd_cb.setEnabled(True)
 
     def set_active(self, active: bool):
         self._led.setStyleSheet(f"color: {'#00cc44' if active else '#444444'}; font-size: 18px;")
 
+    def forwarded_stream_id(self) -> int | None:
+        """Return discovered stream ID if forwarding is checked, else None."""
+        if self._fwd_cb.isChecked() and self._sid_val is not None:
+            return self._sid_val
+        return None
+
     def set_locked(self, locked: bool):
         self._port.setEnabled(not locked)
         self._remove_btn.setEnabled(not locked)
+        # _fwd_cb intentionally NOT locked — user can toggle forwarding while running
 
 
 class PacketizerWindow(QMainWindow):
@@ -101,7 +152,7 @@ class PacketizerWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("DIFI Combiner")
-        self.setMinimumSize(960, 560)
+        self.setMinimumSize(1200, 720)
         self._running     = False
         self._modules     = {}
         self._stream_rows: list = []
@@ -117,12 +168,11 @@ class PacketizerWindow(QMainWindow):
         root = QHBoxLayout(central)
         root.setContentsMargins(0, 0, 0, 0)
 
-        splitter = QSplitter(Qt.Horizontal)
+        splitter = QSplitter(Qt.Orientation.Horizontal)
         root.addWidget(splitter)
 
         # ── left panel: controls ──────────────────────────────────────────
         left     = QWidget()
-        left.setMaximumWidth(340)
         left_lay = QVBoxLayout(left)
         left_lay.setSpacing(8)
 
@@ -131,9 +181,10 @@ class PacketizerWindow(QMainWindow):
         in_vlay = QVBoxLayout(in_box)
         in_vlay.setSpacing(4)
 
+        # Column header
         hdr = QHBoxLayout()
         hdr.addSpacing(22)
-        for lbl, w in [("Port", 100), ("Stream ID (auto)", 110), ("Live", 30)]:
+        for lbl, w in [("Port", 100), ("Stream ID (auto)", 120), ("Fwd", 32), ("Live", 30)]:
             l = QLabel(lbl)
             l.setFixedWidth(w)
             l.setStyleSheet("color: #888888; font-size: 11px;")
@@ -141,19 +192,13 @@ class PacketizerWindow(QMainWindow):
         hdr.addStretch()
         in_vlay.addLayout(hdr)
 
+        # Stream rows live directly in a plain layout — no scroll area
         self._rows_container = QWidget()
         self._rows_layout    = QVBoxLayout(self._rows_container)
         self._rows_layout.setSpacing(2)
         self._rows_layout.setContentsMargins(2, 2, 2, 2)
         self._rows_layout.addStretch()
-
-        scroll = QScrollArea()
-        scroll.setWidget(self._rows_container)
-        scroll.setWidgetResizable(True)
-        scroll.setMinimumHeight(70)
-        scroll.setMaximumHeight(180)
-        scroll.setFrameShape(QFrame.StyledPanel)
-        in_vlay.addWidget(scroll)
+        in_vlay.addWidget(self._rows_container)
 
         self._add_btn = QPushButton("＋  Add Stream")
         self._add_btn.setFixedHeight(28)
@@ -172,6 +217,25 @@ class PacketizerWindow(QMainWindow):
         chunk_row.addStretch()
         in_vlay.addLayout(chunk_row)
         left_lay.addWidget(in_box)
+
+        # Network / Jitter Buffer
+        net_box    = QGroupBox("Network / Jitter Buffer")
+        net_layout = QHBoxLayout(net_box)
+        net_layout.addWidget(QLabel("Reorder hold:"))
+        self._hold_ms = QSpinBox()
+        self._hold_ms.setRange(0, 2000)
+        self._hold_ms.setValue(0)
+        self._hold_ms.setSuffix(" ms")
+        self._hold_ms.setFixedWidth(90)
+        self._hold_ms.setToolTip(
+            "0 ms = LAN mode (pass-through, no added latency).\n"
+            "Set to the expected one-way WAN jitter (e.g. 100-300 ms)\n"
+            "so that out-of-order packets from each generator are\n"
+            "sorted by timestamp before reaching the aggregator."
+        )
+        net_layout.addWidget(self._hold_ms)
+        net_layout.addStretch()
+        left_lay.addWidget(net_box)
 
         # Output
         out_box  = QGroupBox("Output  (to Receiver VM)")
@@ -281,6 +345,10 @@ class PacketizerWindow(QMainWindow):
         self._disp_dbdiv.setSuffix(" dB")
         self._disp_dbdiv.setFixedWidth(110)
         row2.addWidget(self._disp_dbdiv)
+        auto_btn = QPushButton("Auto")
+        auto_btn.setFixedWidth(60)
+        auto_btn.clicked.connect(self._auto_display)
+        row2.addWidget(auto_btn)
         row2.addStretch()
         disp_vlay.addLayout(row2)
 
@@ -300,20 +368,20 @@ class PacketizerWindow(QMainWindow):
         self._plot.showGrid(x=True, y=True, alpha=0.3)
         self._plot.enableAutoRange(axis="xy", enable=False)
         self._plot.getPlotItem().getViewBox().enableAutoRange(enable=False)
-        self._curve = self._plot.plot([], [], pen=pg.mkPen("c", width=1))
+        self._curves: dict = {}  # stream_id → PlotDataItem
         self._ref_line = pg.InfiniteLine(
             angle=0, movable=False,
-            pen=pg.mkPen("y", width=1, style=Qt.DashLine),
+            pen=pg.mkPen("y", width=1, style=Qt.PenStyle.DashLine),
         )
         self._plot.addItem(self._ref_line)
 
         self._plot.getPlotItem().getViewBox().sigRangeChanged.connect(
-            lambda vb, ranges: self._sync_viewport_to_spinboxes(ranges)
+            lambda vb, ranges: self._sync_viewport_to_spinboxes()
         )
 
         right_lay.addWidget(self._plot)
         splitter.addWidget(right)
-        splitter.setSizes([320, 640])
+        splitter.setSizes([420, 780])
 
         self._status = QStatusBar()
         self.setStatusBar(self._status)
@@ -330,7 +398,6 @@ class PacketizerWindow(QMainWindow):
         self._prev_chunks = 0
         self._prev_tick_t = 0.0
 
-        # Apply initial range from spinbox defaults
         self._apply_range()
 
     # ── dynamic row management ─────────────────────────────────────────────
@@ -341,6 +408,7 @@ class PacketizerWindow(QMainWindow):
             port = (max(r.port() for r in self._stream_rows) + 1) if self._stream_rows else 50001
         row = StreamRow(index=n, default_port=port)
         row.removed.connect(self._remove_stream_row)
+        row.filter_changed.connect(self._on_filter_changed)
         row.set_locked(self._running)
         self._rows_layout.insertWidget(self._rows_layout.count() - 1, row)
         self._stream_rows.append(row)
@@ -359,6 +427,7 @@ class PacketizerWindow(QMainWindow):
             row.set_locked(locked)
         self._add_btn.setEnabled(not locked)
         self._chunk.setEnabled(not locked)
+        self._hold_ms.setEnabled(not locked)
         self._dest_ip.setEnabled(not locked)
         self._dest_port.setEnabled(not locked)
         self._start_btn.setEnabled(not locked)
@@ -370,7 +439,7 @@ class PacketizerWindow(QMainWindow):
         if self._running:
             return
 
-        ports     = [r.port() for r in self._stream_rows]
+        ports      = [r.port() for r in self._stream_rows]
         chunk_size = self._chunk.value()
         dest_ip    = self._dest_ip.text().strip()
         dest_port  = self._dest_port.value()
@@ -380,8 +449,9 @@ class PacketizerWindow(QMainWindow):
             return
 
         capture    = InputCapture(ports=ports)
+        jitter     = JitterBuffer(capture, hold_ms=self._hold_ms.value())
         aggregator = Aggregator(
-            capture          = capture,
+            capture          = jitter,
             expected_streams = None,
             expected_count   = len(ports),
             chunk_size       = chunk_size,
@@ -393,11 +463,12 @@ class PacketizerWindow(QMainWindow):
             dest_port  = dest_port,
         )
 
-        self._modules = dict(capture=capture, aggregator=aggregator,
+        self._modules = dict(capture=capture, jitter=jitter, aggregator=aggregator,
                              packetizer=packetizer, sender=sender)
 
         capture.start()
         time.sleep(0.05)
+        jitter.start()
         aggregator.start()
         packetizer.start()
         sender.start()
@@ -424,10 +495,13 @@ class PacketizerWindow(QMainWindow):
         m["sender"].stop()
         m["packetizer"].stop()
         m["aggregator"].stop()
+        m["jitter"].stop()
         m["capture"].stop()
         for row in self._stream_rows:
             row.set_active(False)
-        self._curve.setData([], [])
+        for c in self._curves.values():
+            c.setData([], [])
+        self._curves.clear()
         self._modules = {}
         self._running = False
         self._set_locked(False)
@@ -472,9 +546,6 @@ class PacketizerWindow(QMainWindow):
         if not agg:
             return
 
-        # Use a fully emitted chunk when available; fall back to whatever
-        # is currently buffered per stream so the spectrum shows even when
-        # waiting for all expected streams to connect.
         chunk = agg.last_chunk
         if chunk is not None:
             stream_data = [(s.stream_id, s.samples, s.context) for s in chunk.streams]
@@ -484,26 +555,13 @@ class PacketizerWindow(QMainWindow):
         if not stream_data:
             return
 
-        all_freqs = []
-        all_mags  = []
-        for _sid, samples, ctx in stream_data:
-            n = len(samples)
-            if n == 0:
+        for sid, samples, ctx in stream_data:
+            if ctx is None or len(samples) == 0:
                 continue
-            fs     = ctx.sample_rate_hz
-            lo     = ctx.rf_ref_freq_hz
-            window = np.hanning(n)
-            X      = np.fft.fftshift(np.fft.fft(samples * window))
-            mag_db = 20 * np.log10(np.abs(X) / n + 1e-7)
-            freqs  = np.fft.fftshift(np.fft.fftfreq(n, d=1.0 / fs)) + lo
-            all_freqs.append(freqs)
-            all_mags.append(mag_db)
-
-        if all_freqs:
-            cf  = np.concatenate(all_freqs)
-            cm  = np.concatenate(all_mags)
-            idx = np.argsort(cf)
-            self._curve.setData(cf[idx], cm[idx])
+            if sid not in self._curves:
+                self._curves[sid] = self._plot.plot([], [], pen=_stream_color(sid))
+            f, m = _stream_fft(samples, ctx)
+            self._curves[sid].setData(f, m)
 
     # ── display helpers ────────────────────────────────────────────────────
 
@@ -516,12 +574,61 @@ class PacketizerWindow(QMainWindow):
         self._plot.setYRange(amp_top - db_div * 10, amp_top, padding=0)
         self._ref_line.setValue(amp_top)
 
-    def _sync_viewport_to_spinboxes(self, ranges):
-        x_lo, x_hi = ranges[0]
-        if x_hi <= x_lo:
+    def _auto_display(self):
+        """Set display range to fit all active streams' RF frequencies."""
+        agg = self._modules.get("aggregator")
+        if not agg:
             return
-        self._disp_center.set_hz((x_lo + x_hi) / 2.0)
-        self._disp_span.set_hz(x_hi - x_lo)
+        chunk = agg.last_chunk
+        if chunk is not None:
+            contexts = [s.context for s in chunk.streams if s.context]
+        else:
+            contexts = [ctx for _, _, ctx in agg.get_stream_previews() if ctx]
+        if not contexts:
+            QTimer.singleShot(500, self._auto_display)
+            return
+        rf_refs = [c.rf_ref_freq_hz for c in contexts]
+        fs_vals = [c.sample_rate_hz  for c in contexts]
+        center  = sum(rf_refs) / len(rf_refs)
+        span    = (max(rf_refs) - min(rf_refs)) + max(fs_vals)
+        span    = max(span, max(fs_vals))
+        self._disp_center.set_hz(center)
+        self._disp_span.set_hz(span)
+        self._disp_amp.setValue(-10.0)
+        self._disp_dbdiv.setValue(10.0)
+        self._apply_range()
+
+    def _sync_viewport_to_spinboxes(self):
+        """Keep display spinboxes in sync when user pans/zooms the plot."""
+        [[x_lo, x_hi], [y_lo, y_hi]] = (
+            self._plot.getPlotItem().getViewBox().viewRange()
+        )
+        if x_hi > x_lo:
+            self._disp_center.set_hz((x_lo + x_hi) / 2.0)
+            self._disp_span.set_hz(x_hi - x_lo)
+        if y_hi > y_lo:
+            self._disp_amp.blockSignals(True)
+            self._disp_dbdiv.blockSignals(True)
+            self._disp_amp.setValue(y_hi)
+            self._disp_dbdiv.setValue((y_hi - y_lo) / 10.0)
+            self._disp_amp.blockSignals(False)
+            self._disp_dbdiv.blockSignals(False)
+            self._ref_line.setValue(y_hi)
+
+    def _on_filter_changed(self):
+        """Update the aggregator's stream filter when a Forward checkbox is toggled."""
+        if not self._running:
+            return
+        agg = self._modules.get("aggregator")
+        if not agg:
+            return
+        allowed = {
+            r.forwarded_stream_id()
+            for r in self._stream_rows
+            if r.forwarded_stream_id() is not None
+        }
+        if allowed:
+            agg.update_stream_filter(allowed)
 
     def closeEvent(self, event):
         self._stop()

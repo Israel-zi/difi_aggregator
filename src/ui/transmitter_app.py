@@ -135,7 +135,7 @@ class TransmitterWindow(QMainWindow):
         sig_grid.addWidget(self._stat, 6, 0, 1, 2)
 
         for rb in (self._cw_rb, self._bw_rb, self._off_rb):
-            rb.toggled.connect(lambda: self._bw.setEnabled(self._bw_rb.isChecked()))
+            rb.toggled.connect(lambda checked: self._bw.setEnabled(self._bw_rb.isChecked()))
 
         # live update while running
         for rb in (self._cw_rb, self._bw_rb, self._off_rb):
@@ -264,7 +264,7 @@ class TransmitterWindow(QMainWindow):
         self._stat.setText(f"Running — {self._gen.pkt_count:,} pkts sent")
         self._stat.setStyleSheet("color: #00cc44;")
 
-    def _live_update(self):
+    def _live_update(self, *_):
         if not self._running or not self._gen:
             return
         rf_ref = self._rf_ref()

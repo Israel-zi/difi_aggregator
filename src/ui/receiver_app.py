@@ -29,53 +29,32 @@ from modules.receiver import DifiReceiver
 from ui.freq_input    import FreqInput
 
 
-def _combined_spectrum(streams, seg_len=1024, overlap=0.5):
-    """
-    Welch power spectrum across all streams on a shared frequency grid.
-    Each stream is split into overlapping segments of `seg_len` samples;
-    per-segment powers are averaged (reducing noise variance by ~1/N_segments)
-    then interpolated onto a common axis and summed across streams.
-    """
-    valid = [(iq, ctx) for iq, ctx in streams
-             if ctx is not None and len(iq) > 0]
-    if not valid:
-        return np.array([]), np.array([])
+_STREAM_COLORS = [
+    (100, 220, 255),  # stream index 0 — cyan
+    (255, 170,  50),  # stream index 1 — orange
+    (100, 255, 100),  # stream index 2 — lime
+    (255, 100, 255),  # stream index 3+ — magenta
+]
 
-    edges = [(ctx.rf_ref_freq_hz - ctx.sample_rate_hz / 2,
-              ctx.rf_ref_freq_hz + ctx.sample_rate_hz / 2)
-             for _, ctx in valid]
-    f_lo = min(lo for lo, _ in edges)
-    f_hi = max(hi for _, hi in edges)
 
-    f_grid    = np.linspace(f_lo, f_hi, seg_len)
-    power_sum = np.zeros(seg_len)
+def _stream_color(sid: int):
+    return pg.mkPen(_STREAM_COLORS[(sid - 1) % len(_STREAM_COLORS)], width=1)
 
-    hop   = max(1, int(seg_len * (1.0 - overlap)))
+
+def _stream_fft(iq, ctx, seg_len: int = 1024):
+    """Single-window Hann FFT magnitude spectrum for one IQ buffer."""
     w     = np.hanning(seg_len)
-    w_pow = float(np.sum(w)) ** 2   # amplitude normalisation: tone peak → correct dBm
-
-    for iq, ctx in valid:
-        n     = len(iq)
-        fs    = ctx.sample_rate_hz
-        rf    = ctx.rf_ref_freq_hz
-        freqs = np.fft.fftshift(np.fft.fftfreq(seg_len, d=1.0 / fs)) + rf
-
-        starts = list(range(0, max(1, n - seg_len + 1), hop))
-        if not starts:
-            starts = [0]
-
-        seg_power = np.zeros(seg_len)
-        for s in starts:
-            seg = iq[s : s + seg_len]
-            if len(seg) < seg_len:
-                seg = np.pad(seg, (0, seg_len - len(seg)))
-            X = np.fft.fftshift(np.fft.fft(seg * w))
-            seg_power += np.abs(X) ** 2
-
-        seg_power /= len(starts) * w_pow
-        power_sum += np.interp(f_grid, freqs, seg_power, left=0.0, right=0.0)
-
-    return f_grid, 10 * np.log10(power_sum + 1e-14)
+    w_amp = float(np.sum(w))
+    n     = min(len(iq), seg_len)
+    seg   = iq[-n:].copy()
+    if n < seg_len:
+        seg = np.pad(seg, (0, seg_len - n))
+    X      = np.fft.fftshift(np.fft.fft(seg * w))
+    mag_db = 20.0 * np.log10(np.abs(X) / w_amp + 1e-7)
+    freqs  = np.fft.fftshift(
+        np.fft.fftfreq(seg_len, d=1.0 / ctx.sample_rate_hz)
+    ) + ctx.rf_ref_freq_hz
+    return freqs, mag_db
 
 
 class ReceiverWindow(QMainWindow):
@@ -94,7 +73,7 @@ class ReceiverWindow(QMainWindow):
         root = QHBoxLayout(central)
         root.setContentsMargins(0, 0, 0, 0)
 
-        splitter = QSplitter(Qt.Horizontal)
+        splitter = QSplitter(Qt.Orientation.Horizontal)
         root.addWidget(splitter)
 
         # ── left panel ──
@@ -211,12 +190,12 @@ class ReceiverWindow(QMainWindow):
         self._plot.getPlotItem().getViewBox().enableAutoRange(enable=False)
         self._plot.setYRange(-110, -10, padding=0)
         self._plot.setXRange(0, 5e6, padding=0)
-        self._curve = self._plot.plot([], [], pen=pg.mkPen("c", width=1))
+        self._curves: dict = {}  # stream_id → PlotDataItem
         self._y_range_applied = False
 
         self._ref_line = pg.InfiniteLine(
             angle=0, movable=False,
-            pen=pg.mkPen("y", width=1, style=Qt.DashLine),
+            pen=pg.mkPen("y", width=1, style=Qt.PenStyle.DashLine),
         )
         self._plot.addItem(self._ref_line)
 
@@ -260,7 +239,9 @@ class ReceiverWindow(QMainWindow):
         self._receiver.stop()
         self._receiver = None
         self._running  = False
-        self._curve.setData([], [])
+        for c in self._curves.values():
+            c.setData([], [])
+        self._curves.clear()
         self._start_btn.setEnabled(True)
         self._stop_btn.setEnabled(False)
         self._status.showMessage("Stopped")
@@ -298,10 +279,14 @@ class ReceiverWindow(QMainWindow):
             )
             return
 
-        # Combined power spectrum across all streams
-        f_grid, mag_db = _combined_spectrum(list(snaps.values()))
-        if len(f_grid):
-            self._curve.setData(f_grid, mag_db)
+        # Per-stream spectra — one curve per stream ID
+        for sid, (iq, ctx_s) in snaps.items():
+            if ctx_s is None or len(iq) == 0:
+                continue
+            if sid not in self._curves:
+                self._curves[sid] = self._plot.plot([], [], pen=_stream_color(sid))
+            f, m = _stream_fft(iq, ctx_s)
+            self._curves[sid].setData(f, m)
 
         if not self._y_range_applied:
             self._apply_range()

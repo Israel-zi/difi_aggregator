@@ -11,7 +11,6 @@ For the PoC, the "RF Frontend" is the Receiver module listening on port 50010.
 
 import socket
 import threading
-import time
 
 from modules.packetizer import Packetizer
 
