@@ -26,6 +26,55 @@ from modules.receiver      import DifiReceiver
 from ui.freq_input         import FreqInput
 
 
+def _combined_spectrum(streams, seg_len=1024, overlap=0.5):
+    """
+    Welch power spectrum across all streams on a shared frequency grid.
+    Each stream is split into overlapping segments of `seg_len` samples;
+    per-segment powers are averaged (reducing noise variance by ~1/N_segments)
+    then interpolated onto a common axis and summed across streams.
+    """
+    valid = [(iq, ctx) for iq, ctx in streams
+             if ctx is not None and len(iq) > 0]
+    if not valid:
+        return np.array([]), np.array([])
+
+    edges = [(ctx.rf_ref_freq_hz - ctx.sample_rate_hz / 2,
+              ctx.rf_ref_freq_hz + ctx.sample_rate_hz / 2)
+             for _, ctx in valid]
+    f_lo = min(lo for lo, _ in edges)
+    f_hi = max(hi for _, hi in edges)
+
+    f_grid    = np.linspace(f_lo, f_hi, seg_len)
+    power_sum = np.zeros(seg_len)
+
+    hop   = max(1, int(seg_len * (1.0 - overlap)))
+    w     = np.hanning(seg_len)
+    w_pow = float(np.sum(w)) ** 2   # amplitude normalisation: tone peak → correct dBm
+
+    for iq, ctx in valid:
+        n     = len(iq)
+        fs    = ctx.sample_rate_hz
+        rf    = ctx.rf_ref_freq_hz
+        freqs = np.fft.fftshift(np.fft.fftfreq(seg_len, d=1.0 / fs)) + rf
+
+        starts = list(range(0, max(1, n - seg_len + 1), hop))
+        if not starts:
+            starts = [0]
+
+        seg_power = np.zeros(seg_len)
+        for s in starts:
+            seg = iq[s : s + seg_len]
+            if len(seg) < seg_len:
+                seg = np.pad(seg, (0, seg_len - len(seg)))
+            X = np.fft.fftshift(np.fft.fft(seg * w))
+            seg_power += np.abs(X) ** 2
+
+        seg_power /= len(starts) * w_pow
+        power_sum += np.interp(f_grid, freqs, seg_power, left=0.0, right=0.0)
+
+    return f_grid, 10 * np.log10(power_sum + 1e-14)
+
+
 class GeneratorPanel(QGroupBox):
     changed = Signal()
 
@@ -162,7 +211,7 @@ class MainWindow(QMainWindow):
         self._plot.getPlotItem().getViewBox().enableAutoRange(enable=False)
         self._plot.setYRange(-110, -10, padding=0)
         self._plot.setXRange(0, 5e6, padding=0)
-        self._curve = self._plot.plot([], [], pen=pg.mkPen("c", width=1))
+        self._curve1 = self._plot.plot([], [], pen=pg.mkPen("c", width=1))
         self._ref_line = pg.InfiniteLine(
             angle=0, movable=False,
             pen=pg.mkPen("y", width=1, style=Qt.DashLine)
@@ -186,7 +235,7 @@ class MainWindow(QMainWindow):
         self._plot2.enableAutoRange(axis="xy", enable=False)
         self._plot2.getPlotItem().getViewBox().enableAutoRange(enable=False)
         self._plot2.setYRange(-110, -10, padding=0)
-        self._curve2 = self._plot2.plot([], [], pen=pg.mkPen("y", width=1))
+        self._curve2 = self._plot2.plot([], [], pen=pg.mkPen("c", width=1))
         self._ref_line2 = pg.InfiniteLine(
             angle=0, movable=False,
             pen=pg.mkPen("y", width=1, style=Qt.DashLine)
@@ -443,68 +492,29 @@ class MainWindow(QMainWindow):
         if chunk is None:
             return
 
-        # ── Plot 1: aggregator — per-stream wideband ──────────────────────────
-        # FFT each stream independently and paint at its absolute RF position.
-        # No upsampling required; works for any LO separation.
-        all_freqs = []
-        all_mags  = []
-        for s in chunk.streams:
-            n = len(s.samples)
-            if n == 0:
-                continue
-            fs     = s.context.sample_rate_hz
-            lo     = s.context.rf_ref_freq_hz
-            window = np.hanning(n)
-            X      = np.fft.fftshift(np.fft.fft(s.samples * window))
-            mag_db = 20 * np.log10(np.abs(X) / n + 1e-7)
-            freqs  = np.fft.fftshift(np.fft.fftfreq(n, d=1.0 / fs)) + lo
-            all_freqs.append(freqs)
-            all_mags.append(mag_db)
-
-        if all_freqs:
-            combined_freqs = np.concatenate(all_freqs)
-            combined_mags  = np.concatenate(all_mags)
-            sort_idx       = np.argsort(combined_freqs)
-            # Live annotation: confirms data source and shows chunk counter
-            sids_agg = " + ".join(f"0x{s.stream_id:08X}" for s in chunk.streams)
+        # ── Plot 1: aggregator — combined power spectrum ──────────────────────
+        agg_streams = [(s.samples, s.context) for s in chunk.streams]
+        sids_agg    = [f"0x{s.stream_id:08X}" for s in chunk.streams if len(s.samples) > 0]
+        f1, m1 = _combined_spectrum(agg_streams)
+        if len(f1):
+            self._curve1.setData(f1, m1)
             self._plot1_label.setText(
                 f"source: Aggregator.last_chunk  (float32, no encoding)  |  "
-                f"chunks: {agg.chunks_emitted:,}  |  streams: {sids_agg}"
+                f"chunks: {agg.chunks_emitted:,}  |  streams: {' + '.join(sids_agg)}"
             )
-            self._curve.setData(combined_freqs[sort_idx], combined_mags[sort_idx])
 
-        # ── Plot 2: DIFI receiver — per-stream output ─────────────────────────
-        # Each stream arrives with its original Stream ID; FFT each independently
-        # and paint at its absolute RF position — identical pattern to Plot 1.
+        # ── Plot 2: DIFI receiver — combined power spectrum ───────────────────
         rx = self._modules.get("receiver")
         if rx:
-            snaps      = rx.get_stream_snapshots()
-            all_freqs2 = []
-            all_mags2  = []
-            for _sid, (iq2, ctx2) in snaps.items():
-                if ctx2 is None or len(iq2) == 0:
-                    continue
-                n2     = len(iq2)
-                fs2    = ctx2.sample_rate_hz
-                lo2    = ctx2.rf_ref_freq_hz
-                win2   = np.hanning(n2)
-                X2     = np.fft.fftshift(np.fft.fft(iq2 * win2))
-                mdb2   = 20 * np.log10(np.abs(X2) / n2 + 1e-7)
-                frq2   = np.fft.fftshift(np.fft.fftfreq(n2, d=1.0 / fs2)) + lo2
-                all_freqs2.append(frq2)
-                all_mags2.append(mdb2)
-            if all_freqs2:
-                cf2   = np.concatenate(all_freqs2)
-                cm2   = np.concatenate(all_mags2)
-                idx2  = np.argsort(cf2)
-                self._curve2.setData(cf2[idx2], cm2[idx2])
-            # Live annotation proves this data comes from the receiver, not the aggregator
-            n_rx_pkts = rx.data_received
-            n_streams = len(snaps)
-            sid_list  = " + ".join(f"0x{s:08X}" for s in snaps)
+            snaps = rx.get_stream_snapshots()
+            rx_streams = [(iq, ctx) for iq, ctx in snaps.values()]
+            f2, m2 = _combined_spectrum(rx_streams)
+            if len(f2):
+                self._curve2.setData(f2, m2)
+            sid_list = " + ".join(f"0x{s:08X}" for s in snaps)
             self._plot2_label.setText(
                 f"source: DifiReceiver  (int16→float32)  |  "
-                f"UDP pkts received: {n_rx_pkts:,}  |  "
+                f"UDP pkts received: {rx.data_received:,}  |  "
                 f"streams: {sid_list if sid_list else 'none yet'}"
             )
 
@@ -559,9 +569,17 @@ class MainWindow(QMainWindow):
             rf_ref_freq_hz = rf_ref3,
             ref_level_dbm  = p3.amplitude_dbm(),
         )
+        # Drain pipeline queues so stale chunks with old context don't reach the
+        # receiver after parameter changes, then flush the receiver IQ buffer.
+        agg = self._modules.get("aggregator")
+        if agg:
+            agg.flush_queue()
+        pktzr = self._modules.get("packetizer")
+        if pktzr:
+            pktzr.flush_queue()
         rx = self._modules.get("receiver")
         if rx:
-            rx.flush()   # clear stale IQ so display refreshes on the next tick
+            rx.flush()
 
     def _apply_range(self):
         center  = self._disp_center.value_hz()
@@ -577,13 +595,24 @@ class MainWindow(QMainWindow):
         self._plot2.setYRange(y_lo, y_hi, padding=0)
         self._ref_line2.setValue(amp_top)
 
-    def _sync_viewport_to_spinboxes(self, ranges):
-        """Keep X-axis display spinboxes in sync when user pans/zooms the plot."""
-        x_lo, x_hi = ranges[0]
-        if x_hi <= x_lo:
-            return
-        self._disp_center.set_hz((x_lo + x_hi) / 2.0)
-        self._disp_span.set_hz(x_hi - x_lo)
+    def _sync_viewport_to_spinboxes(self, _ranges=None):
+        """Keep display spinboxes in sync when user pans/zooms the plot."""
+        [[x_lo, x_hi], [y_lo, y_hi]] = (
+            self._plot.getPlotItem().getViewBox().viewRange()
+        )
+        if x_hi > x_lo:
+            self._disp_center.set_hz((x_lo + x_hi) / 2.0)
+            self._disp_span.set_hz(x_hi - x_lo)
+        if y_hi > y_lo:
+            self._disp_amp.blockSignals(True)
+            self._disp_dbdiv.blockSignals(True)
+            self._disp_amp.setValue(y_hi)
+            self._disp_dbdiv.setValue((y_hi - y_lo) / 10.0)
+            self._disp_amp.blockSignals(False)
+            self._disp_dbdiv.blockSignals(False)
+            self._ref_line.setValue(y_hi)
+            self._plot2.setYRange(y_lo, y_hi, padding=0)
+            self._ref_line2.setValue(y_hi)
 
 
     def _set_disp_range(self, center_hz: float, span_hz: float):

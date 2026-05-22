@@ -85,6 +85,16 @@ class Packetizer:
         except queue.Empty:
             return None
 
+    def flush_queue(self):
+        """Drain the output queue and reset context timers so the next chunk
+        sends fresh context packets for all streams to the receiver."""
+        while True:
+            try:
+                self._out_queue.get_nowait()
+            except queue.Empty:
+                break
+        self._last_ctx_times.clear()
+
     # ── per-stream sequence helpers ────────────────────────────────────────
 
     def _next_data_seq(self, sid: int) -> int:
@@ -146,7 +156,14 @@ class Packetizer:
                 sids = [f"0x{s.stream_id:08X}" for s in chunk.streams]
                 print(f"[Packetizer] First chunk — streams: {sids}")
 
-            for block in chunk.streams:
+            # Emit streams in ascending timestamp order so the receiver sees
+            # packets in true chronological sequence across all streams.
+            ordered = sorted(
+                chunk.streams,
+                key=lambda b: (b.data_ts_int, b.data_ts_frac),
+            )
+
+            for block in ordered:
                 sid = block.stream_id
 
                 ctx_bytes = None

@@ -55,12 +55,14 @@ class DifiReceiver:
         # per-stream state — keyed by stream_id (int)
         self._iq_buffers: dict = {}   # stream_id -> np.ndarray[complex64]
         self._contexts:   dict = {}   # stream_id -> DifiContextPacket
+        self._last_seqs:  dict = {}   # stream_id -> last seen seq_num (0-15)
         self._lock        = threading.Lock()
 
         # stats
         self.data_received    = 0
         self.context_received = 0
         self.parse_errors     = 0
+        self.seq_errors       = 0
 
     # ── lifecycle ──────────────────────────────────────────────────────────
 
@@ -120,10 +122,11 @@ class DifiReceiver:
             return None
 
     def flush(self):
-        """Zero all IQ buffers (call after parameter changes to clear stale data)."""
+        """Zero all IQ buffers and reset sequence tracking after parameter changes."""
         with self._lock:
             for sid in self._iq_buffers:
                 self._iq_buffers[sid][:] = 0
+            self._last_seqs.clear()
 
     def get_sample_rate(self) -> float:
         """Return sample rate from the first available context (or default)."""
@@ -155,6 +158,15 @@ class DifiReceiver:
                 ctx = self._contexts.get(sid)
                 bit_depth = ctx.sample_bit_depth if ctx else 16
                 pkt = DifiDataPacket.from_bytes(data, sample_bit_depth=bit_depth)
+                # Detect sequence-number gaps (DIFI seq wraps 0-15)
+                last_seq = self._last_seqs.get(sid)
+                if last_seq is not None and pkt.seq_num != (last_seq + 1) & 0xF:
+                    self.seq_errors += 1
+                    print(
+                        f"[Receiver] Seq gap stream 0x{sid:08X}: "
+                        f"expected {(last_seq + 1) & 0xF}, got {pkt.seq_num}"
+                    )
+                self._last_seqs[sid] = pkt.seq_num
                 self._update_stream_buffer(pkt.stream_id, pkt.payload)
                 self.data_received += 1
 

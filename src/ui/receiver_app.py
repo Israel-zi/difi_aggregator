@@ -29,6 +29,55 @@ from modules.receiver import DifiReceiver
 from ui.freq_input    import FreqInput
 
 
+def _combined_spectrum(streams, seg_len=1024, overlap=0.5):
+    """
+    Welch power spectrum across all streams on a shared frequency grid.
+    Each stream is split into overlapping segments of `seg_len` samples;
+    per-segment powers are averaged (reducing noise variance by ~1/N_segments)
+    then interpolated onto a common axis and summed across streams.
+    """
+    valid = [(iq, ctx) for iq, ctx in streams
+             if ctx is not None and len(iq) > 0]
+    if not valid:
+        return np.array([]), np.array([])
+
+    edges = [(ctx.rf_ref_freq_hz - ctx.sample_rate_hz / 2,
+              ctx.rf_ref_freq_hz + ctx.sample_rate_hz / 2)
+             for _, ctx in valid]
+    f_lo = min(lo for lo, _ in edges)
+    f_hi = max(hi for _, hi in edges)
+
+    f_grid    = np.linspace(f_lo, f_hi, seg_len)
+    power_sum = np.zeros(seg_len)
+
+    hop   = max(1, int(seg_len * (1.0 - overlap)))
+    w     = np.hanning(seg_len)
+    w_pow = float(np.sum(w)) ** 2   # amplitude normalisation: tone peak → correct dBm
+
+    for iq, ctx in valid:
+        n     = len(iq)
+        fs    = ctx.sample_rate_hz
+        rf    = ctx.rf_ref_freq_hz
+        freqs = np.fft.fftshift(np.fft.fftfreq(seg_len, d=1.0 / fs)) + rf
+
+        starts = list(range(0, max(1, n - seg_len + 1), hop))
+        if not starts:
+            starts = [0]
+
+        seg_power = np.zeros(seg_len)
+        for s in starts:
+            seg = iq[s : s + seg_len]
+            if len(seg) < seg_len:
+                seg = np.pad(seg, (0, seg_len - len(seg)))
+            X = np.fft.fftshift(np.fft.fft(seg * w))
+            seg_power += np.abs(X) ** 2
+
+        seg_power /= len(starts) * w_pow
+        power_sum += np.interp(f_grid, freqs, seg_power, left=0.0, right=0.0)
+
+    return f_grid, 10 * np.log10(power_sum + 1e-14)
+
+
 class ReceiverWindow(QMainWindow):
 
     def __init__(self):
@@ -211,6 +260,7 @@ class ReceiverWindow(QMainWindow):
         self._receiver.stop()
         self._receiver = None
         self._running  = False
+        self._curve.setData([], [])
         self._start_btn.setEnabled(True)
         self._stop_btn.setEnabled(False)
         self._status.showMessage("Stopped")
@@ -248,27 +298,10 @@ class ReceiverWindow(QMainWindow):
             )
             return
 
-        # FFT each stream independently at its absolute RF position
-        all_freqs = []
-        all_mags  = []
-        for _sid, (iq, sctx) in snaps.items():
-            if sctx is None or len(iq) == 0:
-                continue
-            n      = len(iq)
-            fs     = sctx.sample_rate_hz
-            rf_ref = sctx.rf_ref_freq_hz
-            window = np.hanning(n)
-            x_fft  = np.fft.fftshift(np.fft.fft(iq * window))
-            freqs  = np.fft.fftshift(np.fft.fftfreq(n, d=1.0 / fs)) + rf_ref
-            mag_db = 20 * np.log10(np.abs(x_fft) / n + 1e-7)
-            all_freqs.append(freqs)
-            all_mags.append(mag_db)
-
-        if all_freqs:
-            combined_freqs = np.concatenate(all_freqs)
-            combined_mags  = np.concatenate(all_mags)
-            sort_idx       = np.argsort(combined_freqs)
-            self._curve.setData(combined_freqs[sort_idx], combined_mags[sort_idx])
+        # Combined power spectrum across all streams
+        f_grid, mag_db = _combined_spectrum(list(snaps.values()))
+        if len(f_grid):
+            self._curve.setData(f_grid, mag_db)
 
         if not self._y_range_applied:
             self._apply_range()
@@ -312,13 +345,22 @@ class ReceiverWindow(QMainWindow):
         self._db_div.setValue(10.0)
         self._apply_range()
 
-    def _sync_viewport_to_spinboxes(self, ranges):
-        """Keep X-axis display spinboxes in sync when user pans/zooms the plot."""
-        x_lo, x_hi = ranges[0]
-        if x_hi <= x_lo:
-            return
-        self._center.set_hz((x_lo + x_hi) / 2.0)
-        self._span.set_hz(x_hi - x_lo)
+    def _sync_viewport_to_spinboxes(self, _ranges=None):
+        """Keep display spinboxes in sync when user pans/zooms the plot."""
+        [[x_lo, x_hi], [y_lo, y_hi]] = (
+            self._plot.getPlotItem().getViewBox().viewRange()
+        )
+        if x_hi > x_lo:
+            self._center.set_hz((x_lo + x_hi) / 2.0)
+            self._span.set_hz(x_hi - x_lo)
+        if y_hi > y_lo:
+            self._amp_top.blockSignals(True)
+            self._db_div.blockSignals(True)
+            self._amp_top.setValue(y_hi)
+            self._db_div.setValue((y_hi - y_lo) / 10.0)
+            self._amp_top.blockSignals(False)
+            self._db_div.blockSignals(False)
+            self._ref_line.setValue(y_hi)
 
     def closeEvent(self, event):
         self._stop()

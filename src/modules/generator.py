@@ -204,7 +204,6 @@ class DifiGenerator:
         rebuild_filter = False
         if tone_hz is not None:
             self.tone_hz = tone_hz
-            # tone does not affect the lowpass BW filter — no rebuild needed
         if signal_type is not None:
             self.signal_type = signal_type
         if bandwidth_hz is not None:
@@ -219,6 +218,9 @@ class DifiGenerator:
             rebuild_filter = True
         if rebuild_filter:
             self._build_bw_filter()
+        # Force a context packet on the very next send so the pipeline sees
+        # the new rf_ref_freq_hz / bandwidth / etc. immediately.
+        self._last_ctx_time = 0.0
 
     def send_one_packet(self):
         now = time.monotonic()

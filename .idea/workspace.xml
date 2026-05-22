@@ -5,15 +5,13 @@
   </component>
   <component name="ChangeListManager">
     <list default="true" id="501509db-c9de-4eb9-b574-ffa1c3e6a775" name="Changes" comment="initial project structure">
-      <change beforePath="$PROJECT_DIR$/.claude/settings.local.json" beforeDir="false" afterPath="$PROJECT_DIR$/.claude/settings.local.json" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/src/modules/aggregator.py" beforeDir="false" afterPath="$PROJECT_DIR$/src/modules/aggregator.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/modules/generator.py" beforeDir="false" afterPath="$PROJECT_DIR$/src/modules/generator.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/src/modules/packetizer.py" beforeDir="false" afterPath="$PROJECT_DIR$/src/modules/packetizer.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/src/modules/receiver.py" beforeDir="false" afterPath="$PROJECT_DIR$/src/modules/receiver.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/src/ui/config_gui.py" beforeDir="false" afterPath="$PROJECT_DIR$/src/ui/config_gui.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/ui/packetizer_app.py" beforeDir="false" afterPath="$PROJECT_DIR$/src/ui/packetizer_app.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/src/ui/receiver_app.py" beforeDir="false" afterPath="$PROJECT_DIR$/src/ui/receiver_app.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/ui/transmitter_app.py" beforeDir="false" afterPath="$PROJECT_DIR$/src/ui/transmitter_app.py" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -155,7 +153,8 @@
   <component name="SharedIndexes">
     <attachedChunks>
       <set>
-        <option value="bundled-python-sdk-024ed6589d45-c2ffad84badb-com.jetbrains.pycharm.pro.sharedIndexes.bundled-PY-261.23567.174" />
+        <option value="bundled-js-predefined-d6986cc7102b-31caf2ab9e3c-JavaScript-PY-261.24374.152" />
+        <option value="bundled-python-sdk-c59985aa861c-c2ffad84badb-com.jetbrains.pycharm.pro.sharedIndexes.bundled-PY-261.24374.152" />
       </set>
     </attachedChunks>
   </component>
@@ -183,7 +182,13 @@
       <workItem from="1778006786207" duration="5807000" />
       <workItem from="1778012643564" duration="9000" />
       <workItem from="1778085480557" duration="8436000" />
-      <workItem from="1778263093963" duration="10898000" />
+      <workItem from="1778263093963" duration="11020000" />
+      <workItem from="1778310257186" duration="1176000" />
+      <workItem from="1778358602203" duration="69000" />
+      <workItem from="1778482722643" duration="741000" />
+      <workItem from="1778503884581" duration="601000" />
+      <workItem from="1779443992933" duration="41000" />
+      <workItem from="1779444224309" duration="5289000" />
     </task>
     <task id="LOCAL-00001" summary="initial project structure">
       <option name="closed" value="true" />
@@ -281,7 +286,23 @@
       <option name="project" value="LOCAL" />
       <updated>1778093938714</updated>
     </task>
-    <option name="localTasksCounter" value="13" />
+    <task id="LOCAL-00013" summary="initial project structure">
+      <option name="closed" value="true" />
+      <created>1778274760262</created>
+      <option name="number" value="00013" />
+      <option name="presentableId" value="LOCAL-00013" />
+      <option name="project" value="LOCAL" />
+      <updated>1778274760262</updated>
+    </task>
+    <task id="LOCAL-00014" summary="initial project structure">
+      <option name="closed" value="true" />
+      <created>1778358642658</created>
+      <option name="number" value="00014" />
+      <option name="presentableId" value="LOCAL-00014" />
+      <option name="project" value="LOCAL" />
+      <updated>1778358642658</updated>
+    </task>
+    <option name="localTasksCounter" value="15" />
     <servers />
   </component>
   <component name="TypeScriptGeneratedFilesManager">
@@ -294,7 +315,7 @@
   <component name="com.intellij.coverage.CoverageDataManagerImpl">
     <SUITE FILE_PATH="coverage/difi_aggregator$difi_packet.coverage" NAME="difi_packet Coverage Results" MODIFIED="1777666628381" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/src/core" />
     <SUITE FILE_PATH="coverage/difi_aggregator$config_gui.coverage" NAME="config_gui Coverage Results" MODIFIED="1777669842567" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/src/ui" />
-    <SUITE FILE_PATH="coverage/difi_aggregator$main.coverage" NAME="main Coverage Results" MODIFIED="1778268025933" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/src" />
+    <SUITE FILE_PATH="coverage/difi_aggregator$main.coverage" NAME="main Coverage Results" MODIFIED="1779449592207" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/src" />
     <SUITE FILE_PATH="coverage/difi_aggregator$tx_gui.coverage" NAME="tx_gui Coverage Results" MODIFIED="1777664580478" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/src/ui" />
     <SUITE FILE_PATH="coverage/difi_aggregator$generator.coverage" NAME="generator Coverage Results" MODIFIED="1777669831465" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/src/modules" />
   </component>

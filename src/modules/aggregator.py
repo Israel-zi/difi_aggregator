@@ -275,6 +275,17 @@ class Aggregator:
 
     # ── diagnostics ────────────────────────────────────────────────────────
 
+    def flush_queue(self):
+        """Drain the output queue so stale chunks don't reach the receiver."""
+        drained = 0
+        while True:
+            try:
+                self._out_queue.get_nowait()
+                drained += 1
+            except queue.Empty:
+                break
+        return drained
+
     def buffer_status(self) -> dict:
         return {
             hex(sid): buf.buffered_samples
