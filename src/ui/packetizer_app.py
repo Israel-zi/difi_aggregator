@@ -3,13 +3,15 @@ packetizer_app.py
 -----------------
 DIFI Aggregator — Combiner GUI.
 
-Runs on the Combiner VM.
-Receives DIFI streams from Transmitter VMs on configurable listen ports,
-re-packetizes them preserving original Stream IDs (read from the DIFI
-packet header — not configured here), and forwards selected streams to a
-single destination port on the Receiver VM.
+Two-phase operation:
+  ▶ Listen   — starts InputCapture + JitterBuffer + Aggregator (spectrum visible)
+  ▶ Forward  — additionally starts Packetizer + Sender (data flows to Receiver VM)
+  ■ Stop     — stops everything
 
-Includes a live per-stream spectrum display of the aggregated inputs.
+Stream rows auto-discover which stream ID arrives on each configured port.
+Per-row checkboxes:
+  Live — show/hide this stream's spectrum curve independently
+  Fwd  — include/exclude this stream from forwarding to the Receiver
 """
 
 import os
@@ -67,10 +69,20 @@ def _stream_fft(iq, ctx, seg_len: int = 1024):
 
 
 class StreamRow(QWidget):
-    """One listen-stream row: index + port + auto-discovered stream ID + forward checkbox + LED + remove."""
+    """
+    One listen-stream row.
+    Layout: [#] Port:[spinbox] [stream-id] [●led] [Live☑] [Fwd☑] [−]
+
+    Signals
+    -------
+    removed        — user clicked the remove button
+    filter_changed — Fwd checkbox toggled (forwarding filter)
+    live_changed   — Live checkbox toggled (spectrum display)
+    """
 
     removed        = Signal(object)
     filter_changed = Signal()
+    live_changed   = Signal()
 
     def __init__(self, index: int, default_port: int, parent=None):
         super().__init__(parent)
@@ -85,7 +97,6 @@ class StreamRow(QWidget):
         self._idx_lbl.setStyleSheet("color: #888888;")
         lay.addWidget(self._idx_lbl)
 
-        lay.addWidget(QLabel("Port:"))
         self._port = QSpinBox()
         self._port.setRange(1024, 65535)
         self._port.setValue(default_port)
@@ -97,19 +108,29 @@ class StreamRow(QWidget):
         self._sid_lbl.setFixedWidth(120)
         lay.addWidget(self._sid_lbl)
 
-        # Forward checkbox — enabled once stream ID is discovered
+        # Activity LED — auto-updated, not user-interactive
+        self._led = QLabel("●")
+        self._led.setStyleSheet("color: #444444; font-size: 18px;")
+        self._led.setFixedWidth(22)
+        lay.addWidget(self._led)
+
+        # Live checkbox — controls spectrum display
+        self._live_cb = QCheckBox()
+        self._live_cb.setChecked(True)
+        self._live_cb.setEnabled(False)
+        self._live_cb.setToolTip("Show / hide this stream's spectrum curve")
+        self._live_cb.setFixedWidth(36)
+        self._live_cb.stateChanged.connect(lambda _: self.live_changed.emit())
+        lay.addWidget(self._live_cb)
+
+        # Fwd checkbox — controls forwarding to Receiver
         self._fwd_cb = QCheckBox()
         self._fwd_cb.setChecked(True)
         self._fwd_cb.setEnabled(False)
-        self._fwd_cb.setToolTip("Forward this stream to the Receiver")
-        self._fwd_cb.setFixedWidth(28)
+        self._fwd_cb.setToolTip("Forward this stream to the Receiver VM")
+        self._fwd_cb.setFixedWidth(36)
         self._fwd_cb.stateChanged.connect(lambda _: self.filter_changed.emit())
         lay.addWidget(self._fwd_cb)
-
-        self._led = QLabel("●")
-        self._led.setStyleSheet("color: #444444; font-size: 18px;")
-        self._led.setFixedWidth(24)
-        lay.addWidget(self._led)
 
         self._remove_btn = QPushButton("−")
         self._remove_btn.setFixedSize(26, 26)
@@ -119,11 +140,16 @@ class StreamRow(QWidget):
 
         lay.addStretch()
 
+    # ── accessors ──────────────────────────────────────────────────────────
+
     def set_index(self, n: int):
         self._idx_lbl.setText(str(n))
 
     def port(self) -> int:
         return self._port.value()
+
+    def stream_id(self) -> int | None:
+        return self._sid_val
 
     def set_stream_id(self, sid: int):
         if sid != self._sid_val:
@@ -131,20 +157,34 @@ class StreamRow(QWidget):
             self._sid_lbl.setText(f"0x{sid:08X}")
             self._sid_lbl.setStyleSheet("color: #aaaaaa; font-size: 11px;")
             self._fwd_cb.setEnabled(True)
+            self._live_cb.setEnabled(True)
 
     def set_active(self, active: bool):
-        self._led.setStyleSheet(f"color: {'#00cc44' if active else '#444444'}; font-size: 18px;")
+        color = "#00cc44" if active else "#444444"
+        self._led.setStyleSheet(f"color: {color}; font-size: 18px;")
+
+    def is_live(self) -> bool:
+        """True when the Live checkbox is checked (show spectrum curve)."""
+        return self._live_cb.isChecked()
 
     def forwarded_stream_id(self) -> int | None:
-        """Return discovered stream ID if forwarding is checked, else None."""
+        """Return stream ID if Fwd is checked and stream is discovered, else None."""
         if self._fwd_cb.isChecked() and self._sid_val is not None:
             return self._sid_val
         return None
 
+    def reset_stream_id(self):
+        """Clear the discovered stream ID — row goes back to '(waiting…)' state."""
+        self._sid_val = None
+        self._sid_lbl.setText("(waiting…)")
+        self._sid_lbl.setStyleSheet("color: #666666; font-size: 11px;")
+        self._live_cb.setEnabled(False)
+        self._fwd_cb.setEnabled(False)
+
     def set_locked(self, locked: bool):
         self._port.setEnabled(not locked)
-        self._remove_btn.setEnabled(not locked)
-        # _fwd_cb intentionally NOT locked — user can toggle forwarding while running
+        # Remove button always stays enabled — rows can be removed while listening.
+        # Live and Fwd checkboxes always stay unlocked too.
 
 
 class PacketizerWindow(QMainWindow):
@@ -153,7 +193,8 @@ class PacketizerWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("DIFI Combiner")
         self.setMinimumSize(1200, 720)
-        self._running     = False
+        self._listening   = False   # capture + aggregator running
+        self._forwarding  = False   # packetizer + sender running
         self._modules     = {}
         self._stream_rows: list = []
         self._build_ui()
@@ -181,10 +222,12 @@ class PacketizerWindow(QMainWindow):
         in_vlay = QVBoxLayout(in_box)
         in_vlay.setSpacing(4)
 
-        # Column header
+        # Column header — matches StreamRow layout exactly
+        # Row left-edge: margin(2) + idx(18) + spacing(6) = 26 before spinbox
         hdr = QHBoxLayout()
-        hdr.addSpacing(22)
-        for lbl, w in [("Port", 100), ("Stream ID (auto)", 120), ("Fwd", 32), ("Live", 30)]:
+        hdr.setSpacing(6)
+        hdr.addSpacing(26)
+        for lbl, w in [("Port", 100), ("Stream ID (auto)", 120), ("●", 22), ("Live", 36), ("Fwd", 36)]:
             l = QLabel(lbl)
             l.setFixedWidth(w)
             l.setStyleSheet("color: #888888; font-size: 11px;")
@@ -192,7 +235,6 @@ class PacketizerWindow(QMainWindow):
         hdr.addStretch()
         in_vlay.addLayout(hdr)
 
-        # Stream rows live directly in a plain layout — no scroll area
         self._rows_container = QWidget()
         self._rows_layout    = QVBoxLayout(self._rows_container)
         self._rows_layout.setSpacing(2)
@@ -290,15 +332,20 @@ class PacketizerWindow(QMainWindow):
 
         left_lay.addStretch()
 
+        # Buttons: Listen | Forward | Stop
         btn_row = QHBoxLayout()
-        self._start_btn = QPushButton("▶  Start")
-        self._stop_btn  = QPushButton("■  Stop")
+        self._listen_btn  = QPushButton("▶  Listen")
+        self._forward_btn = QPushButton("▶  Forward")
+        self._stop_btn    = QPushButton("■  Stop")
+        self._forward_btn.setEnabled(False)
         self._stop_btn.setEnabled(False)
-        self._start_btn.setFixedHeight(36)
-        self._stop_btn.setFixedHeight(36)
-        self._start_btn.clicked.connect(self._start)
+        for btn in (self._listen_btn, self._forward_btn, self._stop_btn):
+            btn.setFixedHeight(36)
+        self._listen_btn.clicked.connect(self._listen)
+        self._forward_btn.clicked.connect(self._on_forward_clicked)
         self._stop_btn.clicked.connect(self._stop)
-        btn_row.addWidget(self._start_btn)
+        btn_row.addWidget(self._listen_btn)
+        btn_row.addWidget(self._forward_btn)
         btn_row.addWidget(self._stop_btn)
         left_lay.addLayout(btn_row)
 
@@ -310,7 +357,6 @@ class PacketizerWindow(QMainWindow):
         right_lay.setContentsMargins(4, 4, 4, 4)
         right_lay.setSpacing(4)
 
-        # Display controls
         disp_box  = QGroupBox("Display")
         disp_vlay = QVBoxLayout(disp_box)
         disp_vlay.setSpacing(4)
@@ -359,7 +405,6 @@ class PacketizerWindow(QMainWindow):
 
         right_lay.addWidget(disp_box)
 
-        # Spectrum plot
         self._plot = pg.PlotWidget(
             title="Combiner — incoming streams (pre-encode)"
         )
@@ -368,7 +413,8 @@ class PacketizerWindow(QMainWindow):
         self._plot.showGrid(x=True, y=True, alpha=0.3)
         self._plot.enableAutoRange(axis="xy", enable=False)
         self._plot.getPlotItem().getViewBox().enableAutoRange(enable=False)
-        self._curves: dict = {}  # stream_id → PlotDataItem
+        self._curves: dict = {}
+
         self._ref_line = pg.InfiniteLine(
             angle=0, movable=False,
             pen=pg.mkPen("y", width=1, style=Qt.PenStyle.DashLine),
@@ -385,7 +431,7 @@ class PacketizerWindow(QMainWindow):
 
         self._status = QStatusBar()
         self.setStatusBar(self._status)
-        self._status.showMessage("Ready — add streams and press Start")
+        self._status.showMessage("Ready — add streams and press Listen")
 
         self._stats_timer = QTimer()
         self._stats_timer.setInterval(500)
@@ -409,13 +455,33 @@ class PacketizerWindow(QMainWindow):
         row = StreamRow(index=n, default_port=port)
         row.removed.connect(self._remove_stream_row)
         row.filter_changed.connect(self._on_filter_changed)
-        row.set_locked(self._running)
+        row.live_changed.connect(self._update_spectrum)
+        row.set_locked(self._listening)
         self._rows_layout.insertWidget(self._rows_layout.count() - 1, row)
         self._stream_rows.append(row)
 
+        if self._listening:
+            # Start a new listener for this port immediately.
+            # Do NOT adjust expected_count — the aggregator uses stale-aware
+            # active-stream detection so the new port won't block existing streams.
+            capture = self._modules.get("capture")
+            if capture:
+                capture.add_port(port)
+
     def _remove_stream_row(self, row: StreamRow):
-        if self._running or len(self._stream_rows) <= 1:
+        if len(self._stream_rows) <= 1:
             return
+        if self._listening:
+            capture = self._modules.get("capture")
+            agg     = self._modules.get("aggregator")
+            if capture:
+                capture.remove_port(row.port())
+            if agg:
+                agg.remove_stream_by_port(row.port())
+            # Clear its spectrum curve immediately
+            sid = row.stream_id()
+            if sid is not None and sid in self._curves:
+                self._curves.pop(sid).setData([], [])
         self._rows_layout.removeWidget(row)
         row.deleteLater()
         self._stream_rows.remove(row)
@@ -425,24 +491,19 @@ class PacketizerWindow(QMainWindow):
     def _set_locked(self, locked: bool):
         for row in self._stream_rows:
             row.set_locked(locked)
-        self._add_btn.setEnabled(not locked)
+        # Add button stays enabled — ports can be added while listening.
         self._chunk.setEnabled(not locked)
         self._hold_ms.setEnabled(not locked)
-        self._dest_ip.setEnabled(not locked)
-        self._dest_port.setEnabled(not locked)
-        self._start_btn.setEnabled(not locked)
-        self._stop_btn.setEnabled(locked)
 
     # ── lifecycle ──────────────────────────────────────────────────────────
 
-    def _start(self):
-        if self._running:
+    def _listen(self):
+        """Start capture + aggregator so the spectrum is visible (no forwarding yet)."""
+        if self._listening:
             return
 
         ports      = [r.port() for r in self._stream_rows]
         chunk_size = self._chunk.value()
-        dest_ip    = self._dest_ip.text().strip()
-        dest_port  = self._dest_port.value()
 
         if len(set(ports)) != len(ports):
             self._status.showMessage("Error: duplicate listen ports")
@@ -456,67 +517,137 @@ class PacketizerWindow(QMainWindow):
             expected_count   = len(ports),
             chunk_size       = chunk_size,
         )
-        packetizer = Packetizer(aggregator=aggregator)
+
+        self._modules.update(capture=capture, jitter=jitter, aggregator=aggregator)
+
+        capture.start()
+        time.sleep(0.05)
+        jitter.start()
+        aggregator.start()
+
+        self._listening   = True
+        self._prev_chunks = 0
+        self._prev_tick_t = time.monotonic()
+        self._set_locked(True)
+        self._listen_btn.setEnabled(False)
+        self._forward_btn.setEnabled(True)
+        self._stop_btn.setEnabled(True)
+        self._stats_timer.start()
+        self._spec_timer.start()
+        self._apply_range()
+
+        self._status.showMessage(
+            f"Listening on ports {ports} — discovering streams…  "
+            f"(press Forward to start sending to Receiver)"
+        )
+
+    def _on_forward_clicked(self):
+        """Toggle forwarding on/off — Forward button handler."""
+        if self._forwarding:
+            self._stop_forward()
+        else:
+            self._forward()
+
+    def _forward(self):
+        """Start forwarding the aggregated stream to the Receiver VM."""
+        if not self._listening or self._forwarding:
+            return
+
+        dest_ip   = self._dest_ip.text().strip()
+        dest_port = self._dest_port.value()
+
+        packetizer = Packetizer(aggregator=self._modules["aggregator"])
         sender     = DifiSender(
             packetizer = packetizer,
             dest_host  = dest_ip,
             dest_port  = dest_port,
         )
 
-        self._modules = dict(capture=capture, jitter=jitter, aggregator=aggregator,
-                             packetizer=packetizer, sender=sender)
-
-        capture.start()
-        time.sleep(0.05)
-        jitter.start()
-        aggregator.start()
+        self._modules.update(packetizer=packetizer, sender=sender)
+        # Apply the current Fwd-checkbox state before the first packet goes out.
+        fwd_filter = self._current_forward_filter()
+        if fwd_filter is not None:
+            packetizer.set_forward_filter(fwd_filter)
         packetizer.start()
         sender.start()
 
-        self._running     = True
-        self._prev_chunks = 0
-        self._prev_tick_t = time.monotonic()
-        self._set_locked(True)
-        self._stats_timer.start()
-        self._spec_timer.start()
-        self._apply_range()
+        self._forwarding = True
+        self._forward_btn.setText("■  Stop Fwd")
+        self._dest_ip.setEnabled(False)
+        self._dest_port.setEnabled(False)
 
+        ports = [r.port() for r in self._stream_rows]
         self._status.showMessage(
-            f"Running — listening on ports {ports}  →  {dest_ip}:{dest_port}  |  "
-            f"discovering {len(ports)} stream(s)…"
+            f"Running — ports {ports}  →  {dest_ip}:{dest_port}  |  "
+            f"forwarding {len(ports)} stream(s)"
         )
 
-    def _stop(self):
-        if not self._running:
+    def _stop_forward(self):
+        """Stop forwarding only — keep listening and spectrum active."""
+        if not self._forwarding:
             return
-        self._stats_timer.stop()
-        self._spec_timer.stop()
         m = self._modules
         m["sender"].stop()
         m["packetizer"].stop()
+        self._modules.pop("sender", None)
+        self._modules.pop("packetizer", None)
+        self._forwarding = False
+        self._forward_btn.setText("▶  Forward")
+        self._dest_ip.setEnabled(True)
+        self._dest_port.setEnabled(True)
+        self._status.showMessage("Forwarding stopped — still listening (press Forward to resume)")
+
+    def _stop(self):
+        """Stop everything — forwarding and listening."""
+        if not self._listening:
+            return
+
+        self._stats_timer.stop()
+        self._spec_timer.stop()
+        m = self._modules
+
+        if self._forwarding:
+            m["sender"].stop()
+            m["packetizer"].stop()
+            self._forwarding = False
+
         m["aggregator"].stop()
         m["jitter"].stop()
         m["capture"].stop()
+
         for row in self._stream_rows:
             row.set_active(False)
         for c in self._curves.values():
             c.setData([], [])
         self._curves.clear()
-        self._modules = {}
-        self._running = False
+        self._modules   = {}
+        self._listening = False
+
         self._set_locked(False)
+        self._listen_btn.setEnabled(True)
+        self._forward_btn.setText("▶  Forward")
+        self._forward_btn.setEnabled(False)
+        self._stop_btn.setEnabled(False)
+        self._dest_ip.setEnabled(True)
+        self._dest_port.setEnabled(True)
         self._status.showMessage("Stopped")
 
     # ── update loops ───────────────────────────────────────────────────────
 
     def _tick(self):
-        if not self._running:
+        if not self._listening:
             return
         agg = self._modules.get("aggregator")
         pkt = self._modules.get("packetizer")
         snd = self._modules.get("sender")
         if not agg:
             return
+
+        # When not forwarding, drain the aggregator output queue so it never fills
+        # up.  Without this the 8-slot queue fills in ~170 ms and every new chunk
+        # is dropped, freezing chunks_emitted and showing spurious drop counts.
+        if not self._forwarding:
+            agg.flush_queue()
 
         chunks = agg.chunks_emitted
         now    = time.monotonic()
@@ -530,38 +661,74 @@ class PacketizerWindow(QMainWindow):
         self._lbl_drops.setText(str(agg.packets_dropped + (pkt.packets_dropped if pkt else 0)))
         self._lbl_rate.setText(f"{rate:.1f} chunks/s")
 
-        last_seen   = agg.stream_last_seen()
-        cutoff      = now - 3.0
-        active_sids = sorted(last_seen.keys())
-        for i, row in enumerate(self._stream_rows):
-            if i < len(active_sids):
-                sid = active_sids[i]
-                row.set_stream_id(sid)
-                row.set_active(last_seen[sid] >= cutoff)
+        last_seen    = agg.stream_last_seen()
+        stream_ports = agg.stream_source_ports()
+        cutoff       = now - 3.0
+        port_to_sid  = {port: sid for sid, port in stream_ports.items()}
+        for row in self._stream_rows:
+            sid = port_to_sid.get(row.port())
+            if sid is not None:
+                active = last_seen.get(sid, 0) >= cutoff
+                if active:
+                    row.set_stream_id(sid)
+                    row.set_active(True)
+                else:
+                    row.set_active(False)
+                    row.reset_stream_id()
             else:
                 row.set_active(False)
+                if row.stream_id() is not None:
+                    row.reset_stream_id()
 
     def _update_spectrum(self):
         agg = self._modules.get("aggregator")
         if not agg:
             return
 
+        now          = time.monotonic()
+        last_seen    = agg.stream_last_seen()
+        stale_cutoff = now - 3.0
+
+        # Build live_sids from the aggregator's authoritative port→sid mapping so
+        # that display recovers immediately when a stream reconnects, without waiting
+        # for _tick (500 ms) to re-set row._sid_val after a reset_stream_id() call.
+        stream_ports = agg.stream_source_ports()
+        port_to_sid  = {port: sid for sid, port in stream_ports.items()}
+        live_sids = {
+            port_to_sid[r.port()]
+            for r in self._stream_rows
+            if r.is_live() and r.port() in port_to_sid
+        }
+
+        # Build display data: start from last emitted chunk, supplement with live
+        # buffer previews for streams not yet in that chunk (first discovery, or
+        # when aggregator was waiting for other streams to accumulate samples).
+        stream_data: dict = {}   # sid -> (samples, ctx)
         chunk = agg.last_chunk
         if chunk is not None:
-            stream_data = [(s.stream_id, s.samples, s.context) for s in chunk.streams]
-        else:
-            stream_data = agg.get_stream_previews()
+            for s in chunk.streams:
+                stream_data[s.stream_id] = (s.samples, s.context)
+        for sid, samples, ctx in agg.get_stream_previews():
+            if sid not in stream_data:
+                stream_data[sid] = (samples, ctx)
 
-        if not stream_data:
-            return
-
-        for sid, samples, ctx in stream_data:
+        for sid, (samples, ctx) in stream_data.items():
             if ctx is None or len(samples) == 0:
+                continue
+            stale = last_seen.get(sid, 0) < stale_cutoff
+            if stale or sid not in live_sids:
+                if sid in self._curves:
+                    self._curves[sid].setData([], [])
                 continue
             if sid not in self._curves:
                 self._curves[sid] = self._plot.plot([], [], pen=_stream_color(sid))
             f, m = _stream_fft(samples, ctx)
             self._curves[sid].setData(f, m)
+
+        # Clear curves for streams that disappeared or went stale
+        for sid in list(self._curves):
+            if sid not in stream_data or last_seen.get(sid, 0) < stale_cutoff:
+                self._curves[sid].setData([], [])
 
     # ── display helpers ────────────────────────────────────────────────────
 
@@ -575,7 +742,6 @@ class PacketizerWindow(QMainWindow):
         self._ref_line.setValue(amp_top)
 
     def _auto_display(self):
-        """Set display range to fit all active streams' RF frequencies."""
         agg = self._modules.get("aggregator")
         if not agg:
             return
@@ -599,7 +765,6 @@ class PacketizerWindow(QMainWindow):
         self._apply_range()
 
     def _sync_viewport_to_spinboxes(self):
-        """Keep display spinboxes in sync when user pans/zooms the plot."""
         [[x_lo, x_hi], [y_lo, y_hi]] = (
             self._plot.getPlotItem().getViewBox().viewRange()
         )
@@ -616,19 +781,30 @@ class PacketizerWindow(QMainWindow):
             self._ref_line.setValue(y_hi)
 
     def _on_filter_changed(self):
-        """Update the aggregator's stream filter when a Forward checkbox is toggled."""
-        if not self._running:
-            return
-        agg = self._modules.get("aggregator")
-        if not agg:
+        """Update the packetizer's forward filter when a Fwd checkbox is toggled.
+        The aggregator always collects all streams so spectrum display is unaffected."""
+        pkt = self._modules.get("packetizer")
+        if not pkt:
             return
         allowed = {
             r.forwarded_stream_id()
             for r in self._stream_rows
             if r.forwarded_stream_id() is not None
         }
-        if allowed:
-            agg.update_stream_filter(allowed)
+        pkt.set_forward_filter(allowed)
+
+    def _current_forward_filter(self) -> frozenset | None:
+        """Return the forward filter implied by current Fwd checkboxes.
+        Returns None when all discovered streams are checked (forward all)."""
+        all_checked = all(r.forwarded_stream_id() is not None or r.stream_id() is None
+                          for r in self._stream_rows)
+        if all_checked:
+            return None
+        return frozenset(
+            r.forwarded_stream_id()
+            for r in self._stream_rows
+            if r.forwarded_stream_id() is not None
+        )
 
     def closeEvent(self, event):
         self._stop()

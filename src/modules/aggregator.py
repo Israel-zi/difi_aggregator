@@ -78,12 +78,15 @@ class AggregatedChunk:
 class StreamBuffer:
     """Accumulates IQ samples and tracks the latest Context for one stream."""
 
-    def __init__(self, stream_id: int):
+    def __init__(self, stream_id: int, max_samples: int = 0):
         self.stream_id      = stream_id
         self._samples       = []          # list of np.ndarray chunks
         self._total         = 0           # total samples buffered
         self.context        = None        # latest DifiContextPacket
         self.last_update    = time.monotonic()
+        # Hard cap: when > 0, old samples are discarded once _total exceeds this.
+        # Keeps pipeline latency bounded at max_samples / sample_rate seconds.
+        self._max_samples   = max_samples
         # DIFI timestamp of the most recently received data packet.
         # Carried through to the combined output so the downstream receiver
         # sees timestamps tied to sample capture time, not combiner wall-clock.
@@ -99,6 +102,17 @@ class StreamBuffer:
         self._samples.append(pkt.payload.copy())
         self._total      += len(pkt.payload)
         self.last_update  = time.monotonic()
+
+        # If the buffer has grown beyond the cap, discard the oldest samples so
+        # the pipeline always shows near-real-time data rather than a stale backlog.
+        if self._max_samples and self._total > self._max_samples:
+            all_s             = np.concatenate(self._samples)
+            keep              = all_s[-self._max_samples:]
+            self._samples     = [keep]
+            self._total       = len(keep)
+            # Latch the current packet's timestamp as the new origin
+            self.data_ts_int  = pkt.timestamp_int
+            self.data_ts_frac = pkt.timestamp_frac
 
     def add_context(self, pkt: DifiContextPacket):
         self.context     = pkt
@@ -187,6 +201,9 @@ class Aggregator:
         # Assignment is atomic in CPython; chunks are immutable after creation.
         self.last_chunk        = None
 
+        # port each stream_id was first received on (populated on first packet)
+        self._stream_ports: dict = {}   # stream_id -> source_port
+
         # stats
         self.chunks_emitted  = 0
         self.packets_dropped = 0
@@ -232,11 +249,12 @@ class Aggregator:
         if self._expected is not None and stream_id not in self._expected:
             return
 
-        # lazy-create buffer
+        # lazy-create buffer — cap at 4× chunk_size to bound latency
         if stream_id not in self._buffers:
-            self._buffers[stream_id] = StreamBuffer(stream_id)
+            self._buffers[stream_id] = StreamBuffer(stream_id, max_samples=self._chunk_size * 4)
+            self._stream_ports[stream_id] = captured.source_port
             if self._expected is None:
-                print(f"[Aggregator] Discovered stream 0x{stream_id:08X} ({len(self._buffers)} of {self._expected_count or '?'})")
+                print(f"[Aggregator] Discovered stream 0x{stream_id:08X} on port {captured.source_port} ({len(self._buffers)} of {self._expected_count or '?'})")
 
         buf = self._buffers[stream_id]
 
@@ -246,24 +264,36 @@ class Aggregator:
             buf.add_context(pkt)
 
     def _try_emit_chunk(self):
-        """Emit one AggregatedChunk if ALL expected/discovered streams are ready."""
+        """Emit one AggregatedChunk when all *active* streams are ready.
+
+        A stream is considered active if it has sent data within stale_timeout.
+        This prevents a stopped or newly-added (not-yet-sending) stream from
+        blocking all other streams indefinitely.
+        """
 
         if self._expected is not None:
             # Fixed mode: wait for exactly the configured stream IDs
             active = self._expected
+            if not active:   # all streams filtered out — emit nothing
+                return
             if not all(
                 sid in self._buffers and self._buffers[sid].ready(self._chunk_size)
                 for sid in active
             ):
                 return
         else:
-            # Auto-detect mode: wait until we have seen enough unique streams
-            # AND all of them have enough samples
-            if self._expected_count and len(self._buffers) < self._expected_count:
+            # Auto-detect mode: emit as soon as any active streams are ready.
+            # A stream is active if it sent data within stale_timeout — stopped or
+            # not-yet-sending streams are excluded so they never block others.
+            # No minimum stream-count threshold: the user can run 1 TX or 4 TX
+            # against 2 configured ports and chunks flow either way.
+            now = time.monotonic()
+            active = {
+                sid for sid, buf in self._buffers.items()
+                if now - buf.last_update < self._stale_timeout
+            }
+            if not active:
                 return
-            if not self._buffers:
-                return
-            active = set(self._buffers.keys())
             if not all(self._buffers[sid].ready(self._chunk_size) for sid in active):
                 return
 
@@ -296,6 +326,14 @@ class Aggregator:
                 print(f"[Aggregator] Output queue full — chunk dropped (total: {self.packets_dropped})")
 
     # ── diagnostics ────────────────────────────────────────────────────────
+
+    def remove_stream_by_port(self, port: int):
+        """Remove buffers and tracking for the stream that was first seen on this port."""
+        for sid, p in list(self._stream_ports.items()):
+            if p == port:
+                self._buffers.pop(sid, None)
+                self._stream_ports.pop(sid, None)
+                print(f"[Aggregator] Removed stream 0x{sid:08X} (was on port {port})")
 
     def update_stream_filter(self, allowed_ids: set):
         """
@@ -330,6 +368,10 @@ class Aggregator:
     def stream_last_seen(self) -> dict:
         """Return {stream_id: last_update monotonic time} for all known streams."""
         return {sid: buf.last_update for sid, buf in self._buffers.items()}
+
+    def stream_source_ports(self) -> dict:
+        """Return {stream_id: source_port} for all discovered streams."""
+        return dict(self._stream_ports)
 
     def get_stream_previews(self) -> list:
         """Return [(stream_id, samples, context)] for any stream that has data.

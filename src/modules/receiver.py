@@ -16,6 +16,7 @@ import os
 import sys
 import socket
 import threading
+import time
 
 import numpy as np
 
@@ -61,10 +62,11 @@ class DifiReceiver:
         )
 
         # per-stream state — keyed by stream_id (int)
-        self._iq_buffers: dict = {}   # stream_id -> np.ndarray[complex64]
-        self._contexts:   dict = {}   # stream_id -> DifiContextPacket
-        self._last_seqs:  dict = {}   # stream_id -> last seen seq_num (0-15)
-        self._lock        = threading.Lock()
+        self._iq_buffers:  dict = {}   # stream_id -> np.ndarray[complex64]
+        self._contexts:    dict = {}   # stream_id -> DifiContextPacket
+        self._last_seqs:   dict = {}   # stream_id -> last seen seq_num (0-15)
+        self._last_update: dict = {}   # stream_id -> time.monotonic() of last data packet
+        self._lock         = threading.Lock()
 
         # stats
         self.data_received    = 0
@@ -193,6 +195,11 @@ class DifiReceiver:
             self.parse_errors += 1
             print(f"[Receiver] Parse error (sid=0x{sid:08X}): {exc}")
 
+    def stream_last_seen(self) -> dict:
+        """Return {stream_id: monotonic timestamp} of the last data packet per stream."""
+        with self._lock:
+            return dict(self._last_update)
+
     def _update_stream_buffer(self, sid: int, new_samples: np.ndarray):
         n = len(new_samples)
         with self._lock:
@@ -204,6 +211,7 @@ class DifiReceiver:
             else:
                 self._iq_buffers[sid] = np.roll(buf, -n)
                 self._iq_buffers[sid][-n:] = new_samples
+            self._last_update[sid] = time.monotonic()
 
 
 # ─────────────────────────────────────────────

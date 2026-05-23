@@ -26,7 +26,10 @@
       "Bash(pyinstaller --noconfirm Transmitter.spec)",
       "Bash(pyinstaller --noconfirm Combiner.spec)",
       "Bash(pyinstaller --noconfirm Receiver.spec)",
-      "Bash(dir C:\\\\Users\\\\276709\\\\PycharmProjects\\\\difi_aggregator\\\\dist *)"
+      "Bash(dir C:\\\\Users\\\\276709\\\\PycharmProjects\\\\difi_aggregator\\\\dist *)",
+      "Bash(pip install *)",
+      "PowerShell(pyinstaller *)",
+      "Bash(dir \"C:\\\\Users\\\\276709\\\\PycharmProjects\\\\difi_aggregator\\\\Base\\\\\")"
     ]
   }
 }

@@ -272,3 +272,23 @@ class DifiGenerator:
             self._sock.close()
         except OSError:
             pass
+
+
+if __name__ == "__main__":
+    print("=== DifiGenerator Self-Test ===")
+    print("Sending 200 CW packets (stream 0x00000001, 2 kHz tone) to 127.0.0.1:50001\n")
+    gen = DifiGenerator(
+        stream_id      = 0x00000001,
+        tone_hz        = 2_000.0,
+        signal_type    = SIGNAL_CW,
+        dest_host      = "127.0.0.1",
+        dest_port      = 50001,
+        sample_rate_hz = 48_000.0,
+        samples_per_pkt= 1024,
+        bit_depth      = 16,
+        rf_ref_freq_hz = 437_000_000.0,
+        bandwidth_hz   = 24_000.0,
+        ref_level_dbm  = -20.0,
+    )
+    gen.run(num_packets=200, packet_rate_hz=48_000.0 / 1024)
+    print(f"\nDone — sent {gen.pkt_count} data packets")

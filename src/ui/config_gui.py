@@ -12,7 +12,7 @@ import numpy as np
 from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
-    QLabel, QDoubleSpinBox, QPushButton, QGroupBox,
+    QLabel, QDoubleSpinBox, QSpinBox, QPushButton, QGroupBox,
     QStatusBar, QMainWindow, QSplitter, QButtonGroup, QRadioButton,
 )
 import pyqtgraph as pg

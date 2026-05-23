@@ -135,11 +135,17 @@ class PortListener(threading.Thread):
                 # unknown packet type — skip silently
                 return
 
-            self.out_queue.put(CapturedPacket(
-                source_port = self.port,
-                received_at = time.monotonic(),
-                packet      = pkt,
-            ))
+            # Non-blocking put: if the queue is full, drop this packet rather
+            # than blocking the receive thread (which would let the OS UDP
+            # buffer fill and silently lose newer packets from the TX).
+            try:
+                self.out_queue.put_nowait(CapturedPacket(
+                    source_port = self.port,
+                    received_at = time.monotonic(),
+                    packet      = pkt,
+                ))
+            except queue.Full:
+                self.stats["parse_errors"] += 1   # reuse counter; counts drops
 
         except (ValueError, struct.error) as exc:
             self.stats["parse_errors"] += 1
@@ -193,6 +199,23 @@ class InputCapture:
         for listener in self._listeners:
             listener.join(timeout=2.0)
         print("[Capture] All listeners stopped")
+
+    def add_port(self, port: int, host: str = "0.0.0.0"):
+        """Start a new listener on the given port while already running."""
+        listener = PortListener(port=port, out_queue=self._out_queue, host=host)
+        self._listeners.append(listener)
+        listener.start()
+        print(f"[Capture] Added listener on port {port}")
+
+    def remove_port(self, port: int):
+        """Stop and remove the listener for the given port."""
+        for listener in list(self._listeners):
+            if listener.port == port:
+                listener.stop()
+                listener.join(timeout=2.0)
+                self._listeners.remove(listener)
+                print(f"[Capture] Removed listener on port {port}")
+                return
 
     def get(self, timeout: float = 0.1):
         """
@@ -249,11 +272,16 @@ class JitterBuffer:
         self._hold_s  = hold_ms / 1000.0
         self._enabled = hold_ms > 0
 
-        # per-stream min-heap of (ts_int, ts_frac, arrival_mono, CapturedPacket)
-        self._heaps: dict = {}
-        self._lock        = threading.Lock()
+        # per-stream min-heap of (ts_int, ts_frac, seq, CapturedPacket)
+        # seq is a monotonic push counter used as a tiebreaker so that Python
+        # never falls through to comparing CapturedPacket objects (no __lt__).
+        self._heaps: dict  = {}
+        self._push_seq: int = 0
+        self._lock         = threading.Lock()
 
-        self._out_queue = queue.Queue(maxsize=256)
+        # Small queue — keeps pipeline latency low.  At ~47 pps per stream a
+        # depth of 128 gives ~2.7 s of burst tolerance without building a backlog.
+        self._out_queue = queue.Queue(maxsize=128)
         self._stop_evt  = threading.Event()
         self._thread    = threading.Thread(
             target=self._run, daemon=True, name="jitter-buffer"
@@ -284,17 +312,20 @@ class JitterBuffer:
 
     def _run(self):
         while not self._stop_evt.is_set():
-            captured = self._capture.get(timeout=0.02)
-            if captured is not None:
-                if not self._enabled:
-                    try:
-                        self._out_queue.put_nowait(captured)
-                    except queue.Full:
-                        pass
-                else:
-                    self._push(captured)
-            if self._enabled:
-                self._drain(time.monotonic())
+            try:
+                captured = self._capture.get(timeout=0.02)
+                if captured is not None:
+                    if not self._enabled:
+                        try:
+                            self._out_queue.put_nowait(captured)
+                        except queue.Full:
+                            pass
+                    else:
+                        self._push(captured)
+                if self._enabled:
+                    self._drain(time.monotonic())
+            except Exception as exc:
+                print(f"[JitterBuffer] Internal error (thread continues): {exc}")
 
     def _push(self, captured: CapturedPacket):
         pkt = captured.packet
@@ -313,8 +344,9 @@ class JitterBuffer:
                 self._heaps[sid] = []
             heapq.heappush(
                 self._heaps[sid],
-                (pkt.timestamp_int, pkt.timestamp_frac, captured.received_at, captured),
+                (pkt.timestamp_int, pkt.timestamp_frac, self._push_seq, captured),
             )
+            self._push_seq += 1
 
     def _drain(self, now: float):
         """
@@ -328,8 +360,8 @@ class JitterBuffer:
         with self._lock:
             for sid, heap in self._heaps.items():
                 while heap:
-                    ts_int, ts_frac, recv_t, captured = heap[0]
-                    if now - recv_t < self._hold_s:
+                    ts_int, ts_frac, _seq, captured = heap[0]
+                    if now - captured.received_at < self._hold_s:
                         break   # oldest packet hasn't waited long enough yet
                     heapq.heappop(heap)
                     try:

@@ -71,6 +71,9 @@ class Packetizer:
         self._ctx_seqs:       dict = {}   # stream_id -> int (0-15)
         self._last_ctx_times: dict = {}   # stream_id -> monotonic float
 
+        # None = forward all streams; frozenset = whitelist (empty = forward none)
+        self._forward_filter: frozenset | None = None
+
         self.packets_produced = 0
         self.packets_dropped  = 0
 
@@ -91,6 +94,10 @@ class Packetizer:
             return self._out_queue.get(timeout=timeout)
         except queue.Empty:
             return None
+
+    def set_forward_filter(self, sids):
+        """Restrict which stream IDs are forwarded. None = all; frozenset() = none."""
+        self._forward_filter = frozenset(sids) if sids is not None else None
 
     def flush_queue(self):
         """Drain the output queue and reset context timers so the next chunk
@@ -172,6 +179,9 @@ class Packetizer:
 
             for block in ordered:
                 sid = block.stream_id
+
+                if self._forward_filter is not None and sid not in self._forward_filter:
+                    continue
 
                 ctx_bytes = None
                 if (now - self._last_ctx_times.get(sid, 0.0)) >= CONTEXT_MIN_INTERVAL_S:

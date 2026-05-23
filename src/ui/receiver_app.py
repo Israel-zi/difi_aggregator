@@ -9,6 +9,7 @@ Listens for the unified DIFI stream and displays a live FFT spectrum.
 
 import os
 import sys
+import time
 
 if not getattr(sys, 'frozen', False):
     _src = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -280,8 +281,14 @@ class ReceiverWindow(QMainWindow):
             return
 
         # Per-stream spectra — one curve per stream ID
+        last_seen    = rx.stream_last_seen()
+        stale_cutoff = time.monotonic() - 3.0
         for sid, (iq, ctx_s) in snaps.items():
             if ctx_s is None or len(iq) == 0:
+                continue
+            if last_seen.get(sid, 0) < stale_cutoff:
+                if sid in self._curves:
+                    self._curves[sid].setData([], [])
                 continue
             if sid not in self._curves:
                 self._curves[sid] = self._plot.plot([], [], pen=_stream_color(sid))
