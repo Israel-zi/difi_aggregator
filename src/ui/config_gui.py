@@ -199,7 +199,7 @@ class MainWindow(QMainWindow):
 
         # ── Plot 1: aggregator (per-stream, pre-pipeline) ──
         self._plot = pg.PlotWidget(
-            title="[1] Combiner INPUT  —  raw float32 from generators  (ports 50001/50002/50003)"
+            title="Combiner Input — ports 50001/50002/50003"
         )
         self._plot.setLabel("bottom", "Frequency", units="Hz")
         self._plot.setLabel("left",   "Magnitude", units="dB")
@@ -224,7 +224,7 @@ class MainWindow(QMainWindow):
 
         # ── Plot 2: DIFI receiver (post-pipeline, per-stream) ──
         self._plot2 = pg.PlotWidget(
-            title="[2] Receiver OUTPUT  —  decoded int16→float32  (port 50010, post full pipeline)"
+            title="Receiver Input — port 50010"
         )
         self._plot2.setLabel("bottom", "Frequency", units="Hz")
         self._plot2.setLabel("left",   "Magnitude", units="dB")

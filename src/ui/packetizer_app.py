@@ -406,7 +406,7 @@ class PacketizerWindow(QMainWindow):
         right_lay.addWidget(disp_box)
 
         self._plot = pg.PlotWidget(
-            title="Combiner — incoming streams (pre-encode)"
+            title="Combiner Input"
         )
         self._plot.setLabel("bottom", "Frequency", units="Hz")
         self._plot.setLabel("left",   "Magnitude", units="dB")
@@ -508,6 +508,9 @@ class PacketizerWindow(QMainWindow):
         if len(set(ports)) != len(ports):
             self._status.showMessage("Error: duplicate listen ports")
             return
+
+        ports_str  = "/".join(str(p) for p in ports)
+        self._plot.setTitle(f"Combiner Input — ports {ports_str}")
 
         capture    = InputCapture(ports=ports)
         jitter     = JitterBuffer(capture, hold_ms=self._hold_ms.value())

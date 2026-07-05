@@ -223,6 +223,7 @@ class ReceiverWindow(QMainWindow):
         if self._running:
             return
         port           = self._port.value()
+        self._plot.setTitle(f"Receiver Input — port {port}")
         self._receiver = DifiReceiver(port=port)
         self._receiver.start()
         self._running = True
