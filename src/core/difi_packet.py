@@ -123,8 +123,11 @@ class DifiDataPacket:
     def _pack_iq_samples(self) -> bytes:
         """Pack complex64 samples into interleaved signed int16 bytes."""
         scale            = (2 ** (self.sample_bit_depth - 1)) - 1
-        i_samples        = np.clip(self.payload.real * scale, -scale, scale).astype(np.int16)
-        q_samples        = np.clip(self.payload.imag * scale, -scale, scale).astype(np.int16)
+        # np.round (not plain truncation from .astype) — truncating toward zero is a
+        # biased quantizer, which turns a periodic tone into deterministic harmonic
+        # spurs (worst when tone/sample-rate is a simple ratio, e.g. fs/10).
+        i_samples        = np.clip(np.round(self.payload.real * scale), -scale, scale).astype(np.int16)
+        q_samples        = np.clip(np.round(self.payload.imag * scale), -scale, scale).astype(np.int16)
         interleaved      = np.empty(len(i_samples) * 2, dtype=np.int16)
         interleaved[0::2] = i_samples
         interleaved[1::2] = q_samples

@@ -268,34 +268,34 @@ class Aggregator:
 
         A stream is considered active if it has sent data within stale_timeout.
         This prevents a stopped or newly-added (not-yet-sending) stream from
-        blocking all other streams indefinitely.
+        blocking all other streams indefinitely — including in fixed mode: a
+        stream that's expected but whose packets never actually reach the
+        Aggregator (e.g. sent to a port nothing is listening on) must not
+        stall aggregation of every other stream forever.
         """
 
+        now = time.monotonic()
         if self._expected is not None:
-            # Fixed mode: wait for exactly the configured stream IDs
-            active = self._expected
-            if not active:   # all streams filtered out — emit nothing
+            # Fixed mode: only among the configured stream IDs, but still
+            # excluding any that are missing entirely or have gone silent.
+            if not self._expected:   # all streams filtered out — emit nothing
                 return
-            if not all(
-                sid in self._buffers and self._buffers[sid].ready(self._chunk_size)
-                for sid in active
-            ):
-                return
+            active = {
+                sid for sid in self._expected
+                if sid in self._buffers and now - self._buffers[sid].last_update < self._stale_timeout
+            }
         else:
             # Auto-detect mode: emit as soon as any active streams are ready.
-            # A stream is active if it sent data within stale_timeout — stopped or
-            # not-yet-sending streams are excluded so they never block others.
             # No minimum stream-count threshold: the user can run 1 TX or 4 TX
             # against 2 configured ports and chunks flow either way.
-            now = time.monotonic()
             active = {
                 sid for sid, buf in self._buffers.items()
                 if now - buf.last_update < self._stale_timeout
             }
-            if not active:
-                return
-            if not all(self._buffers[sid].ready(self._chunk_size) for sid in active):
-                return
+        if not active:
+            return
+        if not all(self._buffers[sid].ready(self._chunk_size) for sid in active):
+            return
 
         # build one StreamBlock per stream
         blocks = []

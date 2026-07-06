@@ -99,6 +99,27 @@ class DifiReceiver:
             f"streams={list(f'0x{s:08X}' for s in self._contexts)}"
         )
 
+    def rebind(self, port: int):
+        """Stop listening on the current port and rebind to a new one at runtime."""
+        self._stop_evt.set()
+        if self._sock is not None:
+            try:
+                self._sock.close()
+            except OSError:
+                pass
+            self._sock = None
+        self._thread.join(timeout=2.0)
+
+        self._port     = port
+        self._stop_evt = threading.Event()
+        self._sock     = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._sock.settimeout(1.0)
+        self._sock.bind((self._host, self._port))
+        self._thread = threading.Thread(target=self._run, daemon=True, name="receiver")
+        self._thread.start()
+        print(f"[Receiver] Rebound to {self._host}:{self._port}")
+
     # ── data access ────────────────────────────────────────────────────────
 
     def get_stream_snapshots(self) -> dict:

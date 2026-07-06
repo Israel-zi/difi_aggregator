@@ -56,6 +56,10 @@ class DifiSender:
         self._thread.start()
         print(f"[Sender] Started | dest={self._dest[0]}:{self._dest[1]}")
 
+    def set_dest_port(self, port: int):
+        """Change the destination port at runtime (no restart needed)."""
+        self._dest = (self._dest[0], port)
+
     def stop(self):
         self._stop_evt.set()
         self._thread.join(timeout=3.0)

@@ -209,6 +209,8 @@ class DifiGenerator:
         rf_ref_freq_hz: float | None = None,
         ref_level_dbm: float | None  = None,
         sample_rate_hz: float | None = None,
+        dest_port: int | None        = None,
+        stream_id: int | None        = None,
     ):
         """Update generator parameters at runtime (thread-safe for simple types)."""
         rebuild_filter = False
@@ -226,6 +228,10 @@ class DifiGenerator:
         if sample_rate_hz is not None:
             self.sample_rate_hz = sample_rate_hz
             rebuild_filter = True
+        if dest_port is not None:
+            self.dest = (self.dest[0], dest_port)
+        if stream_id is not None:
+            self.stream_id = stream_id
         if rebuild_filter:
             self._build_bw_filter()
         # Force a context packet on the very next send so the pipeline sees
@@ -233,6 +239,9 @@ class DifiGenerator:
         self._last_ctx_time = 0.0
 
     def send_one_packet(self):
+        if self.signal_type == SIGNAL_OFF:
+            return   # OFF means no transmission at all — no context, no data
+
         now = time.monotonic()
         if (now - self._last_ctx_time) >= CONTEXT_MIN_INTERVAL_S:
             self._sock.sendto(self._make_context(), self.dest)

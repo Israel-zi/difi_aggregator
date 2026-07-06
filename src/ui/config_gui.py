@@ -5,20 +5,22 @@ DIFI Aggregator — Configuration GUI.
 """
 
 import sys
+import queue
 import threading
 import time
 
 import numpy as np
-from PySide6.QtCore import Qt, QTimer, Signal
+from PySide6.QtCore import Qt, QTimer, Signal, QRegularExpression
+from PySide6.QtGui import QRegularExpressionValidator
 from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
-    QLabel, QDoubleSpinBox, QSpinBox, QPushButton, QGroupBox,
-    QStatusBar, QMainWindow, QSplitter, QButtonGroup, QRadioButton,
+    QLabel, QLineEdit, QDoubleSpinBox, QSpinBox, QPushButton, QGroupBox,
+    QStatusBar, QMainWindow, QSplitter, QButtonGroup, QRadioButton, QTabWidget,
 )
 import pyqtgraph as pg
 
 from modules.generator     import DifiGenerator, SIGNAL_CW, SIGNAL_BW, SIGNAL_OFF
-from modules.input_capture import InputCapture, JitterBuffer
+from modules.input_capture import InputCapture, JitterBuffer, PortListener
 from modules.aggregator    import Aggregator
 from modules.packetizer    import Packetizer
 from modules.sender        import DifiSender
@@ -35,7 +37,7 @@ _STREAM_COLORS = [
 
 
 def _stream_color(sid: int):
-    return pg.mkPen(_STREAM_COLORS[(sid - 1) % len(_STREAM_COLORS)], width=1)
+    return pg.mkPen(_STREAM_COLORS[sid % len(_STREAM_COLORS)], width=1)
 
 
 def _stream_fft(iq, ctx, seg_len: int = 1024):
@@ -54,14 +56,24 @@ def _stream_fft(iq, ctx, seg_len: int = 1024):
     return freqs, mag_db
 
 
-class GeneratorPanel(QGroupBox):
+class GeneratorPanel(QWidget):
     changed = Signal()
 
-    def __init__(self, n: int, default_signal_type: str = SIGNAL_CW, parent=None):
-        super().__init__(f"Generator {n}  —  Stream 0x0000000{n}", parent)
+    def __init__(self, default_signal_type: str = SIGNAL_CW,
+                 default_port: int = 50000, default_stream_id: int = 1,
+                 default_tone_hz: float = 1e6, parent=None):
+        super().__init__(parent)
         grid = QGridLayout(self)
 
-        grid.addWidget(QLabel("Signal type:"), 0, 0)
+        grid.addWidget(QLabel("Stream ID:"), 0, 0)
+        self._stream_id = QLineEdit(f"0x{default_stream_id:08X}")
+        self._stream_id.setValidator(
+            QRegularExpressionValidator(QRegularExpression(r"0[xX][0-9A-Fa-f]{1,8}"))
+        )
+        self._stream_id.setFixedWidth(110)
+        grid.addWidget(self._stream_id, 0, 1)
+
+        grid.addWidget(QLabel("Signal type:"), 1, 0)
         type_w   = QWidget()
         type_lay = QHBoxLayout(type_w)
         type_lay.setContentsMargins(0, 0, 0, 0)
@@ -82,28 +94,39 @@ class GeneratorPanel(QGroupBox):
         type_lay.addWidget(self._bw_rb)
         type_lay.addWidget(self._off_rb)
         type_lay.addStretch()
-        grid.addWidget(type_w, 0, 1)
+        grid.addWidget(type_w, 1, 1)
 
-        grid.addWidget(QLabel("RF Frequency:"), 1, 0)
-        self._tone = FreqInput(default_hz=n * 1e6)
-        grid.addWidget(self._tone, 1, 1)
+        grid.addWidget(QLabel("RF Frequency:"), 2, 0)
+        self._tone = FreqInput(default_hz=default_tone_hz)
+        grid.addWidget(self._tone, 2, 1)
 
-        grid.addWidget(QLabel("Bandwidth:"), 2, 0)
+        grid.addWidget(QLabel("Bandwidth:"), 3, 0)
         self._bw = FreqInput(default_hz=1e6)
-        grid.addWidget(self._bw, 2, 1)
+        grid.addWidget(self._bw, 3, 1)
 
-        grid.addWidget(QLabel("RF reference:"), 3, 0)
+        grid.addWidget(QLabel("RF reference:"), 4, 0)
         self._rf = FreqInput(default_hz=0)
-        grid.addWidget(self._rf, 3, 1)
+        grid.addWidget(self._rf, 4, 1)
 
-        grid.addWidget(QLabel("Amplitude:"), 4, 0)
+        grid.addWidget(QLabel("Amplitude:"), 5, 0)
         self._amp = QDoubleSpinBox()
         self._amp.setRange(-100.0, 0.0)
         self._amp.setDecimals(1)
         self._amp.setSingleStep(1.0)
         self._amp.setValue(-20.0)
         self._amp.setSuffix(" dBm")
-        grid.addWidget(self._amp, 4, 1)
+        self._amp.setFixedWidth(140)
+        grid.addWidget(self._amp, 5, 1)
+
+        grid.addWidget(QLabel("UDP Port:"), 6, 0)
+        self._port = QSpinBox()
+        self._port.setRange(1, 65535)
+        self._port.setValue(default_port)
+        self._port.setFixedWidth(140)
+        self._port.setKeyboardTracking(False)
+        grid.addWidget(self._port, 6, 1)
+
+        grid.setRowStretch(7, 1)
 
         for rb in (self._cw_rb, self._bw_rb, self._off_rb):
             rb.toggled.connect(lambda checked: self._bw.setEnabled(self._bw_rb.isChecked()))
@@ -116,21 +139,27 @@ class GeneratorPanel(QGroupBox):
         self._bw.changed.connect(self.changed)
         self._rf.changed.connect(self.changed)
         self._amp.valueChanged.connect(self.changed)
+        self._port.valueChanged.connect(self.changed)
+        self._stream_id.editingFinished.connect(self.changed)
 
     def signal_type(self)    -> str:   return SIGNAL_CW if self._cw_rb.isChecked() else (SIGNAL_BW if self._bw_rb.isChecked() else "OFF")
     def tone_hz(self)        -> float: return self._tone.value_hz()
     def bandwidth_hz(self)   -> float: return self._bw.value_hz()
     def rf_ref_freq_hz(self) -> float: return self._rf.value_hz()
     def amplitude_dbm(self)  -> float: return self._amp.value()
+    def port(self)           -> int:   return self._port.value()
+
+    def stream_id(self) -> int:
+        try:
+            return int(self._stream_id.text(), 16)
+        except ValueError:
+            return 0
 
 
 class MainWindow(QMainWindow):
 
     SAMPLES_PER_PKT  = 1024
     BIT_DEPTH        = 16
-    CAPTURE_PORTS    = [50001, 50002, 50003]
-    EXPECTED_STREAMS = [0x00000001, 0x00000002, 0x00000003]
-    RECEIVER_PORT    = 50010
 
     def __init__(self):
         super().__init__()
@@ -138,11 +167,14 @@ class MainWindow(QMainWindow):
         self.setMinimumSize(1100, 820)
         self._pipeline_running = False
         self._modules          = {}
+        self._gen_panels        = []
+        self._pipeline_warning  = ""
+        self._agg_standalone_bind_errors = {}
 
         self._build_ui()
-        self._panel1.changed.connect(self._live_update_generators)
-        self._panel2.changed.connect(self._live_update_generators)
-        self._panel3.changed.connect(self._live_update_generators)
+
+        self._add_generator(default_signal_type=SIGNAL_OFF)
+        self._add_agg_port_row(default_port=self._next_default_agg_port())
 
     def _build_ui(self):
         central = QWidget()
@@ -153,13 +185,14 @@ class MainWindow(QMainWindow):
 
         # ── left panel ──
         left        = QWidget()
-        left.setMaximumWidth(420)
+        left.setMaximumWidth(480)
         left_layout = QVBoxLayout(left)
 
         fs_box    = QGroupBox("Shared Sample Rate (both generators)")
         fs_layout = QHBoxLayout(fs_box)
         fs_layout.addWidget(QLabel("Sample rate:"))
         self._shared_fs = FreqInput(default_hz=10e6)
+        self._shared_fs.changed.connect(self._live_update_generators)
         fs_layout.addWidget(self._shared_fs)
         left_layout.addWidget(fs_box)
 
@@ -171,23 +204,77 @@ class MainWindow(QMainWindow):
         self._hold_ms.setValue(0)
         self._hold_ms.setSuffix(" ms")
         self._hold_ms.setFixedWidth(90)
+        self._hold_ms.setKeyboardTracking(False)
         self._hold_ms.setToolTip(
             "0 ms = LAN mode (pass-through, no added latency).\n"
             "Set to the expected one-way WAN jitter (e.g. 100-300 ms)\n"
             "so that out-of-order packets from each generator are\n"
             "sorted by timestamp before reaching the aggregator."
         )
+        self._hold_ms.valueChanged.connect(self._on_hold_ms_changed)
         net_layout.addWidget(self._hold_ms)
         net_layout.addStretch()
         left_layout.addWidget(net_box)
 
-        self._panel1 = GeneratorPanel(1)
-        self._panel2 = GeneratorPanel(2)
-        self._panel3 = GeneratorPanel(3, default_signal_type=SIGNAL_OFF)
-        left_layout.addWidget(self._panel1)
-        left_layout.addWidget(self._panel2)
-        left_layout.addWidget(self._panel3)
-        left_layout.addStretch()
+        gen_box    = QGroupBox("Generators")
+        gen_layout = QVBoxLayout(gen_box)
+        self._gen_tabs = QTabWidget()
+        gen_layout.addWidget(self._gen_tabs)
+        gen_btn_row = QHBoxLayout()
+        self._add_gen_btn    = QPushButton("+  Add Generator")
+        self._remove_gen_btn = QPushButton("−  Remove Generator")
+        self._add_gen_btn.clicked.connect(lambda: self._add_generator())
+        self._remove_gen_btn.clicked.connect(self._remove_generator)
+        gen_btn_row.addWidget(self._add_gen_btn)
+        gen_btn_row.addWidget(self._remove_gen_btn)
+        gen_layout.addLayout(gen_btn_row)
+        left_layout.addWidget(gen_box)
+
+        agg_box     = QGroupBox("Aggregator")
+        agg_vlayout = QVBoxLayout(agg_box)
+        agg_vlayout.setContentsMargins(12, 18, 12, 14)
+        agg_vlayout.setSpacing(12)
+
+        self._agg_ports_widget = QWidget()
+        self._agg_ports_layout = QVBoxLayout(self._agg_ports_widget)
+        self._agg_ports_layout.setContentsMargins(0, 0, 0, 0)
+        self._agg_ports_layout.setSpacing(8)
+        self._agg_port_rows          = []
+        self._agg_port_labels        = []
+        self._agg_ports              = []
+        self._agg_port_remove_btns   = []
+        self._agg_port_listen_btns   = []
+        self._agg_port_listeners     = []
+        self._agg_port_status_labels = []
+        self._agg_port_active        = []
+        agg_vlayout.addWidget(self._agg_ports_widget)
+
+        agg_btn_row = QHBoxLayout()
+        self._add_port_btn = QPushButton("+  Add Port")
+        self._add_port_btn.clicked.connect(self._add_agg_port)
+        agg_btn_row.addWidget(self._add_port_btn)
+        agg_btn_row.addStretch()
+        agg_vlayout.addLayout(agg_btn_row)
+
+        out_row = QHBoxLayout()
+        out_row.addWidget(QLabel("Aggregator → Receiver:"))
+        self._port_out = QSpinBox()
+        self._port_out.setRange(1, 65535)
+        self._port_out.setValue(50010)
+        self._port_out.setFixedWidth(140)
+        self._port_out.setKeyboardTracking(False)
+        self._port_out.valueChanged.connect(self._on_port_out_changed)
+        out_row.addWidget(self._port_out)
+        out_row.addStretch()
+        agg_vlayout.addLayout(out_row)
+
+        left_layout.addWidget(agg_box)
+
+        self._port_test_timer = QTimer()
+        self._port_test_timer.setInterval(300)
+        self._port_test_timer.timeout.connect(self._update_port_status_labels)
+        self._port_test_timer.start()
+
         left_layout.addWidget(self._build_buttons())
         splitter.addWidget(left)
 
@@ -198,9 +285,7 @@ class MainWindow(QMainWindow):
         right_layout.addWidget(self._build_display_controls())
 
         # ── Plot 1: aggregator (per-stream, pre-pipeline) ──
-        self._plot = pg.PlotWidget(
-            title="Combiner Input — ports 50001/50002/50003"
-        )
+        self._plot = pg.PlotWidget(title="Aggregator Input")
         self._plot.setLabel("bottom", "Frequency", units="Hz")
         self._plot.setLabel("left",   "Magnitude", units="dB")
         self._plot.showGrid(x=True, y=True, alpha=0.3)
@@ -223,9 +308,7 @@ class MainWindow(QMainWindow):
         self._plot.addItem(self._plot1_label)
 
         # ── Plot 2: DIFI receiver (post-pipeline, per-stream) ──
-        self._plot2 = pg.PlotWidget(
-            title="Receiver Input — port 50010"
-        )
+        self._plot2 = pg.PlotWidget(title="Receiver Input")
         self._plot2.setLabel("bottom", "Frequency", units="Hz")
         self._plot2.setLabel("left",   "Magnitude", units="dB")
         self._plot2.showGrid(x=True, y=True, alpha=0.3)
@@ -270,6 +353,7 @@ class MainWindow(QMainWindow):
         self._timer = QTimer()
         self._timer.setInterval(100)
         self._timer.timeout.connect(self._update_spectrum)
+        self._timer.start()   # always running — shows live data whenever any is flowing, blank otherwise
 
     def _build_display_controls(self) -> QWidget:
         box    = QGroupBox("Display")
@@ -334,6 +418,345 @@ class MainWindow(QMainWindow):
         h.addWidget(self._stop_btn)
         return w
 
+    # ── generator tab management ────────────────────────────────────────────
+
+    def _next_default_port(self) -> int:
+        used = {p.port() for p in self._gen_panels}
+        port = 50001
+        while port in used:
+            port += 1
+        return port
+
+    def _next_default_stream_id(self) -> int:
+        used = {p.stream_id() for p in self._gen_panels}
+        sid = 1
+        while sid in used:
+            sid += 1
+        return sid
+
+    def _renumber_tabs(self):
+        for i in range(self._gen_tabs.count()):
+            self._gen_tabs.setTabText(i, f"Generator {i + 1}")
+
+    def _renumber_agg_ports(self):
+        for i, label in enumerate(self._agg_port_labels):
+            label.setText(f"Input port {i + 1}:")
+
+    def _add_agg_port_row(self, default_port: int, active: bool = False):
+        row_widget = QWidget()
+        row = QHBoxLayout(row_widget)
+        row.setContentsMargins(0, 0, 0, 0)
+        label = QLabel(f"Input port {len(self._agg_ports) + 1}:")
+        spin  = QSpinBox()
+        spin.setRange(1, 65535)
+        spin.setValue(default_port)
+        spin.setFixedWidth(140)
+        spin.setKeyboardTracking(False)
+        spin._prev_value = default_port
+        spin.setToolTip(
+            "Port the Aggregator listens on for this stream.\n"
+            "Does not have to match the generator's UDP Port —\n"
+            "set it differently to simulate a generator whose\n"
+            "traffic the Aggregator isn't picking up."
+        )
+        spin.valueChanged.connect(lambda new_val, s=spin: self._on_agg_port_value_changed(s, new_val))
+        listen_btn = QPushButton("▶")
+        listen_btn.setFixedWidth(28)
+        listen_btn.setToolTip("Start listening on this port")
+        listen_btn.clicked.connect(lambda: self._toggle_port_listener(row_widget))
+        remove_btn = QPushButton("✕")
+        remove_btn.setFixedWidth(28)
+        remove_btn.setToolTip("Remove this input port")
+        remove_btn.clicked.connect(lambda: self._remove_specific_agg_port(row_widget))
+        status_label = QLabel("")
+        status_label.setStyleSheet("color: #4CAF50;")
+        row.addWidget(label)
+        row.addWidget(spin)
+        row.addWidget(listen_btn)
+        row.addWidget(remove_btn)
+        row.addWidget(status_label)
+        row.addStretch()
+        self._agg_ports_layout.addWidget(row_widget)
+        self._agg_port_rows.append(row_widget)
+        self._agg_port_labels.append(label)
+        self._agg_ports.append(spin)
+        self._agg_port_remove_btns.append(remove_btn)
+        self._agg_port_listen_btns.append(listen_btn)
+        self._agg_port_listeners.append(None)
+        self._agg_port_status_labels.append(status_label)
+        self._agg_port_active.append(False)
+        self._update_agg_remove_enabled()
+        if active:
+            self._set_port_active(len(self._agg_ports) - 1, True)
+
+    def _remove_agg_port_row(self, idx: int):
+        port = self._agg_ports[idx].value()
+        if self._agg_port_active[idx]:
+            if self._pipeline_running:
+                capture = self._modules.get("capture")
+                if capture:
+                    capture.remove_port(port)
+                    capture.bind_errors.pop(port, None)
+            else:
+                self._stop_standalone_listener(idx)
+        self._agg_standalone_bind_errors.pop(port, None)
+        self._agg_port_active.pop(idx)
+        self._agg_port_listeners.pop(idx)
+        self._agg_port_listen_btns.pop(idx)
+        self._agg_port_status_labels.pop(idx)
+        row_widget = self._agg_port_rows.pop(idx)
+        self._agg_ports_layout.removeWidget(row_widget)
+        row_widget.deleteLater()
+        self._agg_port_labels.pop(idx)
+        self._agg_ports.pop(idx)
+        self._agg_port_remove_btns.pop(idx)
+        self._renumber_agg_ports()
+        self._update_agg_remove_enabled()
+
+    def _set_port_active(self, idx: int, want_active: bool):
+        """Turn listening on/off for one Aggregator port row.
+
+        Works identically whether the main pipeline is running or not: while
+        running it drives the real InputCapture (add_port/remove_port); while
+        stopped it drives a standalone PortListener so the row still shows
+        live status. Either way this is the single source of truth for
+        whether a port is being listened to.
+        """
+        if self._agg_port_active[idx] == want_active:
+            return
+        port = self._agg_ports[idx].value()
+        btn  = self._agg_port_listen_btns[idx]
+        if want_active:
+            if self._pipeline_running:
+                capture = self._modules.get("capture")
+                try:
+                    capture.add_port(port)
+                    capture.bind_errors.pop(port, None)
+                except OSError as exc:
+                    capture.bind_errors[port] = str(exc)
+                    self._status.showMessage(f"⚠ Couldn't listen on port {port}: {exc}")
+            else:
+                try:
+                    listener = PortListener(port=port, out_queue=queue.Queue(maxsize=50))
+                    listener.start()
+                    self._agg_port_listeners[idx] = listener
+                    self._agg_standalone_bind_errors.pop(port, None)
+                except OSError as exc:
+                    self._agg_standalone_bind_errors[port] = str(exc)
+                    self._status.showMessage(f"⚠ Couldn't listen on port {port}: {exc}")
+            self._agg_port_active[idx] = True
+            btn.setText("■")
+            btn.setToolTip(f"Listening on port {port} — click to pause")
+        else:
+            if self._pipeline_running:
+                capture = self._modules.get("capture")
+                if capture:
+                    capture.remove_port(port)
+                    capture.bind_errors.pop(port, None)
+            else:
+                self._stop_standalone_listener(idx)
+                self._agg_standalone_bind_errors.pop(port, None)
+            self._agg_port_active[idx] = False
+            btn.setText("▶")
+            btn.setToolTip("Start listening on this port")
+            self._agg_port_status_labels[idx].setText("")
+
+    def _stop_standalone_listener(self, idx: int):
+        listener = self._agg_port_listeners[idx]
+        if listener is not None:
+            listener.stop()
+            listener.join(timeout=1.0)
+            self._agg_port_listeners[idx] = None
+
+    def _resume_standalone_listener(self, idx: int):
+        port = self._agg_ports[idx].value()
+        try:
+            listener = PortListener(port=port, out_queue=queue.Queue(maxsize=50))
+            listener.start()
+            self._agg_port_listeners[idx] = listener
+            self._agg_standalone_bind_errors.pop(port, None)
+        except OSError as exc:
+            self._agg_standalone_bind_errors[port] = str(exc)
+
+    def _on_agg_port_value_changed(self, spin, new_value):
+        idx = self._agg_ports.index(spin)
+        old_value = getattr(spin, "_prev_value", new_value)
+        spin._prev_value = new_value
+        if old_value == new_value or not self._agg_port_active[idx]:
+            return
+        if self._pipeline_running:
+            capture = self._modules.get("capture")
+            if capture:
+                capture.remove_port(old_value)
+                capture.bind_errors.pop(old_value, None)
+                try:
+                    capture.add_port(new_value)
+                    capture.bind_errors.pop(new_value, None)
+                except OSError as exc:
+                    capture.bind_errors[new_value] = str(exc)
+                    self._status.showMessage(f"⚠ Couldn't listen on port {new_value}: {exc}")
+        else:
+            self._stop_standalone_listener(idx)
+            self._agg_standalone_bind_errors.pop(old_value, None)
+            try:
+                listener = PortListener(port=new_value, out_queue=queue.Queue(maxsize=50))
+                listener.start()
+                self._agg_port_listeners[idx] = listener
+                self._agg_standalone_bind_errors.pop(new_value, None)
+            except OSError as exc:
+                self._agg_standalone_bind_errors[new_value] = str(exc)
+                self._status.showMessage(f"⚠ Couldn't listen on port {new_value}: {exc}")
+
+    def _on_port_out_changed(self, value):
+        if self._pipeline_running:
+            sender   = self._modules.get("sender")
+            receiver = self._modules.get("receiver")
+            if sender:
+                sender.set_dest_port(value)
+            if receiver:
+                try:
+                    receiver.rebind(value)
+                except OSError as exc:
+                    self._status.showMessage(f"⚠ Couldn't bind receiver to port {value}: {exc}")
+
+    def _on_hold_ms_changed(self, value):
+        if self._pipeline_running:
+            jitter = self._modules.get("jitter")
+            if jitter:
+                jitter.set_hold_ms(value)
+
+    def _toggle_port_listener(self, row_widget):
+        idx = self._agg_port_rows.index(row_widget)
+        self._set_port_active(idx, not self._agg_port_active[idx])
+
+    def _update_port_status_labels(self):
+        """Refresh each Aggregator port row's status label.
+
+        A row only shows anything if it's toggled active (▶ pressed). While
+        the real pipeline is running this reflects the actual InputCapture
+        listener (live packet count, or "bind failed"); while stopped it
+        reflects the standalone listener started for that same toggle — same
+        button, same state, whether the pipeline is running or not.
+        """
+        capture = self._modules.get("capture") if self._pipeline_running else None
+        for i, (spin, label) in enumerate(zip(self._agg_ports, self._agg_port_status_labels)):
+            if not self._agg_port_active[i]:
+                label.setText("")
+                continue
+            port = spin.value()
+            if capture:
+                if port in capture.bind_errors:
+                    label.setStyleSheet("color: #E53935;")
+                    label.setText("bind failed")
+                else:
+                    stats = capture.port_stats()
+                    label.setStyleSheet("color: #4CAF50;")
+                    label.setText(f"{stats.get(port, 0)} pkts")
+            elif port in self._agg_standalone_bind_errors:
+                label.setStyleSheet("color: #E53935;")
+                label.setText("bind failed")
+            else:
+                listener = self._agg_port_listeners[i]
+                if listener is not None:
+                    label.setStyleSheet("color: #4CAF50;")
+                    label.setText(f"{listener.stats['data_received']} pkts")
+
+    def _update_agg_remove_enabled(self):
+        enabled = len(self._agg_ports) > 1
+        for btn in self._agg_port_remove_btns:
+            btn.setEnabled(enabled)
+
+    def _stop_all_standalone_listeners(self):
+        """Stop every standalone PortListener without changing active/button state.
+
+        Used to release ports before Start hands them off to the real
+        InputCapture, and for final cleanup on close.
+        """
+        for idx in range(len(self._agg_port_listeners)):
+            self._stop_standalone_listener(idx)
+
+    def _add_agg_port(self):
+        self._add_agg_port_row(default_port=self._next_default_agg_port())
+
+    def _remove_specific_agg_port(self, row_widget):
+        if len(self._agg_ports) <= 1:
+            return
+        idx = self._agg_port_rows.index(row_widget)
+        self._remove_agg_port_row(idx)
+
+    def _next_default_agg_port(self) -> int:
+        used = {sb.value() for sb in self._agg_ports}
+        port = 50001
+        while port in used:
+            port += 1
+        return port
+
+    def _build_generator(self, panel) -> DifiGenerator:
+        rf_ref  = self._rf_ref_for(panel)
+        tone_bb = panel.tone_hz() - rf_ref
+        return DifiGenerator(
+            stream_id       = panel.stream_id(),
+            tone_hz         = tone_bb,
+            signal_type     = panel.signal_type(),
+            dest_port       = panel.port(),
+            sample_rate_hz  = self._shared_fs.value_hz(),
+            samples_per_pkt = self.SAMPLES_PER_PKT,
+            bit_depth       = self.BIT_DEPTH,
+            rf_ref_freq_hz  = rf_ref,
+            bandwidth_hz    = panel.bandwidth_hz(),
+            ref_level_dbm   = panel.amplitude_dbm(),
+        )
+
+    def _start_generator_thread(self, gen: DifiGenerator):
+        pkt_rate = self._shared_fs.value_hz() / self.SAMPLES_PER_PKT
+        threading.Thread(target=gen.run, kwargs=dict(packet_rate_hz=pkt_rate), daemon=True).start()
+
+    def _active_stream_ids(self) -> set:
+        """Stream IDs of generators that are actually transmitting (not OFF).
+
+        The Aggregator's fixed mode waits for ALL expected streams before
+        emitting any chunk — an OFF generator sends nothing at all, so it
+        must be excluded or the whole pipeline would stall forever.
+        """
+        return {p.stream_id() for p in self._gen_panels if p.signal_type() != SIGNAL_OFF}
+
+    def _add_generator(self, default_signal_type: str = SIGNAL_OFF):
+        idx  = len(self._gen_panels) + 1
+        port = self._next_default_port()
+        sid  = self._next_default_stream_id()
+        panel = GeneratorPanel(
+            default_signal_type = default_signal_type,
+            default_port        = port,
+            default_stream_id   = sid,
+            default_tone_hz     = idx * 1e6,
+        )
+        panel.changed.connect(self._live_update_generators)
+        self._gen_panels.append(panel)
+        self._gen_tabs.addTab(panel, f"Generator {idx}")
+        self._gen_tabs.setCurrentWidget(panel)
+        self._renumber_tabs()
+        self._remove_gen_btn.setEnabled(len(self._gen_panels) > 1)
+        if self._pipeline_running:
+            gen = self._build_generator(panel)
+            self._modules["gens"].append(gen)
+            self._start_generator_thread(gen)
+            self._modules["aggregator"].update_stream_filter(self._active_stream_ids())
+
+    def _remove_generator(self):
+        if len(self._gen_panels) <= 1:
+            return
+        idx = self._gen_tabs.currentIndex()
+        if idx < 0:
+            return
+        panel = self._gen_panels.pop(idx)
+        self._gen_tabs.removeTab(idx)
+        panel.deleteLater()
+        self._renumber_tabs()
+        self._remove_gen_btn.setEnabled(len(self._gen_panels) > 1)
+        if self._pipeline_running:
+            gen = self._modules["gens"].pop(idx)
+            gen.close()
+            self._modules["aggregator"].update_stream_filter(self._active_stream_ids())
 
     def _rf_ref_for(self, panel) -> float:
         """
@@ -357,118 +780,99 @@ class MainWindow(QMainWindow):
         if self._pipeline_running:
             return
 
-        p1 = self._panel1
-        p2 = self._panel2
-        p3 = self._panel3
+        panels    = self._gen_panels
+        # Only ports currently toggled on (▶) are listened to — Start respects
+        # whatever's currently configured, it doesn't force-listen on everything added.
+        agg_ports = [sb.value() for sb, active in zip(self._agg_ports, self._agg_port_active) if active]
+        sids      = [p.stream_id() for p in panels]
+        port_out  = self._port_out.value()
+
+        listen_ports = agg_ports + [port_out]
+        if len(set(listen_ports)) != len(listen_ports):
+            self._status.showMessage(
+                "⚠ Aggregator listening ports must be unique — "
+                "two or more input/receiver ports are the same"
+            )
+            return
+        if len(set(sids)) != len(sids):
+            self._status.showMessage(
+                "⚠ Stream IDs must be unique — two or more generators share one"
+            )
+            return
+
+        self._stop_all_standalone_listeners()   # hand active ports off to the real InputCapture
+
         fs = self._shared_fs.value_hz()
 
-        rf_ref1  = self._rf_ref_for(p1)
-        rf_ref2  = self._rf_ref_for(p2)
-        rf_ref3  = self._rf_ref_for(p3)
-        tone1_bb = p1.tone_hz() - rf_ref1
-        tone2_bb = p2.tone_hz() - rf_ref2
-        tone3_bb = p3.tone_hz() - rf_ref3
+        gens = [self._build_generator(panel) for panel in panels]
 
-        gen1 = DifiGenerator(
-            stream_id       = 0x00000001,
-            tone_hz         = tone1_bb,
-            signal_type     = p1.signal_type(),
-            dest_port       = 50001,
-            sample_rate_hz  = fs,
-            samples_per_pkt = self.SAMPLES_PER_PKT,
-            bit_depth       = self.BIT_DEPTH,
-            rf_ref_freq_hz  = rf_ref1,
-            bandwidth_hz    = p1.bandwidth_hz(),
-            ref_level_dbm   = p1.amplitude_dbm(),
-        )
-        gen2 = DifiGenerator(
-            stream_id       = 0x00000002,
-            tone_hz         = tone2_bb,
-            signal_type     = p2.signal_type(),
-            dest_port       = 50002,
-            sample_rate_hz  = fs,
-            samples_per_pkt = self.SAMPLES_PER_PKT,
-            bit_depth       = self.BIT_DEPTH,
-            rf_ref_freq_hz  = rf_ref2,
-            bandwidth_hz    = p2.bandwidth_hz(),
-            ref_level_dbm   = p2.amplitude_dbm(),
-        )
-        gen3 = DifiGenerator(
-            stream_id       = 0x00000003,
-            tone_hz         = tone3_bb,
-            signal_type     = p3.signal_type(),
-            dest_port       = 50003,
-            sample_rate_hz  = fs,
-            samples_per_pkt = self.SAMPLES_PER_PKT,
-            bit_depth       = self.BIT_DEPTH,
-            rf_ref_freq_hz  = rf_ref3,
-            bandwidth_hz    = p3.bandwidth_hz(),
-            ref_level_dbm   = p3.amplitude_dbm(),
-        )
-
-        capture    = InputCapture(ports=self.CAPTURE_PORTS)
+        capture    = InputCapture(ports=agg_ports)
         jitter     = JitterBuffer(capture, hold_ms=self._hold_ms.value())
         aggregator = Aggregator(
             capture          = jitter,
-            expected_streams = self.EXPECTED_STREAMS,
+            expected_streams = self._active_stream_ids(),
             chunk_size       = self.SAMPLES_PER_PKT,
         )
         packetizer = Packetizer(aggregator=aggregator)
-        sender     = DifiSender(packetizer=packetizer, dest_port=self.RECEIVER_PORT)
-        receiver   = DifiReceiver(port=self.RECEIVER_PORT)
+        sender     = DifiSender(packetizer=packetizer, dest_port=port_out)
+
+        try:
+            receiver = DifiReceiver(port=port_out)
+            receiver.start()
+        except OSError as exc:
+            self._status.showMessage(f"⚠ Couldn't bind receiver to port {port_out}: {exc}")
+            return
+        time.sleep(0.05)
 
         self._modules = dict(
-            gen1=gen1, gen2=gen2, gen3=gen3,
+            gens=gens,
             capture=capture, jitter=jitter, aggregator=aggregator,
             packetizer=packetizer, sender=sender, receiver=receiver,
         )
 
-        receiver.start();  time.sleep(0.05)
         capture.start();   time.sleep(0.05)
         jitter.start()
         aggregator.start()
         packetizer.start()
         sender.start()
 
-        # Warn if any baseband tone still exceeds Nyquist after LO auto-assignment
+        status_extra = ""
+        if capture.bind_errors:
+            failed = ", ".join(f"{p} ({err})" for p, err in capture.bind_errors.items())
+            status_extra = f" | ⚠ Failed to listen on: {failed}"
+
+        # Warn if any baseband tone still exceeds Nyquist after LO auto-assignment.
+        # Stored persistently (not just shown once) since the recurring spectrum
+        # status update below would otherwise silently overwrite it within ~100ms.
         nyquist = fs / 2.0
         alias_warnings = []
-        if abs(tone1_bb) >= nyquist:
-            alias_warnings.append(f"Gen1 RF={p1.tone_hz()/1e6:.3f}MHz bb={tone1_bb/1e6:.3f}MHz")
-        if abs(tone2_bb) >= nyquist:
-            alias_warnings.append(f"Gen2 RF={p2.tone_hz()/1e6:.3f}MHz bb={tone2_bb/1e6:.3f}MHz")
-        if abs(tone3_bb) >= nyquist:
-            alias_warnings.append(f"Gen3 RF={p3.tone_hz()/1e6:.3f}MHz bb={tone3_bb/1e6:.3f}MHz")
-        if alias_warnings:
-            self._status.showMessage(
-                f"⚠ Tone exceeds Nyquist ({nyquist/1e6:.3f}MHz): "
-                + ", ".join(alias_warnings)
-                + " — set RF Reference to the correct LO"
-            )
+        for i, (panel, gen) in enumerate(zip(panels, gens), start=1):
+            if abs(gen.tone_hz) >= nyquist:
+                alias_warnings.append(
+                    f"Gen{i} RF={panel.tone_hz()/1e6:.3f}MHz bb={gen.tone_hz/1e6:.3f}MHz"
+                )
+        self._pipeline_warning = (
+            f" | ⚠ Tone exceeds Nyquist ({nyquist/1e6:.3f}MHz): "
+            + ", ".join(alias_warnings)
+            + " — set RF Reference to the correct LO"
+        ) if alias_warnings else ""
+        status_extra += self._pipeline_warning
 
-        pkt_rate = fs / self.SAMPLES_PER_PKT
-        threading.Thread(target=gen1.run, kwargs=dict(packet_rate_hz=pkt_rate), daemon=True).start()
-        threading.Thread(target=gen2.run, kwargs=dict(packet_rate_hz=pkt_rate), daemon=True).start()
-        threading.Thread(target=gen3.run, kwargs=dict(packet_rate_hz=pkt_rate), daemon=True).start()
+        for gen in gens:
+            self._start_generator_thread(gen)
 
         self._pipeline_running = True
-        self._shared_fs.setEnabled(False)   # lock sample rate while running
-        self._hold_ms.setEnabled(False)     # lock jitter budget while running
         self._start_btn.setEnabled(False)
         self._stop_btn.setEnabled(True)
-        self._timer.start()
 
-        self._status.showMessage(
-            f"Running — fs={fs/1e6:.1f}MHz | "
-            f"Gen1:{p1.signal_type()} {p1.tone_hz()/1e6:.3f}MHz | "
-            f"Gen2:{p2.signal_type()} {p2.tone_hz()/1e6:.3f}MHz | "
-            f"Gen3:{p3.signal_type()} {p3.tone_hz()/1e6:.3f}MHz"
+        gen_str = " | ".join(
+            f"Gen{i}:{p.signal_type()} {p.tone_hz()/1e6:.3f}MHz" for i, p in enumerate(panels, start=1)
         )
+        self._status.showMessage(f"Running — fs={fs/1e6:.1f}MHz | {gen_str}{status_extra}")
 
-    def _stop_pipeline(self):
+    def _stop_pipeline(self, resume_standalone: bool = True):
         if not self._pipeline_running:
             return
-        self._timer.stop()
         m = self._modules
         m["sender"].stop()
         m["packetizer"].stop()
@@ -476,53 +880,95 @@ class MainWindow(QMainWindow):
         m["jitter"].stop()
         m["capture"].stop()
         m["receiver"].stop()
-        m["gen1"].close()
-        m["gen2"].close()
-        m["gen3"].close()
+        for gen in m["gens"]:
+            gen.close()
+        self._modules = {}
         self._pipeline_running = False
-        self._shared_fs.setEnabled(True)    # unlock sample rate
-        self._hold_ms.setEnabled(True)      # unlock jitter budget
+        self._pipeline_warning = ""
+        self._clear_plots()
+        if resume_standalone:
+            # Ports that were active stay "live" via standalone listeners even
+            # while stopped, and are handed straight back to Start next time.
+            for idx in range(len(self._agg_port_active)):
+                if self._agg_port_active[idx]:
+                    self._resume_standalone_listener(idx)
         self._start_btn.setEnabled(True)
         self._stop_btn.setEnabled(False)
         self._status.showMessage("Stopped")
 
+    def _clear_plots(self):
+        for curve in self._curves1.values():
+            curve.setData([], [])
+        for curve in self._curves2.values():
+            curve.setData([], [])
+        self._plot1_label.setText("source: Aggregator.last_chunk  (float32, no encoding)")
+        self._plot2_label.setText("waiting for receiver packets…")
+
+    # How long since the last fresh data before a plot/stream is treated as
+    # dead and cleared, rather than left showing a frozen last snapshot.
+    STALE_DATA_TIMEOUT_S = 1.5
+
     def _update_spectrum(self):
         agg = self._modules.get("aggregator")
         if agg is None:
+            self._clear_plots()
             return
         chunk = agg.last_chunk
         if chunk is None:
             return
+        now = time.monotonic()
+        if now - chunk.created_at > self.STALE_DATA_TIMEOUT_S:
+            # Aggregator hasn't produced anything new in a while — nothing is
+            # actually flowing right now, so don't keep showing the old chunk.
+            self._clear_plots()
+            return
 
         # ── Plot 1: aggregator — per-stream spectra (generator inputs) ─────────
         active_sids1 = []
+        seen_sids1 = set()
         for s in chunk.streams:
             if s.context is None or len(s.samples) == 0:
                 continue
             sid = s.stream_id
+            seen_sids1.add(sid)
             active_sids1.append(f"0x{sid:08X}")
             if sid not in self._curves1:
                 self._curves1[sid] = self._plot.plot([], [], pen=_stream_color(sid))
             f, m = _stream_fft(s.samples, s.context)
             self._curves1[sid].setData(f, m)
-        if active_sids1:
-            self._plot1_label.setText(
-                f"source: Aggregator.last_chunk  (float32, no encoding)  |  "
-                f"chunks: {agg.chunks_emitted:,}  |  streams: {' + '.join(active_sids1)}"
-            )
+        # Clear curves for any stream that's no longer part of the latest chunk
+        # (e.g. a generator was switched OFF) instead of leaving it frozen.
+        for sid, curve in self._curves1.items():
+            if sid not in seen_sids1:
+                curve.setData([], [])
+        self._plot1_label.setText(
+            f"source: Aggregator.last_chunk  (float32, no encoding)  |  "
+            f"chunks: {agg.chunks_emitted:,}  |  streams: {' + '.join(active_sids1)}"
+            if active_sids1 else "source: Aggregator.last_chunk  (float32, no encoding)"
+        )
 
         # ── Plot 2: DIFI receiver — per-stream spectra (combiner output) ────────
         rx = self._modules.get("receiver")
         if rx:
-            snaps = rx.get_stream_snapshots()
+            snaps      = rx.get_stream_snapshots()
+            last_seen  = rx.stream_last_seen()
+            active_sids2 = []
+            seen_sids2   = set()
             for sid, (iq, ctx_s) in snaps.items():
                 if ctx_s is None or len(iq) == 0:
                     continue
+                if now - last_seen.get(sid, 0.0) > self.STALE_DATA_TIMEOUT_S:
+                    continue   # stream has gone silent — don't keep redrawing its last snapshot
+                seen_sids2.add(sid)
+                active_sids2.append(f"0x{sid:08X}")
                 if sid not in self._curves2:
                     self._curves2[sid] = self._plot2.plot([], [], pen=_stream_color(sid))
                 f, m = _stream_fft(iq, ctx_s)
                 self._curves2[sid].setData(f, m)
-            sid_list = " + ".join(f"0x{s:08X}" for s in snaps)
+            for sid, curve in self._curves2.items():
+                if sid not in seen_sids2:
+                    curve.setData([], [])
+            sid_list = " + ".join(active_sids2)
             self._plot2_label.setText(
                 f"source: DifiReceiver  (int16→float32)  |  "
                 f"UDP pkts received: {rx.data_received:,}  |  "
@@ -541,49 +987,39 @@ class MainWindow(QMainWindow):
         chunk_age_ms = (time.monotonic() - chunk.created_at) * 1000
         fs0 = chunk.streams[0].context.sample_rate_hz
         rx_pkts = rx.data_received if rx else 0
+        seq_errors = rx.seq_errors if rx else 0
+        dropped    = agg.packets_dropped
+        loss_str = f"  seq_errors={seq_errors}  dropped={dropped}" if (seq_errors or dropped) else ""
         self._status.showMessage(
             f"Running — fs={fs0/1e6:.1f} MHz{rf_str} | "
             f"chunks={agg.chunks_emitted}  rx={rx_pkts}  "
-            f"latency≈{chunk_age_ms:.1f} ms"
+            f"latency≈{chunk_age_ms:.1f} ms{loss_str}{self._pipeline_warning}"
         )
 
     def _live_update_generators(self):
         if not self._pipeline_running:
             return
-        gen1 = self._modules.get("gen1")
-        gen2 = self._modules.get("gen2")
-        gen3 = self._modules.get("gen3")
-        if not gen1 or not gen2 or not gen3:
+        gens = self._modules.get("gens")
+        if not gens or len(gens) != len(self._gen_panels):
             return
-        p1, p2, p3 = self._panel1, self._panel2, self._panel3
-        rf_ref1  = self._rf_ref_for(p1)
-        rf_ref2  = self._rf_ref_for(p2)
-        rf_ref3  = self._rf_ref_for(p3)
-        gen1.update_params(
-            tone_hz        = p1.tone_hz() - rf_ref1,
-            signal_type    = p1.signal_type(),
-            bandwidth_hz   = p1.bandwidth_hz(),
-            rf_ref_freq_hz = rf_ref1,
-            ref_level_dbm  = p1.amplitude_dbm(),
-        )
-        gen2.update_params(
-            tone_hz        = p2.tone_hz() - rf_ref2,
-            signal_type    = p2.signal_type(),
-            bandwidth_hz   = p2.bandwidth_hz(),
-            rf_ref_freq_hz = rf_ref2,
-            ref_level_dbm  = p2.amplitude_dbm(),
-        )
-        gen3.update_params(
-            tone_hz        = p3.tone_hz() - rf_ref3,
-            signal_type    = p3.signal_type(),
-            bandwidth_hz   = p3.bandwidth_hz(),
-            rf_ref_freq_hz = rf_ref3,
-            ref_level_dbm  = p3.amplitude_dbm(),
-        )
+        fs = self._shared_fs.value_hz()
+        for gen, panel in zip(gens, self._gen_panels):
+            rf_ref = self._rf_ref_for(panel)
+            gen.update_params(
+                tone_hz        = panel.tone_hz() - rf_ref,
+                signal_type    = panel.signal_type(),
+                bandwidth_hz   = panel.bandwidth_hz(),
+                rf_ref_freq_hz = rf_ref,
+                ref_level_dbm  = panel.amplitude_dbm(),
+                sample_rate_hz = fs,
+                dest_port      = panel.port(),
+                stream_id      = panel.stream_id(),
+            )
         # Drain pipeline queues so stale chunks with old context don't reach the
         # receiver after parameter changes, then flush the receiver IQ buffer.
         agg = self._modules.get("aggregator")
         if agg:
+            agg.update_stream_filter(self._active_stream_ids())
             agg.flush_queue()
         pktzr = self._modules.get("packetizer")
         if pktzr:
@@ -633,7 +1069,8 @@ class MainWindow(QMainWindow):
 
 
     def closeEvent(self, event):
-        self._stop_pipeline()
+        self._stop_pipeline(resume_standalone=False)
+        self._stop_all_standalone_listeners()
         event.accept()
 
 

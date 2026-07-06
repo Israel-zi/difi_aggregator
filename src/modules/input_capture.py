@@ -72,7 +72,19 @@ class PortListener(threading.Thread):
         self.host      = host
         self.timeout   = timeout
         self._stop_evt = threading.Event()
-        self._sock     = None
+
+        # Bind synchronously in the caller's thread so a failure (port already
+        # in use by another process, permission denied, etc.) raises immediately
+        # here instead of silently killing a background thread with no one
+        # ever finding out why no packets are arriving.
+        self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._sock.settimeout(self.timeout)
+        try:
+            self._sock.bind((self.host, self.port))
+        except OSError:
+            self._sock.close()
+            raise
 
         # per-stream statistics
         self.stats = {
@@ -91,11 +103,6 @@ class PortListener(threading.Thread):
                 pass
 
     def run(self):
-        self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self._sock.settimeout(self.timeout)
-        self._sock.bind((self.host, self.port))
-
         print(f"[Capture] Listening on {self.host}:{self.port}")
 
         while not self._stop_evt.is_set():
@@ -181,10 +188,18 @@ class InputCapture:
         queue_maxsize: int = 30,
     ):
         self._out_queue = queue.Queue(maxsize=queue_maxsize)
-        self._listeners = [
-            PortListener(port=p, out_queue=self._out_queue, host=host)
-            for p in ports
-        ]
+        self._listeners = []
+        # Ports that failed to bind (e.g. already in use by another program) —
+        # collected instead of raised so the other ports still start.
+        self.bind_errors: dict = {}
+        for p in ports:
+            try:
+                self._listeners.append(
+                    PortListener(port=p, out_queue=self._out_queue, host=host)
+                )
+            except OSError as exc:
+                self.bind_errors[p] = str(exc)
+                print(f"[Capture] Failed to bind port {p}: {exc}")
 
     def start(self):
         """Start all listener threads."""
@@ -201,7 +216,11 @@ class InputCapture:
         print("[Capture] All listeners stopped")
 
     def add_port(self, port: int, host: str = "0.0.0.0"):
-        """Start a new listener on the given port while already running."""
+        """Start a new listener on the given port while already running.
+
+        Raises OSError (unchanged) if the port can't be bound — callers
+        should catch this and surface it rather than let it vanish.
+        """
         listener = PortListener(port=port, out_queue=self._out_queue, host=host)
         self._listeners.append(listener)
         listener.start()
@@ -234,6 +253,10 @@ class InputCapture:
             for key in combined:
                 combined[key] += listener.stats[key]
         return combined
+
+    def port_stats(self) -> dict:
+        """Return {port: data_received} for every currently active listener."""
+        return {listener.port: listener.stats["data_received"] for listener in self._listeners}
 
     @property
     def queue_size(self) -> int:
@@ -307,6 +330,11 @@ class JitterBuffer:
             return self._out_queue.get(timeout=timeout)
         except queue.Empty:
             return None
+
+    def set_hold_ms(self, hold_ms: float):
+        """Change the jitter budget at runtime (no restart needed)."""
+        self._hold_s  = hold_ms / 1000.0
+        self._enabled = hold_ms > 0
 
     # ── internal ──────────────────────────────────────────────────────────
 
