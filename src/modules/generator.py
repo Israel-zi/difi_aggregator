@@ -10,6 +10,7 @@ Signal types:
 
 import os
 import sys
+import random
 import socket
 import time
 
@@ -28,6 +29,7 @@ from core.difi_packet import (
     TSI_UTC,
     TSF_REAL_TIME,
 )
+from modules.net_impairment import DelayedDispatcher
 
 CONTEXT_MIN_INTERVAL_S = 0.05   # max 20 context packets/s per DIFI standard (Section 4.3.1)
 SIGNAL_CW  = "CW"
@@ -52,6 +54,9 @@ class DifiGenerator:
     rf_ref_freq_hz  : RF reference frequency for Context packet
     bandwidth_hz    : signal bandwidth (used in BW mode and Context packet)
     ref_level_dbm   : reference level (dBm) — scales signal amplitude
+    sim_delay_ms    : fixed simulated one-way network delay before send (ms)
+    sim_jitter_ms   : max random jitter added on top of sim_delay_ms (ms),
+                      uniform in [0, sim_jitter_ms] per packet
     """
 
     def __init__(
@@ -67,6 +72,8 @@ class DifiGenerator:
         rf_ref_freq_hz: float   = 1_000_000_000,
         bandwidth_hz: float     = 1_000_000,
         ref_level_dbm: float    = -20.0,
+        sim_delay_ms: float     = 0.0,
+        sim_jitter_ms: float    = 0.0,
     ):
         self.stream_id       = stream_id
         self.tone_hz         = tone_hz
@@ -78,8 +85,11 @@ class DifiGenerator:
         self.rf_ref_freq_hz  = rf_ref_freq_hz
         self.bandwidth_hz    = bandwidth_hz
         self.ref_level_dbm   = ref_level_dbm
+        self.sim_delay_ms    = sim_delay_ms
+        self.sim_jitter_ms   = sim_jitter_ms
 
         self._sock          = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self._dispatcher    = DelayedDispatcher(self._sock)
         self._data_seq      = 0
         self._ctx_seq       = 0
         self._pkt_count     = 0
@@ -211,9 +221,15 @@ class DifiGenerator:
         sample_rate_hz: float | None = None,
         dest_port: int | None        = None,
         stream_id: int | None        = None,
+        sim_delay_ms: float | None   = None,
+        sim_jitter_ms: float | None  = None,
     ):
         """Update generator parameters at runtime (thread-safe for simple types)."""
         rebuild_filter = False
+        if sim_delay_ms is not None:
+            self.sim_delay_ms = sim_delay_ms
+        if sim_jitter_ms is not None:
+            self.sim_jitter_ms = sim_jitter_ms
         if tone_hz is not None:
             self.tone_hz = tone_hz
         if signal_type is not None:
@@ -238,17 +254,25 @@ class DifiGenerator:
         # the new rf_ref_freq_hz / bandwidth / etc. immediately.
         self._last_ctx_time = 0.0
 
+    def _sim_delay_s(self) -> float:
+        """Simulated one-way WAN delay for the next packet (fixed + random jitter)."""
+        jitter = random.uniform(0.0, self.sim_jitter_ms) if self.sim_jitter_ms > 0 else 0.0
+        return (self.sim_delay_ms + jitter) / 1000.0
+
     def send_one_packet(self):
         if self.signal_type == SIGNAL_OFF:
             return   # OFF means no transmission at all — no context, no data
 
+        # Packets are built (and DIFI-timestamped) here at true capture time;
+        # the dispatcher only delays when they actually hit the wire, mirroring
+        # a real modem stamping at capture and jitter happening in transit.
         now = time.monotonic()
         if (now - self._last_ctx_time) >= CONTEXT_MIN_INTERVAL_S:
-            self._sock.sendto(self._make_context(), self.dest)
+            self._dispatcher.schedule(self._sim_delay_s(), self.dest, self._make_context())
             self._last_ctx_time = now
 
         samples = self._generate_samples()
-        self._sock.sendto(self._make_data(samples), self.dest)
+        self._dispatcher.schedule(self._sim_delay_s(), self.dest, self._make_data(samples))
         self._pkt_count += 1
 
     def run(self, num_packets: int = 0, packet_rate_hz: float = 0.0):
@@ -259,13 +283,25 @@ class DifiGenerator:
             f"type={self.signal_type} | tone={self.tone_hz:.0f}Hz | "
             f"fs={self.sample_rate_hz:.0f}Hz | dest={self.dest}"
         )
+        # Schedule against an absolute, cumulative clock (start + n*interval),
+        # not "interval minus this iteration's elapsed time". The latter never
+        # recovers an overshoot: a non-real-time OS's sleep() commonly wakes
+        # late by several ms (Windows' default timer granularity is ~15.6ms,
+        # comparable to a whole packet interval here), and if each iteration
+        # forgets the last one's overshoot, the real long-run average send
+        # rate drifts measurably slower than nominal — which, run for long
+        # enough, starves the Aggregator's fixed-cadence demand regardless of
+        # buffer size, since that's a genuine rate deficit, not jitter.
+        # Scheduling against an absolute target lets a late iteration simply
+        # sleep less (or not at all) next time, keeping the average locked in.
+        start = time.monotonic()
         try:
             while self._running and (num_packets == 0 or count < num_packets):
-                t0 = time.monotonic()
                 self.send_one_packet()
                 count += 1
                 if interval > 0:
-                    sleep = interval - (time.monotonic() - t0)
+                    target = start + count * interval
+                    sleep  = target - time.monotonic()
                     if sleep > 0:
                         time.sleep(sleep)
         except (KeyboardInterrupt, OSError):
@@ -277,6 +313,7 @@ class DifiGenerator:
 
     def close(self):
         self._running = False
+        self._dispatcher.stop()
         try:
             self._sock.close()
         except OSError:

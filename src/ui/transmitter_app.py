@@ -17,11 +17,15 @@ if not getattr(sys, 'frozen', False):
 
 import threading
 
-from PySide6.QtCore import QTimer
+import numpy as np
+import scipy.signal as sp_sig
+
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QGridLayout, QLabel, QDoubleSpinBox, QPushButton,
     QGroupBox, QStatusBar, QLineEdit, QSpinBox, QButtonGroup, QRadioButton,
+    QSplitter,
 )
 import pyqtgraph as pg
 
@@ -37,16 +41,25 @@ class TransmitterWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("DIFI Transmitter")
-        self.setMinimumSize(420, 500)
+        self.setMinimumSize(900, 520)
         self._running = False
         self._gen     = None
         self._build_ui()
 
     def _build_ui(self):
-        central = QWidget()
+        central  = QWidget()
         self.setCentralWidget(central)
-        root = QVBoxLayout(central)
-        root.setSpacing(8)
+        root     = QHBoxLayout(central)
+        root.setContentsMargins(0, 0, 0, 0)
+
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        root.addWidget(splitter)
+
+        # ── left panel: controls ──────────────────────────────────────────
+        left     = QWidget()
+        left.setMaximumWidth(400)
+        left_lay = QVBoxLayout(left)
+        left_lay.setSpacing(8)
 
         # ── Network ──
         net_box  = QGroupBox("Network")
@@ -80,7 +93,33 @@ class TransmitterWindow(QMainWindow):
         sid_l.addStretch()
         net_grid.addWidget(sid_w, 2, 1)
 
-        root.addWidget(net_box)
+        net_grid.addWidget(QLabel("Sim delay:"), 3, 0)
+        self._sim_delay = QDoubleSpinBox()
+        self._sim_delay.setRange(0, 5000)
+        self._sim_delay.setDecimals(0)
+        self._sim_delay.setValue(0)
+        self._sim_delay.setSuffix(" ms")
+        self._sim_delay.setFixedWidth(110)
+        self._sim_delay.setToolTip(
+            "Fixed simulated one-way network delay for this modem's path\n"
+            "to the Combiner VM (e.g. 100/120/150 ms)."
+        )
+        net_grid.addWidget(self._sim_delay, 3, 1)
+
+        net_grid.addWidget(QLabel("Sim jitter max:"), 4, 0)
+        self._sim_jitter = QDoubleSpinBox()
+        self._sim_jitter.setRange(0, 1000)
+        self._sim_jitter.setDecimals(0)
+        self._sim_jitter.setValue(0)
+        self._sim_jitter.setSuffix(" ms")
+        self._sim_jitter.setFixedWidth(110)
+        self._sim_jitter.setToolTip(
+            "Extra random delay on top of Sim delay, uniform in\n"
+            "[0, this value] per packet."
+        )
+        net_grid.addWidget(self._sim_jitter, 4, 1)
+
+        left_lay.addWidget(net_box)
 
         # ── Signal ──
         sig_box  = QGroupBox("Signal")
@@ -137,16 +176,19 @@ class TransmitterWindow(QMainWindow):
         for rb in (self._cw_rb, self._bw_rb, self._off_rb):
             rb.toggled.connect(lambda checked: self._bw.setEnabled(self._bw_rb.isChecked()))
 
-        # live update while running
+        # live update generator while running, and refresh spectrum preview
         for rb in (self._cw_rb, self._bw_rb, self._off_rb):
-            rb.toggled.connect(self._live_update)
-        self._tone.changed.connect(self._live_update)
-        self._bw.changed.connect(self._live_update)
-        self._rf.changed.connect(self._live_update)
-        self._amp.valueChanged.connect(self._live_update)
+            rb.toggled.connect(self._on_param_changed)
+        self._tone.changed.connect(self._on_param_changed)
+        self._bw.changed.connect(self._on_param_changed)
+        self._rf.changed.connect(self._on_param_changed)
+        self._amp.valueChanged.connect(self._on_param_changed)
+        self._fs.changed.connect(self._on_param_changed)
+        self._sim_delay.valueChanged.connect(self._on_param_changed)
+        self._sim_jitter.valueChanged.connect(self._on_param_changed)
 
-        root.addWidget(sig_box)
-        root.addStretch()
+        left_lay.addWidget(sig_box)
+        left_lay.addStretch()
 
         # ── Start / Stop ──
         btn_row = QHBoxLayout()
@@ -159,15 +201,96 @@ class TransmitterWindow(QMainWindow):
         self._stop_btn.clicked.connect(self._stop)
         btn_row.addWidget(self._start_btn)
         btn_row.addWidget(self._stop_btn)
-        root.addLayout(btn_row)
+        left_lay.addLayout(btn_row)
+
+        splitter.addWidget(left)
+
+        # ── right panel: display controls + spectrum ──────────────────────
+        right     = QWidget()
+        right_lay = QVBoxLayout(right)
+        right_lay.setContentsMargins(4, 4, 4, 4)
+        right_lay.setSpacing(4)
+
+        disp_box  = QGroupBox("Display")
+        disp_vlay = QVBoxLayout(disp_box)
+        disp_vlay.setSpacing(4)
+
+        row1 = QHBoxLayout()
+        row1.addWidget(QLabel("Center:"))
+        self._disp_center = FreqInput(default_hz=1e6)
+        row1.addWidget(self._disp_center)
+        row1.addSpacing(16)
+        row1.addWidget(QLabel("Span:"))
+        self._disp_span = FreqInput(default_hz=10e6)
+        row1.addWidget(self._disp_span)
+        row1.addStretch()
+        disp_vlay.addLayout(row1)
+
+        row2 = QHBoxLayout()
+        row2.addWidget(QLabel("Amplitude:"))
+        self._disp_amp = QDoubleSpinBox()
+        self._disp_amp.setRange(-200, 50)
+        self._disp_amp.setDecimals(1)
+        self._disp_amp.setSingleStep(10)
+        self._disp_amp.setValue(-10)
+        self._disp_amp.setSuffix(" dB")
+        self._disp_amp.setFixedWidth(120)
+        row2.addWidget(self._disp_amp)
+        row2.addSpacing(16)
+        row2.addWidget(QLabel("dB / div:"))
+        self._disp_dbdiv = QDoubleSpinBox()
+        self._disp_dbdiv.setRange(1, 100)
+        self._disp_dbdiv.setDecimals(1)
+        self._disp_dbdiv.setValue(10)
+        self._disp_dbdiv.setSuffix(" dB")
+        self._disp_dbdiv.setFixedWidth(110)
+        row2.addWidget(self._disp_dbdiv)
+        auto_btn = QPushButton("Auto")
+        auto_btn.setFixedWidth(60)
+        auto_btn.clicked.connect(self._auto_display)
+        row2.addWidget(auto_btn)
+        row2.addStretch()
+        disp_vlay.addLayout(row2)
+
+        self._disp_center.changed.connect(self._apply_range)
+        self._disp_span.changed.connect(self._apply_range)
+        self._disp_amp.valueChanged.connect(self._apply_range)
+        self._disp_dbdiv.valueChanged.connect(self._apply_range)
+
+        right_lay.addWidget(disp_box)
+
+        self._plot = pg.PlotWidget(title="Transmitter Output")
+        self._plot.setLabel("bottom", "Frequency", units="Hz")
+        self._plot.setLabel("left",   "Magnitude", units="dB")
+        self._plot.showGrid(x=True, y=True, alpha=0.3)
+        self._plot.enableAutoRange(axis="xy", enable=False)
+        self._plot.getPlotItem().getViewBox().enableAutoRange(enable=False)
+        self._curve = self._plot.plot([], [], pen=pg.mkPen((100, 220, 255), width=1))
+
+        self._ref_line = pg.InfiniteLine(
+            angle=0, movable=False,
+            pen=pg.mkPen("y", width=1, style=Qt.PenStyle.DashLine),
+        )
+        self._plot.addItem(self._ref_line)
+
+        self._plot.getPlotItem().getViewBox().sigRangeChanged.connect(
+            lambda vb, ranges: self._sync_viewport_to_spinboxes()
+        )
+
+        right_lay.addWidget(self._plot)
+        splitter.addWidget(right)
+        splitter.setSizes([380, 520])
 
         self._status = QStatusBar()
         self.setStatusBar(self._status)
         self._status.showMessage("Ready — enter Combiner IP and press Start")
 
         self._timer = QTimer()
-        self._timer.setInterval(500)
+        self._timer.setInterval(200)
         self._timer.timeout.connect(self._tick)
+
+        self._apply_range()
+        self._update_spectrum()
 
     # ── helpers ────────────────────────────────────────────────────────────
 
@@ -177,10 +300,8 @@ class TransmitterWindow(QMainWindow):
         return SIGNAL_OFF
 
     def _stream_id_int(self) -> int:
-        try:
-            return int(self._stream_id.text().strip(), 16)
-        except ValueError:
-            return 0x00000001
+        """Parse stream ID from the text field. Raises ValueError on bad input."""
+        return int(self._stream_id.text().strip(), 16)
 
     def _rf_ref(self) -> float:
         rf_ref = self._rf.value_hz()
@@ -194,9 +315,9 @@ class TransmitterWindow(QMainWindow):
         if self._running:
             return
 
-        ip      = self._dest_ip.text().strip()
-        fs      = self._fs.value_hz()
-        rf_ref  = self._rf_ref()
+        ip     = self._dest_ip.text().strip()
+        fs     = self._fs.value_hz()
+        rf_ref = self._rf_ref()
         tone_bb = self._tone.value_hz() - rf_ref
 
         try:
@@ -217,6 +338,8 @@ class TransmitterWindow(QMainWindow):
             rf_ref_freq_hz  = rf_ref,
             bandwidth_hz    = self._bw.value_hz(),
             ref_level_dbm   = self._amp.value(),
+            sim_delay_ms    = self._sim_delay.value(),
+            sim_jitter_ms   = self._sim_jitter.value(),
         )
 
         pkt_rate = fs / self.SAMPLES_PER_PKT
@@ -234,8 +357,11 @@ class TransmitterWindow(QMainWindow):
         self._start_btn.setEnabled(False)
         self._stop_btn.setEnabled(True)
         self._timer.start()
+
+        port = self._dest_port.value()
+        self._plot.setTitle(f"Transmitter Output — port {port}")
         self._status.showMessage(
-            f"Sending to {ip}:{self._dest_port.value()} | "
+            f"Sending to {ip}:{port} | "
             f"stream=0x{sid:08X} | fs={fs/1e6:.2f} MHz | "
             f"type={self._signal_type()} | RF={self._tone.value_hz()/1e6:.3f} MHz"
         )
@@ -256,6 +382,7 @@ class TransmitterWindow(QMainWindow):
         self._stream_id.setEnabled(True)
         self._start_btn.setEnabled(True)
         self._stop_btn.setEnabled(False)
+        self._plot.setTitle("Transmitter Output")
         self._status.showMessage("Stopped")
 
     def _tick(self):
@@ -263,18 +390,102 @@ class TransmitterWindow(QMainWindow):
             return
         self._stat.setText(f"Running — {self._gen.pkt_count:,} pkts sent")
         self._stat.setStyleSheet("color: #00cc44;")
+        self._update_spectrum()
 
-    def _live_update(self, *_):
-        if not self._running or not self._gen:
+    def _on_param_changed(self, *_):
+        """Called when any signal parameter changes — live-update generator and spectrum."""
+        if self._running and self._gen:
+            rf_ref = self._rf_ref()
+            self._gen.update_params(
+                tone_hz        = self._tone.value_hz() - rf_ref,
+                signal_type    = self._signal_type(),
+                bandwidth_hz   = self._bw.value_hz(),
+                rf_ref_freq_hz = rf_ref,
+                ref_level_dbm  = self._amp.value(),
+                sim_delay_ms   = self._sim_delay.value(),
+                sim_jitter_ms  = self._sim_jitter.value(),
+            )
+        self._update_spectrum()
+
+    # ── spectrum ───────────────────────────────────────────────────────────
+
+    def _update_spectrum(self):
+        """Compute and display the expected signal spectrum from current UI parameters."""
+        fs       = self._fs.value_hz()
+        rf_ref   = self._rf_ref()
+        tone_bb  = self._tone.value_hz() - rf_ref
+        sig_type = self._signal_type()
+        amp_dbm  = self._amp.value()
+        bw       = self._bw.value_hz()
+
+        if fs <= 0:
             return
+
+        seg_len = 1024
+        t = np.arange(seg_len) / fs
+
+        if sig_type == SIGNAL_OFF:
+            self._curve.setData([], [])
+            return
+
+        if sig_type == SIGNAL_CW:
+            iq = np.exp(1j * 2 * np.pi * tone_bb * t).astype(np.complex64)
+            iq *= 10 ** (amp_dbm / 20.0)
+        else:  # BW
+            rng    = np.random.default_rng(0)   # fixed seed → stable display
+            noise  = (rng.standard_normal(seg_len) + 1j * rng.standard_normal(seg_len)).astype(np.complex64)
+            nyq    = fs / 2.0
+            cutoff = max(min(bw / 2.0 / nyq, 0.499), 1e-4)
+            fir    = sp_sig.firwin(101, cutoff)
+            fi     = sp_sig.lfilter(fir, [1.0], noise.real)
+            fq     = sp_sig.lfilter(fir, [1.0], noise.imag)
+            iq     = (fi + 1j * fq).astype(np.complex64)
+            iq    *= np.exp(1j * 2 * np.pi * tone_bb * t)
+            iq    *= 10 ** (amp_dbm / 20.0)
+
+        w      = np.hanning(seg_len)
+        w_amp  = float(np.sum(w))
+        X      = np.fft.fftshift(np.fft.fft(iq * w))
+        mag_db = 20.0 * np.log10(np.abs(X) / w_amp + 1e-7)
+        freqs  = np.fft.fftshift(np.fft.fftfreq(seg_len, d=1.0 / fs)) + rf_ref
+
+        self._curve.setData(freqs, mag_db)
+
+    # ── display helpers ────────────────────────────────────────────────────
+
+    def _apply_range(self):
+        center  = self._disp_center.value_hz()
+        span    = self._disp_span.value_hz()
+        amp_top = self._disp_amp.value()
+        db_div  = self._disp_dbdiv.value()
+        self._plot.setXRange(center - span / 2, center + span / 2, padding=0)
+        self._plot.setYRange(amp_top - db_div * 10, amp_top, padding=0)
+        self._ref_line.setValue(amp_top)
+
+    def _auto_display(self):
+        fs     = self._fs.value_hz()
         rf_ref = self._rf_ref()
-        self._gen.update_params(
-            tone_hz        = self._tone.value_hz() - rf_ref,
-            signal_type    = self._signal_type(),
-            bandwidth_hz   = self._bw.value_hz(),
-            rf_ref_freq_hz = rf_ref,
-            ref_level_dbm  = self._amp.value(),
+        self._disp_center.set_hz(rf_ref if rf_ref != 0.0 else self._tone.value_hz())
+        self._disp_span.set_hz(fs)
+        self._disp_amp.setValue(-10.0)
+        self._disp_dbdiv.setValue(10.0)
+        self._apply_range()
+
+    def _sync_viewport_to_spinboxes(self):
+        [[x_lo, x_hi], [y_lo, y_hi]] = (
+            self._plot.getPlotItem().getViewBox().viewRange()
         )
+        if x_hi > x_lo:
+            self._disp_center.set_hz((x_lo + x_hi) / 2.0)
+            self._disp_span.set_hz(x_hi - x_lo)
+        if y_hi > y_lo:
+            self._disp_amp.blockSignals(True)
+            self._disp_dbdiv.blockSignals(True)
+            self._disp_amp.setValue(y_hi)
+            self._disp_dbdiv.setValue((y_hi - y_lo) / 10.0)
+            self._disp_amp.blockSignals(False)
+            self._disp_dbdiv.blockSignals(False)
+            self._ref_line.setValue(y_hi)
 
     def closeEvent(self, event):
         self._stop()

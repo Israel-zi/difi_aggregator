@@ -126,7 +126,33 @@ class GeneratorPanel(QWidget):
         self._port.setKeyboardTracking(False)
         grid.addWidget(self._port, 6, 1)
 
-        grid.setRowStretch(7, 1)
+        grid.addWidget(QLabel("Sim delay:"), 7, 0)
+        self._sim_delay = QDoubleSpinBox()
+        self._sim_delay.setRange(0, 5000)
+        self._sim_delay.setDecimals(0)
+        self._sim_delay.setValue(0)
+        self._sim_delay.setSuffix(" ms")
+        self._sim_delay.setFixedWidth(140)
+        self._sim_delay.setToolTip(
+            "Fixed simulated one-way network delay for this stream, as if it\n"
+            "came from a modem on its own WAN path (e.g. 100/120/150 ms)."
+        )
+        grid.addWidget(self._sim_delay, 7, 1)
+
+        grid.addWidget(QLabel("Sim jitter max:"), 8, 0)
+        self._sim_jitter = QDoubleSpinBox()
+        self._sim_jitter.setRange(0, 1000)
+        self._sim_jitter.setDecimals(0)
+        self._sim_jitter.setValue(0)
+        self._sim_jitter.setSuffix(" ms")
+        self._sim_jitter.setFixedWidth(140)
+        self._sim_jitter.setToolTip(
+            "Extra random delay added on top of Sim delay, uniform in\n"
+            "[0, this value] per packet — simulates WAN jitter."
+        )
+        grid.addWidget(self._sim_jitter, 8, 1)
+
+        grid.setRowStretch(9, 1)
 
         for rb in (self._cw_rb, self._bw_rb, self._off_rb):
             rb.toggled.connect(lambda checked: self._bw.setEnabled(self._bw_rb.isChecked()))
@@ -141,6 +167,8 @@ class GeneratorPanel(QWidget):
         self._amp.valueChanged.connect(self.changed)
         self._port.valueChanged.connect(self.changed)
         self._stream_id.editingFinished.connect(self.changed)
+        self._sim_delay.valueChanged.connect(self.changed)
+        self._sim_jitter.valueChanged.connect(self.changed)
 
     def signal_type(self)    -> str:   return SIGNAL_CW if self._cw_rb.isChecked() else (SIGNAL_BW if self._bw_rb.isChecked() else "OFF")
     def tone_hz(self)        -> float: return self._tone.value_hz()
@@ -148,6 +176,8 @@ class GeneratorPanel(QWidget):
     def rf_ref_freq_hz(self) -> float: return self._rf.value_hz()
     def amplitude_dbm(self)  -> float: return self._amp.value()
     def port(self)           -> int:   return self._port.value()
+    def sim_delay_ms(self)   -> float: return self._sim_delay.value()
+    def sim_jitter_ms(self)  -> float: return self._sim_jitter.value()
 
     def stream_id(self) -> int:
         try:
@@ -169,12 +199,14 @@ class MainWindow(QMainWindow):
         self._modules          = {}
         self._gen_panels        = []
         self._pipeline_warning  = ""
+        self._latency_warning   = ""
         self._agg_standalone_bind_errors = {}
 
         self._build_ui()
 
         self._add_generator(default_signal_type=SIGNAL_OFF)
         self._add_agg_port_row(default_port=self._next_default_agg_port())
+        self._update_latency_warning()
 
     def _build_ui(self):
         central = QWidget()
@@ -196,9 +228,9 @@ class MainWindow(QMainWindow):
         fs_layout.addWidget(self._shared_fs)
         left_layout.addWidget(fs_box)
 
-        net_box    = QGroupBox("Network / Jitter Buffer")
+        net_box    = QGroupBox("Network / Alignment Buffer")
         net_layout = QHBoxLayout(net_box)
-        net_layout.addWidget(QLabel("Reorder hold:"))
+        net_layout.addWidget(QLabel("Reorder window:"))
         self._hold_ms = QSpinBox()
         self._hold_ms.setRange(0, 2000)
         self._hold_ms.setValue(0)
@@ -206,13 +238,31 @@ class MainWindow(QMainWindow):
         self._hold_ms.setFixedWidth(90)
         self._hold_ms.setKeyboardTracking(False)
         self._hold_ms.setToolTip(
-            "0 ms = LAN mode (pass-through, no added latency).\n"
-            "Set to the expected one-way WAN jitter (e.g. 100-300 ms)\n"
-            "so that out-of-order packets from each generator are\n"
-            "sorted by timestamp before reaching the aggregator."
+            "0 ms = pass-through, no added latency.\n"
+            "Fixes out-of-order packets WITHIN one stream — set it to\n"
+            "roughly the largest configured 'Sim jitter max' below, not\n"
+            "the fixed delay (that's absorbed by Target latency instead)."
         )
         self._hold_ms.valueChanged.connect(self._on_hold_ms_changed)
         net_layout.addWidget(self._hold_ms)
+
+        net_layout.addSpacing(16)
+        net_layout.addWidget(QLabel("Target latency:"))
+        self._target_latency_ms = QSpinBox()
+        self._target_latency_ms.setRange(1, 10000)
+        self._target_latency_ms.setValue(200)
+        self._target_latency_ms.setSuffix(" ms")
+        self._target_latency_ms.setFixedWidth(90)
+        self._target_latency_ms.setKeyboardTracking(False)
+        self._target_latency_ms.setToolTip(
+            "End-to-end deadline: the Aggregator emits on this schedule and\n"
+            "zero-fills any stream not ready in time, instead of stalling\n"
+            "every stream while it waits. Must comfortably exceed the\n"
+            "largest (Sim delay + Sim jitter max + Reorder window) across\n"
+            "all generators, or streams will be zero-filled continuously."
+        )
+        self._target_latency_ms.valueChanged.connect(self._update_latency_warning)
+        net_layout.addWidget(self._target_latency_ms)
         net_layout.addStretch()
         left_layout.addWidget(net_box)
 
@@ -497,6 +547,9 @@ class MainWindow(QMainWindow):
                 if capture:
                     capture.remove_port(port)
                     capture.bind_errors.pop(port, None)
+                agg = self._modules.get("aggregator")
+                if agg:
+                    agg.remove_stream_by_port(port)
             else:
                 self._stop_standalone_listener(idx)
         self._agg_standalone_bind_errors.pop(port, None)
@@ -553,6 +606,9 @@ class MainWindow(QMainWindow):
                 if capture:
                     capture.remove_port(port)
                     capture.bind_errors.pop(port, None)
+                agg = self._modules.get("aggregator")
+                if agg:
+                    agg.remove_stream_by_port(port)
             else:
                 self._stop_standalone_listener(idx)
                 self._agg_standalone_bind_errors.pop(port, None)
@@ -589,6 +645,9 @@ class MainWindow(QMainWindow):
             if capture:
                 capture.remove_port(old_value)
                 capture.bind_errors.pop(old_value, None)
+                agg = self._modules.get("aggregator")
+                if agg:
+                    agg.remove_stream_by_port(old_value)
                 try:
                     capture.add_port(new_value)
                     capture.bind_errors.pop(new_value, None)
@@ -624,6 +683,23 @@ class MainWindow(QMainWindow):
             jitter = self._modules.get("jitter")
             if jitter:
                 jitter.set_hold_ms(value)
+        self._update_latency_warning()
+
+    def _update_latency_warning(self):
+        """Warn when Target latency can't cover the worst configured delay+jitter+reorder
+        window — otherwise streams would be zero-filled continuously rather than occasionally."""
+        active = [p for p in self._gen_panels if p.signal_type() != SIGNAL_OFF]
+        worst  = max((p.sim_delay_ms() + p.sim_jitter_ms() for p in active), default=0.0)
+        worst += self._hold_ms.value()
+        target = self._target_latency_ms.value()
+        self._latency_warning = (
+            f" | ⚠ Target latency ({target:.0f}ms) is tighter than worst-case "
+            f"delay+jitter+reorder ({worst:.0f}ms) — expect frequent zero-fills"
+        ) if worst > target else ""
+        if not self._pipeline_running:
+            self._status.showMessage(
+                "Ready — configure and press Start" + self._latency_warning
+            )
 
     def _toggle_port_listener(self, row_widget):
         idx = self._agg_port_rows.index(row_widget)
@@ -705,6 +781,8 @@ class MainWindow(QMainWindow):
             rf_ref_freq_hz  = rf_ref,
             bandwidth_hz    = panel.bandwidth_hz(),
             ref_level_dbm   = panel.amplitude_dbm(),
+            sim_delay_ms    = panel.sim_delay_ms(),
+            sim_jitter_ms   = panel.sim_jitter_ms(),
         )
 
     def _start_generator_thread(self, gen: DifiGenerator):
@@ -731,6 +809,7 @@ class MainWindow(QMainWindow):
             default_tone_hz     = idx * 1e6,
         )
         panel.changed.connect(self._live_update_generators)
+        panel.changed.connect(self._update_latency_warning)
         self._gen_panels.append(panel)
         self._gen_tabs.addTab(panel, f"Generator {idx}")
         self._gen_tabs.setCurrentWidget(panel)
@@ -753,6 +832,7 @@ class MainWindow(QMainWindow):
         panel.deleteLater()
         self._renumber_tabs()
         self._remove_gen_btn.setEnabled(len(self._gen_panels) > 1)
+        self._update_latency_warning()
         if self._pipeline_running:
             gen = self._modules["gens"].pop(idx)
             gen.close()
@@ -809,9 +889,11 @@ class MainWindow(QMainWindow):
         capture    = InputCapture(ports=agg_ports)
         jitter     = JitterBuffer(capture, hold_ms=self._hold_ms.value())
         aggregator = Aggregator(
-            capture          = jitter,
-            expected_streams = self._active_stream_ids(),
-            chunk_size       = self.SAMPLES_PER_PKT,
+            capture           = jitter,
+            sample_rate_hz    = fs,
+            expected_streams  = self._active_stream_ids(),
+            chunk_size        = self.SAMPLES_PER_PKT,
+            target_latency_ms = self._target_latency_ms.value(),
         )
         packetizer = Packetizer(aggregator=aggregator)
         sender     = DifiSender(packetizer=packetizer, dest_port=port_out)
@@ -868,7 +950,8 @@ class MainWindow(QMainWindow):
         gen_str = " | ".join(
             f"Gen{i}:{p.signal_type()} {p.tone_hz()/1e6:.3f}MHz" for i, p in enumerate(panels, start=1)
         )
-        self._status.showMessage(f"Running — fs={fs/1e6:.1f}MHz | {gen_str}{status_extra}")
+        self._update_latency_warning()
+        self._status.showMessage(f"Running — fs={fs/1e6:.1f}MHz | {gen_str}{status_extra}{self._latency_warning}")
 
     def _stop_pipeline(self, resume_standalone: bool = True):
         if not self._pipeline_running:
@@ -985,15 +1068,22 @@ class MainWindow(QMainWindow):
             if active_los else ""
         )
         chunk_age_ms = (time.monotonic() - chunk.created_at) * 1000
-        fs0 = chunk.streams[0].context.sample_rate_hz
+        ctx0 = chunk.streams[0].context if chunk.streams else None
+        if ctx0 is None:
+            return
+        fs0 = ctx0.sample_rate_hz
         rx_pkts = rx.data_received if rx else 0
         seq_errors = rx.seq_errors if rx else 0
         dropped    = agg.packets_dropped
-        loss_str = f"  seq_errors={seq_errors}  dropped={dropped}" if (seq_errors or dropped) else ""
+        misses     = agg.deadline_misses
+        loss_str = (
+            f"  seq_errors={seq_errors}  dropped={dropped}  deadline_misses={misses}"
+            if (seq_errors or dropped or misses) else ""
+        )
         self._status.showMessage(
             f"Running — fs={fs0/1e6:.1f} MHz{rf_str} | "
             f"chunks={agg.chunks_emitted}  rx={rx_pkts}  "
-            f"latency≈{chunk_age_ms:.1f} ms{loss_str}{self._pipeline_warning}"
+            f"latency≈{chunk_age_ms:.1f} ms{loss_str}{self._pipeline_warning}{self._latency_warning}"
         )
 
     def _live_update_generators(self):
@@ -1014,6 +1104,8 @@ class MainWindow(QMainWindow):
                 sample_rate_hz = fs,
                 dest_port      = panel.port(),
                 stream_id      = panel.stream_id(),
+                sim_delay_ms   = panel.sim_delay_ms(),
+                sim_jitter_ms  = panel.sim_jitter_ms(),
             )
         # Drain pipeline queues so stale chunks with old context don't reach the
         # receiver after parameter changes, then flush the receiver IQ buffer.

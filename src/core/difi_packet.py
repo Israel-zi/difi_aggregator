@@ -256,13 +256,20 @@ class DifiContextPacket:
         return int(round(dbm * 128)) & 0xFFFF
 
     def _build_data_payload_format(self) -> tuple:
-        """Build the Data Packet Payload Format field (Words 26-27) per VITA-49.2 Table 9.13.3-1."""
+        """Build the Data Packet Payload Format field (Words 26-27) per VITA-49.2 Table 9.13.3-1.
+
+        Bit layout (MSB to LSB) confirmed against the DIFI Consortium's own
+        reference parser (DIFI-Consortium/DIFI-Certification): packing_method(1)
+        + real_complex_type(2) + data_item_format(5) + sample_repeat_indicator(1)
+        + event_tag_size(3) + channel_tag_size(4) + data_item_fraction_size(4)
+        + item_packing_field_size(6, bits 11-6) + data_item_size(6, bits 5-0).
+        """
         bd = self.sample_bit_depth - 1
         word26 = (
             1      << 31 |   # Packing Method = Link Efficient
             0b01   << 29 |   # Real-Complex = Complex Cartesian
-            bd     << 10 |   # Item Packing Field Size (bits 15-10, value = size-1)
-            bd     <<  0     # Data Item Size (bits 9-0, value = size-1)
+            bd     <<  6 |   # Item Packing Field Size (bits 11-6, value = size-1)
+            bd     <<  0     # Data Item Size (bits 5-0, value = size-1)
         )
         return word26, 0
 
