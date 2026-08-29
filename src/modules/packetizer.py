@@ -33,6 +33,7 @@ from core.difi_packet import (
     TSF_REAL_TIME,
 )
 from modules.aggregator import Aggregator, StreamBlock
+from pipeline_logger import wall_clock_str
 
 
 CONTEXT_MIN_INTERVAL_S = 0.05   # max 20 context packets/s per DIFI standard §4.3.1
@@ -59,8 +60,12 @@ class Packetizer:
         aggregator: Aggregator,
         out_queue_size: int = 128,
         put_timeout_s: float = 0.2,
+        hold_log             = None,   # pipeline_logger.PacketLogger, or None — shared with Aggregator
+        sent_log             = None,   # pipeline_logger.PacketLogger, or None
     ):
         self._aggregator      = aggregator
+        self._hold_log        = hold_log
+        self._sent_log        = sent_log
         self._out_queue       = queue.Queue(maxsize=out_queue_size)
         # A transient consumer stall (Sender thread briefly descheduled, GC
         # pause, etc.) should not permanently discard already-aggregated
@@ -151,12 +156,16 @@ class Packetizer:
             tsf                 = TSF_REAL_TIME,
         ).to_bytes()
 
-    def _build_data(self, block: StreamBlock) -> bytes:
+    def _build_data(self, block: StreamBlock) -> tuple:
+        """Returns (packet_bytes, seq_num) — the seq is exposed so the caller
+        can log exactly which packet was built, whether it ends up sent or
+        dropped for lack of queue room."""
         sid = block.stream_id
         src = block.context
-        return DifiDataPacket(
+        seq = self._next_data_seq(sid)
+        data_bytes = DifiDataPacket(
             stream_id        = sid,
-            seq_num          = self._next_data_seq(sid),
+            seq_num          = seq,
             timestamp_int    = block.data_ts_int,
             timestamp_frac   = block.data_ts_frac,
             payload          = block.samples,
@@ -164,6 +173,7 @@ class Packetizer:
             tsi              = TSI_UTC,
             tsf              = TSF_REAL_TIME,
         ).to_bytes()
+        return data_bytes, seq
 
     # ── main loop ──────────────────────────────────────────────────────────
 
@@ -197,13 +207,24 @@ class Packetizer:
                     ctx_bytes = self._build_context(block)
                     self._last_ctx_times[sid] = now
 
-                data_bytes = self._build_data(block)
+                data_bytes, seq = self._build_data(block)
 
                 try:
                     self._out_queue.put((ctx_bytes, data_bytes), timeout=self._put_timeout_s)
                     self.packets_produced += 1
+                    if self._sent_log is not None:
+                        self._sent_log.log(
+                            wall_clock_str(), f"0x{sid:08X}", "DATA", seq,
+                            block.data_ts_int, block.data_ts_frac, len(block.samples),
+                        )
                 except queue.Full:
                     self.packets_dropped += 1
+                    if self._hold_log is not None:
+                        hold_ms = (time.time() - (block.data_ts_int + block.data_ts_frac / 1e12)) * 1000.0
+                        self._hold_log.log(
+                            wall_clock_str(), "PACKETIZER", f"0x{sid:08X}", "LOST_QUEUE_FULL",
+                            f"{hold_ms:.2f}", block.data_ts_int, block.data_ts_frac, len(block.samples),
+                        )
 
 
 # ─────────────────────────────────────────────

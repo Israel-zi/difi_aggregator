@@ -30,6 +30,7 @@ from core.difi_packet import (
     TSF_REAL_TIME,
 )
 from modules.net_impairment import DelayedDispatcher
+from pipeline_logger import wall_clock_str
 
 CONTEXT_MIN_INTERVAL_S = 0.05   # max 20 context packets/s per DIFI standard (Section 4.3.1)
 SIGNAL_CW  = "CW"
@@ -74,6 +75,7 @@ class DifiGenerator:
         ref_level_dbm: float    = -20.0,
         sim_delay_ms: float     = 0.0,
         sim_jitter_ms: float    = 0.0,
+        packet_logger           = None,   # pipeline_logger.PacketLogger, or None
     ):
         self.stream_id       = stream_id
         self.tone_hz         = tone_hz
@@ -99,6 +101,7 @@ class DifiGenerator:
         self._bw_zi_i       = None   # lowpass filter state for I channel
         self._bw_zi_q       = None   # lowpass filter state for Q channel
         self._last_ctx_time = 0.0   # 0 ensures context is sent before the first data packet
+        self._packet_logger = packet_logger
 
         self._build_bw_filter()
 
@@ -198,9 +201,15 @@ class DifiGenerator:
 
     def _make_data(self, samples: np.ndarray) -> bytes:
         ts_int, ts_frac = now_timestamp()
+        seq = self._next_seq("_data_seq")
+        if self._packet_logger is not None:
+            self._packet_logger.log(
+                wall_clock_str(), f"0x{self.stream_id:08X}", "DATA", seq,
+                ts_int, ts_frac, len(samples), self.dest[0], self.dest[1],
+            )
         return DifiDataPacket(
             stream_id        = self.stream_id,
-            seq_num          = self._next_seq("_data_seq"),
+            seq_num          = seq,
             timestamp_int    = ts_int,
             timestamp_frac   = ts_frac,
             payload          = samples,

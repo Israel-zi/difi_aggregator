@@ -37,6 +37,7 @@ if not getattr(sys, 'frozen', False):
 
 from core.difi_packet import DifiDataPacket, DifiContextPacket
 from modules.input_capture import CapturedPacket, InputCapture
+from pipeline_logger import wall_clock_str
 
 
 def _advance_ts(ts_int: int, ts_frac: int, n_samples: int, sample_rate_hz: float) -> tuple:
@@ -241,8 +242,10 @@ class Aggregator:
         put_timeout_s: float    = 0.2,
         stale_timeout: float    = 5.0,
         target_latency_ms: float = 200.0,
+        hold_log                = None,   # pipeline_logger.PacketLogger, or None
     ):
         self._capture          = capture
+        self._hold_log          = hold_log
         self._sample_rate_hz   = sample_rate_hz
         self._expected         = set(expected_streams) if expected_streams else None
         self._expected_count   = (
@@ -463,6 +466,7 @@ class Aggregator:
                     stream_id=sid, samples=samples, context=buf.context,
                     received_at=buf.last_update, data_ts_int=ts_int, data_ts_frac=ts_frac,
                 ))
+                self._log_hold(sid, "READY", ts_int, ts_frac, len(samples))
             elif buf is not None and buf.context is not None and sid in self._next_expected_ts:
                 # Missed this cycle's deadline — zero-fill to preserve phase
                 # alignment for the other streams instead of stalling everyone.
@@ -476,6 +480,7 @@ class Aggregator:
                 self._next_expected_ts[sid] = _advance_ts(ts_int, ts_frac, self._chunk_size, fs)
                 self.deadline_misses += 1
                 self.deadline_misses_by_stream[sid] = self.deadline_misses_by_stream.get(sid, 0) + 1
+                self._log_hold(sid, "TIMEOUT_ZEROFILL", ts_int, ts_frac, self._chunk_size)
             # else: cold start — this stream has never sent a first packet yet.
 
         if not blocks:
@@ -492,6 +497,19 @@ class Aggregator:
             self._drop_warn_count += 1
             if self._drop_warn_count <= 3 or self._drop_warn_count % 1000 == 0:
                 print(f"[Aggregator] Output queue full — chunk dropped (total: {self.packets_dropped})")
+            for block in blocks:
+                self._log_hold(block.stream_id, "LOST_QUEUE_FULL",
+                                block.data_ts_int, block.data_ts_frac, len(block.samples))
+
+    def _log_hold(self, sid: int, outcome: str, ts_int: int, ts_frac: int, samples: int):
+        """Record one stream's per-cycle outcome to the hold/loss evidence log."""
+        if self._hold_log is None:
+            return
+        hold_ms = (time.time() - (ts_int + ts_frac / 1e12)) * 1000.0
+        self._hold_log.log(
+            wall_clock_str(), "AGGREGATOR", f"0x{sid:08X}", outcome,
+            f"{hold_ms:.2f}", ts_int, ts_frac, samples,
+        )
 
     # ── diagnostics ────────────────────────────────────────────────────────
 

@@ -28,6 +28,7 @@ import pyqtgraph as pg
 
 from modules.receiver import DifiReceiver
 from ui.freq_input    import FreqInput
+from pipeline_logger  import make_run_dir, PacketLogger
 
 
 _STREAM_COLORS = [
@@ -65,51 +66,64 @@ def _stream_fft(iq, ctx, seg_len: int = 1024):
 
 class ReceiverStreamRow(QWidget):
     """
-    One discovered-stream status row: [●] [stream id] [fs] [RF] [status]
+    One discovered-stream status card, stacked over three lines:
+        ● 0x00000001                          stopped
+          fs 20.000 MHz
+          RF 490.000 MHz
 
     Read-only — the receiver only auto-discovers streams from incoming
     Context packets, there's nothing here for the user to configure.
     The LED and status text are the whole point: a stream that stops
     sending must visibly go from "live" to "stopped", not just sit in a
     flat list forever looking identical to an active one.
+
+    Two lines, not a column table: the left panel this lives in is capped
+    at 300px, and "0x00000001 | 20.000 MHz | 490.000 MHz | stopped" simply
+    doesn't fit in that width at any reasonable font size -- cramming it
+    sideways just moves the collision around instead of fixing it.
     """
 
     def __init__(self, sid: int, parent=None):
         super().__init__(parent)
         self.sid = sid
-        lay = QHBoxLayout(self)
-        lay.setContentsMargins(2, 2, 2, 2)
-        lay.setSpacing(8)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(2, 3, 2, 3)
+        outer.setSpacing(1)
 
+        top = QHBoxLayout()
+        top.setSpacing(6)
         self._led = QLabel("●")
-        self._led.setFixedWidth(16)
-        lay.addWidget(self._led)
-
+        self._led.setFixedWidth(14)
+        top.addWidget(self._led)
         self._sid_lbl = QLabel(f"0x{sid:08X}")
-        self._sid_lbl.setFixedWidth(100)
-        lay.addWidget(self._sid_lbl)
-
-        self._fs_lbl = QLabel("—")
-        self._fs_lbl.setFixedWidth(90)
-        lay.addWidget(self._fs_lbl)
-
-        self._rf_lbl = QLabel("—")
-        self._rf_lbl.setFixedWidth(90)
-        lay.addWidget(self._rf_lbl)
-
+        top.addWidget(self._sid_lbl)
+        top.addStretch()
         self._status_lbl = QLabel("")
-        lay.addWidget(self._status_lbl)
-        lay.addStretch()
+        self._status_lbl.setStyleSheet("color: #cc5555; font-size: 11px;")
+        top.addWidget(self._status_lbl)
+        outer.addLayout(top)
+
+        def _detail_line():
+            row = QHBoxLayout()
+            row.setContentsMargins(20, 0, 0, 0)
+            lbl = QLabel("—")
+            lbl.setStyleSheet("color: #888888; font-size: 11px;")
+            row.addWidget(lbl)
+            row.addStretch()
+            outer.addLayout(row)
+            return lbl
+
+        self._fs_lbl = _detail_line()
+        self._rf_lbl = _detail_line()
 
     def update_state(self, ctx, active: bool):
         if ctx is not None:
-            self._fs_lbl.setText(f"{ctx.sample_rate_hz / 1e6:.3f} MHz")
-            self._rf_lbl.setText(f"{ctx.rf_ref_freq_hz / 1e6:.3f} MHz")
+            self._fs_lbl.setText(f"fs {ctx.sample_rate_hz / 1e6:.3f} MHz")
+            self._rf_lbl.setText(f"RF {ctx.rf_ref_freq_hz / 1e6:.3f} MHz")
         color = "#00cc44" if active else "#888888"
         self._led.setStyleSheet(f"color: {color}; font-size: 16px;")
         self._sid_lbl.setStyleSheet("color: #dddddd;" if active else "color: #888888;")
         self._status_lbl.setText("" if active else "stopped")
-        self._status_lbl.setStyleSheet("color: #cc5555; font-size: 11px;")
 
 
 class ReceiverWindow(QMainWindow):
@@ -120,6 +134,7 @@ class ReceiverWindow(QMainWindow):
         self.setMinimumSize(1050, 620)
         self._receiver = None
         self._running  = False
+        self._recv_log = None
         self._build_ui()
 
     def _build_ui(self):
@@ -207,23 +222,13 @@ class ReceiverWindow(QMainWindow):
         stats_grid.addWidget(self._lbl_errs,            2, 1)
         left_layout.addWidget(stats_box)
 
-        # Streams — one row per discovered stream ID, LED shows live/stopped
+        # Streams — one card per discovered stream ID, LED shows live/stopped
         streams_box  = QGroupBox("Streams")
         streams_vlay = QVBoxLayout(streams_box)
-        streams_vlay.setSpacing(2)
-        hdr = QHBoxLayout()
-        hdr.setSpacing(8)
-        hdr.addSpacing(16)
-        for lbl, w in [("Stream ID", 100), ("Sample rate", 90), ("RF ref", 90)]:
-            l = QLabel(lbl)
-            l.setFixedWidth(w)
-            l.setStyleSheet("color: #888888; font-size: 11px;")
-            hdr.addWidget(l)
-        hdr.addStretch()
-        streams_vlay.addLayout(hdr)
+        streams_vlay.setSpacing(4)
         self._stream_rows_container = QWidget()
         self._stream_rows_layout    = QVBoxLayout(self._stream_rows_container)
-        self._stream_rows_layout.setSpacing(2)
+        self._stream_rows_layout.setSpacing(6)
         self._stream_rows_layout.setContentsMargins(0, 0, 0, 0)
         streams_vlay.addWidget(self._stream_rows_container)
         left_layout.addWidget(streams_box)
@@ -291,7 +296,13 @@ class ReceiverWindow(QMainWindow):
             return
         port           = self._port.value()
         self._plot.setTitle(f"Receiver Input — port {port}")
-        self._receiver = DifiReceiver(port=port)
+        run_dir        = make_run_dir("Receiver")
+        self._recv_log = PacketLogger(
+            run_dir, "data_received.csv",
+            ["wall_clock", "stream_id", "pkt_type", "seq", "difi_ts_int",
+             "difi_ts_frac", "samples", "seq_gap"],
+        )
+        self._receiver = DifiReceiver(port=port, packet_logger=self._recv_log)
         self._receiver.start()
         self._running = True
         self._y_range_applied = False
@@ -299,7 +310,7 @@ class ReceiverWindow(QMainWindow):
         self._stop_btn.setEnabled(True)
         self._timer.start()
         self._apply_range()
-        self._status.showMessage(f"Listening on 0.0.0.0:{port}")
+        self._status.showMessage(f"Listening on 0.0.0.0:{port} | log: {run_dir}")
 
     def _stop(self):
         if not self._running:
@@ -307,6 +318,9 @@ class ReceiverWindow(QMainWindow):
         self._timer.stop()
         self._receiver.stop()
         self._receiver = None
+        if self._recv_log:
+            self._recv_log.close()
+            self._recv_log = None
         self._running  = False
         for c in self._curves.values():
             c.setData([], [])
@@ -445,9 +459,14 @@ class ReceiverWindow(QMainWindow):
 
 
 def main():
+    from logging_setup import setup_frozen_file_logging
+    log_path = setup_frozen_file_logging("Receiver")
+
     pg.setConfigOptions(antialias=True)
     app = QApplication(sys.argv)
     win = ReceiverWindow()
+    if log_path:
+        win._status.showMessage(f"Logging to {log_path}")
     win.show()
     sys.exit(app.exec())
 

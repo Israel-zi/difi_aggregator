@@ -38,6 +38,7 @@ from modules.aggregator    import Aggregator
 from modules.packetizer    import Packetizer
 from modules.sender        import DifiSender
 from ui.freq_input         import FreqInput
+from pipeline_logger       import make_run_dir, PacketLogger
 
 
 _STREAM_COLORS = [
@@ -204,6 +205,7 @@ class PacketizerWindow(QMainWindow):
         self._listening   = False   # capture + aggregator running
         self._forwarding  = False   # packetizer + sender running
         self._modules     = {}
+        self._run_dir     = None    # log folder for the current Listen session
         self._stream_rows: list = []
         self._build_ui()
         self._add_stream_row(50001)
@@ -520,16 +522,32 @@ class PacketizerWindow(QMainWindow):
         ports_str  = "/".join(str(p) for p in ports)
         self._plot.setTitle(f"Combiner Input — ports {ports_str}")
 
-        capture    = InputCapture(ports=ports)
+        self._run_dir = make_run_dir("Combiner")
+        recv_log = PacketLogger(
+            self._run_dir, "data_received.csv",
+            ["wall_clock", "source_port", "stream_id", "pkt_type", "seq",
+             "difi_ts_int", "difi_ts_frac", "samples"],
+        )
+        hold_log = PacketLogger(
+            self._run_dir, "hold_and_loss.csv",
+            ["wall_clock", "stage", "stream_id", "outcome", "hold_ms",
+             "difi_ts_int", "difi_ts_frac", "samples"],
+        )
+
+        capture    = InputCapture(ports=ports, packet_logger=recv_log)
         jitter     = JitterBuffer(capture, hold_ms=self._hold_ms.value())
         aggregator = Aggregator(
             capture          = jitter,
             expected_streams = None,
             expected_count   = len(ports),
             chunk_size       = chunk_size,
+            hold_log         = hold_log,
         )
 
-        self._modules.update(capture=capture, jitter=jitter, aggregator=aggregator)
+        self._modules.update(
+            capture=capture, jitter=jitter, aggregator=aggregator,
+            recv_log=recv_log, hold_log=hold_log,
+        )
 
         capture.start()
         time.sleep(0.05)
@@ -549,7 +567,7 @@ class PacketizerWindow(QMainWindow):
 
         self._status.showMessage(
             f"Listening on ports {ports} — discovering streams…  "
-            f"(press Forward to start sending to Receiver)"
+            f"(press Forward to start sending to Receiver) | log: {self._run_dir}"
         )
 
     def _on_forward_clicked(self):
@@ -567,14 +585,23 @@ class PacketizerWindow(QMainWindow):
         dest_ip   = self._dest_ip.text().strip()
         dest_port = self._dest_port.value()
 
-        packetizer = Packetizer(aggregator=self._modules["aggregator"])
+        sent_log = PacketLogger(
+            self._run_dir, "data_sent.csv",
+            ["wall_clock", "stream_id", "pkt_type", "seq", "difi_ts_int",
+             "difi_ts_frac", "samples"],
+        )
+        packetizer = Packetizer(
+            aggregator = self._modules["aggregator"],
+            hold_log   = self._modules["hold_log"],
+            sent_log   = sent_log,
+        )
         sender     = DifiSender(
             packetizer = packetizer,
             dest_host  = dest_ip,
             dest_port  = dest_port,
         )
 
-        self._modules.update(packetizer=packetizer, sender=sender)
+        self._modules.update(packetizer=packetizer, sender=sender, sent_log=sent_log)
         # Apply the current Fwd-checkbox state before the first packet goes out.
         fwd_filter = self._current_forward_filter()
         if fwd_filter is not None:
@@ -590,7 +617,7 @@ class PacketizerWindow(QMainWindow):
         ports = [r.port() for r in self._stream_rows]
         self._status.showMessage(
             f"Running — ports {ports}  →  {dest_ip}:{dest_port}  |  "
-            f"forwarding {len(ports)} stream(s)"
+            f"forwarding {len(ports)} stream(s) | log: {self._run_dir}"
         )
 
     def _stop_forward(self):
@@ -600,8 +627,11 @@ class PacketizerWindow(QMainWindow):
         m = self._modules
         m["sender"].stop()
         m["packetizer"].stop()
+        if "sent_log" in m:
+            m["sent_log"].close()
         self._modules.pop("sender", None)
         self._modules.pop("packetizer", None)
+        self._modules.pop("sent_log", None)
         self._forwarding = False
         self._forward_btn.setText("▶  Forward")
         self._dest_ip.setEnabled(True)
@@ -620,11 +650,17 @@ class PacketizerWindow(QMainWindow):
         if self._forwarding:
             m["sender"].stop()
             m["packetizer"].stop()
+            if "sent_log" in m:
+                m["sent_log"].close()
             self._forwarding = False
 
         m["aggregator"].stop()
         m["jitter"].stop()
         m["capture"].stop()
+        if "recv_log" in m:
+            m["recv_log"].close()
+        if "hold_log" in m:
+            m["hold_log"].close()
 
         for row in self._stream_rows:
             row.set_active(False)
@@ -632,6 +668,7 @@ class PacketizerWindow(QMainWindow):
             c.setData([], [])
         self._curves.clear()
         self._modules   = {}
+        self._run_dir   = None
         self._listening = False
 
         self._set_locked(False)
@@ -823,9 +860,14 @@ class PacketizerWindow(QMainWindow):
 
 
 def main():
+    from logging_setup import setup_frozen_file_logging
+    log_path = setup_frozen_file_logging("Combiner")
+
     pg.setConfigOptions(antialias=True)
     app = QApplication(sys.argv)
     win = PacketizerWindow()
+    if log_path:
+        win._status.showMessage(f"Logging to {log_path}")
     win.show()
     sys.exit(app.exec())
 

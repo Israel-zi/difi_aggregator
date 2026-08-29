@@ -33,6 +33,7 @@ from core.difi_packet import (
     PACKET_TYPE_DATA,
     PACKET_TYPE_CONTEXT,
 )
+from pipeline_logger import wall_clock_str
 
 
 # ─────────────────────────────────────────────
@@ -65,12 +66,14 @@ class PortListener(threading.Thread):
         out_queue: queue.Queue,
         host: str = "0.0.0.0",
         timeout: float = 1.0,
+        packet_logger = None,   # pipeline_logger.PacketLogger, or None
     ):
         super().__init__(daemon=True, name=f"listener-{port}")
         self.port      = port
         self.out_queue = out_queue
         self.host      = host
         self.timeout   = timeout
+        self._packet_logger = packet_logger
         self._stop_evt = threading.Event()
 
         # Bind synchronously in the caller's thread so a failure (port already
@@ -133,14 +136,23 @@ class PortListener(threading.Thread):
             if pkt_type == PACKET_TYPE_DATA:
                 pkt = DifiDataPacket.from_bytes(data)
                 self.stats["data_received"] += 1
+                n_samples = len(pkt.payload)
 
             elif pkt_type == PACKET_TYPE_CONTEXT:
                 pkt = DifiContextPacket.from_bytes(data)
                 self.stats["context_received"] += 1
+                n_samples = 0
 
             else:
                 # unknown packet type — skip silently
                 return
+
+            if self._packet_logger is not None:
+                pkt_kind = "DATA" if pkt_type == PACKET_TYPE_DATA else "CONTEXT"
+                self._packet_logger.log(
+                    wall_clock_str(), self.port, f"0x{pkt.stream_id:08X}", pkt_kind,
+                    pkt.seq_num, pkt.timestamp_int, pkt.timestamp_frac, n_samples,
+                )
 
             # Non-blocking put: if the queue is full, drop this packet rather
             # than blocking the receive thread (which would let the OS UDP
@@ -186,16 +198,19 @@ class InputCapture:
         ports: list,
         host: str        = "0.0.0.0",
         queue_maxsize: int = 30,
+        packet_logger    = None,   # pipeline_logger.PacketLogger, or None
     ):
         self._out_queue = queue.Queue(maxsize=queue_maxsize)
         self._listeners = []
+        self._packet_logger = packet_logger
         # Ports that failed to bind (e.g. already in use by another program) —
         # collected instead of raised so the other ports still start.
         self.bind_errors: dict = {}
         for p in ports:
             try:
                 self._listeners.append(
-                    PortListener(port=p, out_queue=self._out_queue, host=host)
+                    PortListener(port=p, out_queue=self._out_queue, host=host,
+                                 packet_logger=packet_logger)
                 )
             except OSError as exc:
                 self.bind_errors[p] = str(exc)
@@ -221,7 +236,8 @@ class InputCapture:
         Raises OSError (unchanged) if the port can't be bound — callers
         should catch this and surface it rather than let it vanish.
         """
-        listener = PortListener(port=port, out_queue=self._out_queue, host=host)
+        listener = PortListener(port=port, out_queue=self._out_queue, host=host,
+                                 packet_logger=self._packet_logger)
         self._listeners.append(listener)
         listener.start()
         print(f"[Capture] Added listener on port {port}")

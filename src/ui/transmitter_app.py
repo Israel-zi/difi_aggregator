@@ -31,6 +31,7 @@ import pyqtgraph as pg
 
 from modules.generator import DifiGenerator, SIGNAL_CW, SIGNAL_BW, SIGNAL_OFF
 from ui.freq_input     import FreqInput
+from pipeline_logger   import make_run_dir, PacketLogger
 
 
 class TransmitterWindow(QMainWindow):
@@ -44,6 +45,7 @@ class TransmitterWindow(QMainWindow):
         self.setMinimumSize(900, 520)
         self._running = False
         self._gen     = None
+        self._sent_log = None
         self._build_ui()
 
     def _build_ui(self):
@@ -326,6 +328,13 @@ class TransmitterWindow(QMainWindow):
             self._status.showMessage("Invalid Stream ID — use hex e.g. 0x00000001")
             return
 
+        run_dir = make_run_dir("Transmitter")
+        self._sent_log = PacketLogger(
+            run_dir, "data_sent.csv",
+            ["wall_clock", "stream_id", "pkt_type", "seq", "difi_ts_int",
+             "difi_ts_frac", "samples", "dest_ip", "dest_port"],
+        )
+
         self._gen = DifiGenerator(
             stream_id       = sid,
             tone_hz         = tone_bb,
@@ -340,6 +349,7 @@ class TransmitterWindow(QMainWindow):
             ref_level_dbm   = self._amp.value(),
             sim_delay_ms    = self._sim_delay.value(),
             sim_jitter_ms   = self._sim_jitter.value(),
+            packet_logger   = self._sent_log,
         )
 
         pkt_rate = fs / self.SAMPLES_PER_PKT
@@ -363,7 +373,8 @@ class TransmitterWindow(QMainWindow):
         self._status.showMessage(
             f"Sending to {ip}:{port} | "
             f"stream=0x{sid:08X} | fs={fs/1e6:.2f} MHz | "
-            f"type={self._signal_type()} | RF={self._tone.value_hz()/1e6:.3f} MHz"
+            f"type={self._signal_type()} | RF={self._tone.value_hz()/1e6:.3f} MHz | "
+            f"log: {run_dir}"
         )
 
     def _stop(self):
@@ -373,6 +384,9 @@ class TransmitterWindow(QMainWindow):
         if self._gen:
             self._gen.close()
             self._gen = None
+        if self._sent_log:
+            self._sent_log.close()
+            self._sent_log = None
         self._stat.setText("Idle")
         self._stat.setStyleSheet("color: #888888;")
         self._running = False
@@ -509,9 +523,14 @@ class TransmitterWindow(QMainWindow):
 
 
 def main():
+    from logging_setup import setup_frozen_file_logging
+    log_path = setup_frozen_file_logging("Transmitter")
+
     pg.setConfigOptions(antialias=True)
     app = QApplication(sys.argv)
     win = TransmitterWindow()
+    if log_path:
+        win._status.showMessage(f"Logging to {log_path}")
     win.show()
     sys.exit(app.exec())
 

@@ -31,6 +31,7 @@ from core.difi_packet import (
     PACKET_TYPE_DATA,
     PACKET_TYPE_CONTEXT,
 )
+from pipeline_logger import wall_clock_str
 
 
 class DifiReceiver:
@@ -51,10 +52,12 @@ class DifiReceiver:
         host: str        = "0.0.0.0",
         port: int        = 50010,
         buffer_size: int = 8192,
+        packet_logger    = None,   # pipeline_logger.PacketLogger, or None
     ):
         self._host        = host
         self._port        = port
         self._buffer_size = buffer_size
+        self._packet_logger = packet_logger
         self._sock        = None
         self._stop_evt    = threading.Event()
         self._thread      = threading.Thread(
@@ -191,7 +194,8 @@ class DifiReceiver:
                 pkt = DifiDataPacket.from_bytes(data, sample_bit_depth=bit_depth)
                 # Detect sequence-number gaps (DIFI seq wraps 0-15)
                 last_seq = self._last_seqs.get(sid)
-                if last_seq is not None and pkt.seq_num != (last_seq + 1) & 0xF:
+                seq_gap = last_seq is not None and pkt.seq_num != (last_seq + 1) & 0xF
+                if seq_gap:
                     self.seq_errors += 1
                     print(
                         f"[Receiver] Seq gap stream 0x{sid:08X}: "
@@ -200,6 +204,11 @@ class DifiReceiver:
                 self._last_seqs[sid] = pkt.seq_num
                 self._update_stream_buffer(pkt.stream_id, pkt.payload)
                 self.data_received += 1
+                if self._packet_logger is not None:
+                    self._packet_logger.log(
+                        wall_clock_str(), f"0x{sid:08X}", "DATA", pkt.seq_num,
+                        pkt.timestamp_int, pkt.timestamp_frac, len(pkt.payload), seq_gap,
+                    )
 
             elif pkt_type == PACKET_TYPE_CONTEXT:
                 pkt = DifiContextPacket.from_bytes(data)
@@ -211,6 +220,11 @@ class DifiReceiver:
                         )
                         print(f"[Receiver] New stream: 0x{pkt.stream_id:08X}")
                 self.context_received += 1
+                if self._packet_logger is not None:
+                    self._packet_logger.log(
+                        wall_clock_str(), f"0x{sid:08X}", "CONTEXT", pkt.seq_num,
+                        pkt.timestamp_int, pkt.timestamp_frac, 0, False,
+                    )
 
         except Exception as exc:
             self.parse_errors += 1
