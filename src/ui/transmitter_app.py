@@ -29,7 +29,7 @@ from PySide6.QtWidgets import (
 )
 import pyqtgraph as pg
 
-from modules.generator import DifiGenerator, SIGNAL_CW, SIGNAL_BW, SIGNAL_OFF
+from modules.generator import DifiGenerator, SIGNAL_CW, SIGNAL_BW, SIGNAL_OFF, SIGNAL_PATTERN
 from ui.freq_input     import FreqInput
 from pipeline_logger   import make_run_dir, PacketLogger
 
@@ -135,16 +135,19 @@ class TransmitterWindow(QMainWindow):
         type_w   = QWidget()
         type_lay = QHBoxLayout(type_w)
         type_lay.setContentsMargins(0, 0, 0, 0)
-        self._cw_rb  = QRadioButton("CW")
-        self._bw_rb  = QRadioButton("BW")
-        self._off_rb = QRadioButton("OFF")
+        self._cw_rb      = QRadioButton("CW")
+        self._bw_rb      = QRadioButton("BW")
+        self._pattern_rb = QRadioButton("PATTERN")
+        self._off_rb     = QRadioButton("OFF")
         self._cw_rb.setChecked(True)
         grp = QButtonGroup(self)
         grp.addButton(self._cw_rb)
         grp.addButton(self._bw_rb)
+        grp.addButton(self._pattern_rb)
         grp.addButton(self._off_rb)
         type_lay.addWidget(self._cw_rb)
         type_lay.addWidget(self._bw_rb)
+        type_lay.addWidget(self._pattern_rb)
         type_lay.addWidget(self._off_rb)
         type_lay.addStretch()
         sig_grid.addWidget(type_w, 1, 1)
@@ -175,11 +178,11 @@ class TransmitterWindow(QMainWindow):
         self._stat.setStyleSheet("color: #888888;")
         sig_grid.addWidget(self._stat, 6, 0, 1, 2)
 
-        for rb in (self._cw_rb, self._bw_rb, self._off_rb):
+        for rb in (self._cw_rb, self._bw_rb, self._pattern_rb, self._off_rb):
             rb.toggled.connect(lambda checked: self._bw.setEnabled(self._bw_rb.isChecked()))
 
         # live update generator while running, and refresh spectrum preview
-        for rb in (self._cw_rb, self._bw_rb, self._off_rb):
+        for rb in (self._cw_rb, self._bw_rb, self._pattern_rb, self._off_rb):
             rb.toggled.connect(self._on_param_changed)
         self._tone.changed.connect(self._on_param_changed)
         self._bw.changed.connect(self._on_param_changed)
@@ -297,8 +300,9 @@ class TransmitterWindow(QMainWindow):
     # ── helpers ────────────────────────────────────────────────────────────
 
     def _signal_type(self) -> str:
-        if self._cw_rb.isChecked():  return SIGNAL_CW
-        if self._bw_rb.isChecked():  return SIGNAL_BW
+        if self._cw_rb.isChecked():      return SIGNAL_CW
+        if self._bw_rb.isChecked():      return SIGNAL_BW
+        if self._pattern_rb.isChecked(): return SIGNAL_PATTERN
         return SIGNAL_OFF
 
     def _stream_id_int(self) -> int:
@@ -332,7 +336,7 @@ class TransmitterWindow(QMainWindow):
         self._sent_log = PacketLogger(
             run_dir, "data_sent.csv",
             ["wall_clock", "stream_id", "pkt_type", "seq", "difi_ts_int",
-             "difi_ts_frac", "samples", "dest_ip", "dest_port"],
+             "difi_ts_frac", "samples", "dest_ip", "dest_port", "first_i", "first_q"],
         )
 
         self._gen = DifiGenerator(
@@ -455,6 +459,11 @@ class TransmitterWindow(QMainWindow):
 
         if sig_type == SIGNAL_CW:
             iq = np.exp(1j * 2 * np.pi * tone_bb * t).astype(np.complex64)
+            iq *= amp_lin
+        elif sig_type == SIGNAL_PATTERN:
+            from modules.generator import PATTERN_PERIOD
+            idx = np.arange(seg_len)
+            iq  = (((idx % PATTERN_PERIOD) / PATTERN_PERIOD) * 2.0 - 1.0).astype(np.complex64)
             iq *= amp_lin
         else:  # BW
             noise  = (rng.standard_normal(seg_len) + 1j * rng.standard_normal(seg_len)).astype(np.complex64)

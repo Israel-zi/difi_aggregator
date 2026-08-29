@@ -300,7 +300,7 @@ class ReceiverWindow(QMainWindow):
         self._recv_log = PacketLogger(
             run_dir, "data_received.csv",
             ["wall_clock", "stream_id", "pkt_type", "seq", "difi_ts_int",
-             "difi_ts_frac", "samples", "seq_gap"],
+             "difi_ts_frac", "samples", "seq_gap", "first_i", "first_q"],
         )
         self._receiver = DifiReceiver(port=port, packet_logger=self._recv_log)
         self._receiver.start()

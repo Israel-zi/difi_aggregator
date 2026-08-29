@@ -526,12 +526,18 @@ class PacketizerWindow(QMainWindow):
         recv_log = PacketLogger(
             self._run_dir, "data_received.csv",
             ["wall_clock", "source_port", "stream_id", "pkt_type", "seq",
-             "difi_ts_int", "difi_ts_frac", "samples"],
+             "difi_ts_int", "difi_ts_frac", "samples", "first_i", "first_q"],
         )
         hold_log = PacketLogger(
             self._run_dir, "hold_and_loss.csv",
             ["wall_clock", "stage", "stream_id", "outcome", "hold_ms",
-             "difi_ts_int", "difi_ts_frac", "samples"],
+             "difi_ts_int", "difi_ts_frac", "samples", "local_latency_ms"],
+        )
+        group_log = PacketLogger(
+            self._run_dir, "group_reassembly.csv",
+            ["wall_clock", "stream_id", "difi_ts_int", "difi_ts_frac",
+             "packet_count", "samples", "seq_first", "seq_last",
+             "complete", "close_reason", "first_i", "first_q", "local_latency_ms"],
         )
 
         capture    = InputCapture(ports=ports, packet_logger=recv_log)
@@ -542,11 +548,12 @@ class PacketizerWindow(QMainWindow):
             expected_count   = len(ports),
             chunk_size       = chunk_size,
             hold_log         = hold_log,
+            group_log        = group_log,
         )
 
         self._modules.update(
             capture=capture, jitter=jitter, aggregator=aggregator,
-            recv_log=recv_log, hold_log=hold_log,
+            recv_log=recv_log, hold_log=hold_log, group_log=group_log,
         )
 
         capture.start()
@@ -588,7 +595,7 @@ class PacketizerWindow(QMainWindow):
         sent_log = PacketLogger(
             self._run_dir, "data_sent.csv",
             ["wall_clock", "stream_id", "pkt_type", "seq", "difi_ts_int",
-             "difi_ts_frac", "samples"],
+             "difi_ts_frac", "samples", "first_i", "first_q"],
         )
         packetizer = Packetizer(
             aggregator = self._modules["aggregator"],
@@ -661,6 +668,8 @@ class PacketizerWindow(QMainWindow):
             m["recv_log"].close()
         if "hold_log" in m:
             m["hold_log"].close()
+        if "group_log" in m:
+            m["group_log"].close()
 
         for row in self._stream_rows:
             row.set_active(False)

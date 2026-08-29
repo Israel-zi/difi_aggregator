@@ -30,12 +30,14 @@ from core.difi_packet import (
     TSF_REAL_TIME,
 )
 from modules.net_impairment import DelayedDispatcher
-from pipeline_logger import wall_clock_str
+from pipeline_logger import wall_clock_str, sample_fingerprint
 
 CONTEXT_MIN_INTERVAL_S = 0.05   # max 20 context packets/s per DIFI standard (Section 4.3.1)
-SIGNAL_CW  = "CW"
-SIGNAL_BW  = "BW"
-SIGNAL_OFF = "OFF"
+SIGNAL_CW      = "CW"
+SIGNAL_BW      = "BW"
+SIGNAL_OFF     = "OFF"
+SIGNAL_PATTERN = "PATTERN"   # deterministic test signal — see _generate_pattern()
+PATTERN_PERIOD = 1000        # samples per sawtooth cycle
 
 
 class DifiGenerator:
@@ -96,6 +98,7 @@ class DifiGenerator:
         self._ctx_seq       = 0
         self._pkt_count     = 0
         self._phase         = 0.0
+        self._sample_counter = 0   # monotonic, never reset — drives SIGNAL_PATTERN
         self._running       = True
         self._bw_filter     = None
         self._bw_zi_i       = None   # lowpass filter state for I channel
@@ -169,11 +172,31 @@ class DifiGenerator:
 
         return (amp * baseband * mix).astype(np.complex64)
 
+    def _generate_pattern(self) -> np.ndarray:
+        """Deterministic test pattern -- NOT a network loopback. The point is
+        that every sample's value is a pure function of its position in the
+        stream (a monotonic sample counter, never reset and independent of
+        wall-clock/phase state), so given only what's already in the packet
+        logs (seq_num + sample-in-packet) the expected value at any point can
+        be recomputed and checked against what a log from a real run shows
+        actually arrived -- catching corruption, drops or reordering from the
+        logs alone. The combiner and receiver need no special-case knowledge
+        of this pattern; it looks like any other signal to them.
+        """
+        n   = self.samples_per_pkt
+        amp = 10 ** (self.ref_level_dbm / 20.0)
+        idx = self._sample_counter + np.arange(n)
+        ramp = ((idx % PATTERN_PERIOD) / PATTERN_PERIOD) * 2.0 - 1.0   # sawtooth in [-1, 1)
+        self._sample_counter += n
+        return (amp * ramp).astype(np.complex64)   # Q=0 -- keeps the pattern in the I channel only
+
     def _generate_samples(self) -> np.ndarray:
         if self.signal_type == SIGNAL_OFF:
             return np.zeros(self.samples_per_pkt, dtype=np.complex64)
         if self.signal_type == SIGNAL_CW:
             return self._generate_cw()
+        if self.signal_type == SIGNAL_PATTERN:
+            return self._generate_pattern()
         return self._generate_bw()
 
     # ── packet building ────────────────────────────────────────────────────
@@ -203,9 +226,11 @@ class DifiGenerator:
         ts_int, ts_frac = now_timestamp()
         seq = self._next_seq("_data_seq")
         if self._packet_logger is not None:
+            first_i, first_q = sample_fingerprint(samples)
             self._packet_logger.log(
                 wall_clock_str(), f"0x{self.stream_id:08X}", "DATA", seq,
                 ts_int, ts_frac, len(samples), self.dest[0], self.dest[1],
+                first_i, first_q,
             )
         return DifiDataPacket(
             stream_id        = self.stream_id,

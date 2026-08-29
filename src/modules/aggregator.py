@@ -37,7 +37,7 @@ if not getattr(sys, 'frozen', False):
 
 from core.difi_packet import DifiDataPacket, DifiContextPacket
 from modules.input_capture import CapturedPacket, InputCapture
-from pipeline_logger import wall_clock_str
+from pipeline_logger import wall_clock_str, sample_fingerprint
 
 
 def _advance_ts(ts_int: int, ts_frac: int, n_samples: int, sample_rate_hz: float) -> tuple:
@@ -47,6 +47,20 @@ def _advance_ts(ts_int: int, ts_frac: int, n_samples: int, sample_rate_hz: float
     ps_advance = int(n_samples * 1_000_000_000_000 / sample_rate_hz)
     new_frac   = ts_frac + ps_advance
     return ts_int + new_frac // 1_000_000_000_000, new_frac % 1_000_000_000_000
+
+
+def _seq_run_complete(seqs: list) -> bool:
+    """True iff seq_num values (4-bit, mod-16) form one unbroken run with no
+    gap -- i.e. no packet belonging to this (stream_id, timestamp) group was
+    lost in transit between InputCapture and the Aggregator."""
+    if len(seqs) <= 1:
+        return True
+    expected = seqs[0]
+    for s in seqs:
+        if s != expected:
+            return False
+        expected = (expected + 1) & 0xF
+    return True
 
 
 # ─────────────────────────────────────────────
@@ -89,41 +103,134 @@ class AggregatedChunk:
 class StreamBuffer:
     """Accumulates IQ samples and tracks the latest Context for one stream.
 
-    Samples are kept as a queue of (ts_int, ts_frac, array) per received
-    packet -- not one flat array with a single timestamp latched only when
-    the buffer was last empty. That older design meant that once a backlog
-    built up (production briefly outrunning consumption, e.g. under thread
-    scheduling contention with several other streams), every consume() took
-    a "remainder" path that dead-reckoned the timestamp forward from a
-    stale origin by chunk_size each time -- divorced from the packets'
-    own real stamps, and able to drift for as long as the backlog persisted.
-    Tracking per-packet timestamps means consume() always reports a real
-    packet's own true stamp (exactly, in the common case where chunk_size
-    equals samples_per_pkt -- one packet in, one packet out).
+    Reassembly, not just buffering
+    -------------------------------
+    A single logical capture instant can arrive as several distinct UDP DATA
+    packets that all carry the *same* Stream ID and the *same* DIFI
+    timestamp -- either because the source genuinely split one block across
+    multiple packets, or (observed in practice on this project) because the
+    wall-clock timestamp source ticks slower than the packet rate, so a
+    burst of real, independent packets collide onto one timestamp. Either
+    way, the combiner must not silently treat these as one packet's worth of
+    data cut off wherever chunk_size happens to land -- it must gather every
+    packet sharing that (stream_id, timestamp) key, verify none of them was
+    lost in transit (via unbroken seq_num continuity), and only then treat
+    the reassembled result as ready to forward.
+
+    add_data() accumulates packets into an "open" group keyed by the DIFI
+    timestamp. The group closes -- gets concatenated into one array and
+    pushed onto the queue that ready()/consume() read from -- the moment a
+    packet with a *different* timestamp arrives (the normal case: the
+    source has moved on, so nothing more will arrive for the old one), or
+    after poll_idle() sees the group has gone quiet for group_timeout_s (the
+    tail case: this was the last group before the stream paused/stopped, so
+    nothing will ever arrive to trigger the normal close). Each close is
+    logged (packet count, seq range, completeness) via group_log.
+
+    Once closed, groups are just (ts_int, ts_frac, array) entries in a queue
+    -- consume() slices exactly chunk_size samples off the front, splitting
+    a group only when chunk_size doesn't land on a group boundary (rare;
+    falls back to sample-rate-based timestamp advancement for the leftover,
+    same as before reassembly was added).
     """
 
-    def __init__(self, stream_id: int, max_samples: int = 0):
+    def __init__(self, stream_id: int, max_samples: int = 0,
+                 group_timeout_s: float = 0.05, group_log=None):
         self.stream_id      = stream_id
-        self._packets       = deque()     # (ts_int, ts_frac, np.ndarray) per packet
-        self._total         = 0           # total samples buffered
+        self._packets       = deque()     # (ts_int, ts_frac, np.ndarray, first_received_at) per CLOSED group
+        self._total         = 0           # total samples buffered across closed groups
         self.context        = None        # latest DifiContextPacket
         self.last_update    = time.monotonic()
-        # Hard cap: when > 0, oldest packets are dropped once _total exceeds this.
-        # Keeps pipeline latency bounded at max_samples / sample_rate seconds.
+        # Hard cap: when > 0, oldest closed groups are dropped once _total exceeds
+        # this. Keeps pipeline latency bounded at max_samples / sample_rate seconds.
         self._max_samples   = max_samples
         # DIFI timestamp of the most recently emitted chunk (set by consume()).
         self.data_ts_int    = 0
         self.data_ts_frac   = 0
+        # monotonic time (this process's own clock only) that the first packet
+        # of the most recently emitted chunk was captured off the wire by
+        # InputCapture -- set by consume(). Unlike hold_ms (which compares
+        # this machine's wall clock against the DIFI timestamp stamped on a
+        # DIFFERENT machine, the Transmitter), a delta against this is immune
+        # to any clock skew between VMs -- it measures only how long this
+        # process itself took, nothing about whether the two machines agree
+        # on what time it is.
+        self.data_received_at = 0.0
 
-    def add_data(self, pkt: DifiDataPacket):
-        self._packets.append((pkt.timestamp_int, pkt.timestamp_frac, pkt.payload.copy()))
-        self._total      += len(pkt.payload)
-        self.last_update  = time.monotonic()
+        # -- open (not yet closed) group state --
+        self._group_log        = group_log   # pipeline_logger.PacketLogger, or None
+        self._group_timeout_s  = group_timeout_s
+        self._open_ts          = None        # (ts_int, ts_frac) or None if nothing open
+        self._open_parts       = []          # list[np.ndarray] pieces seen so far
+        self._open_seqs        = []          # list[int] seq_num per piece, arrival order
+        self._open_last_seen   = 0.0         # monotonic time of the open group's last packet
+        self._open_gap         = False       # a seq_num gap landed while this group was open
+        self._open_first_recv  = 0.0         # monotonic captured_at of this group's first packet
+        self._last_seq         = None        # last seq_num seen on this stream (any group)
 
-        # If the buffer has grown beyond the cap, drop the oldest whole packets so
+        # stats
+        self.groups_closed     = 0
+        self.groups_incomplete = 0
+
+    def add_data(self, pkt: DifiDataPacket, received_at: float):
+        now = time.monotonic()
+        ts  = (pkt.timestamp_int, pkt.timestamp_frac)
+
+        if self._open_ts is not None and ts != self._open_ts:
+            self._close_open_group("TS_CHANGED")
+        if self._open_ts is None:
+            self._open_ts         = ts
+            self._open_first_recv = received_at
+
+        gap = self._last_seq is not None and pkt.seq_num != (self._last_seq + 1) & 0xF
+        if gap:
+            self._open_gap = True
+        self._last_seq = pkt.seq_num
+
+        self._open_parts.append(pkt.payload.copy())
+        self._open_seqs.append(pkt.seq_num)
+        self._open_last_seen = now
+        self.last_update     = now
+
+    def poll_idle(self):
+        """Force-close the open group if no new packet has arrived for it in
+        group_timeout_s. Without this, the last group of a burst -- the one
+        with no later, differently-stamped packet to trigger a normal close
+        -- would sit "open" (invisible to ready()/consume()) forever."""
+        if self._open_ts is not None and (time.monotonic() - self._open_last_seen) >= self._group_timeout_s:
+            self._close_open_group("TIMEOUT")
+
+    def _close_open_group(self, reason: str):
+        ts_int, ts_frac = self._open_ts
+        seqs    = self._open_seqs
+        samples = np.concatenate(self._open_parts).astype(np.complex64)
+        complete = not self._open_gap and _seq_run_complete(seqs)
+
+        self._packets.append((ts_int, ts_frac, samples, self._open_first_recv))
+        self._total += len(samples)
+        self.groups_closed += 1
+        if not complete:
+            self.groups_incomplete += 1
+
+        if self._group_log is not None:
+            first_i, first_q = sample_fingerprint(samples)
+            local_latency_ms = (time.monotonic() - self._open_first_recv) * 1000.0
+            self._group_log.log(
+                wall_clock_str(), f"0x{self.stream_id:08X}", ts_int, ts_frac,
+                len(seqs), len(samples), seqs[0], seqs[-1], complete, reason,
+                first_i, first_q, f"{local_latency_ms:.2f}",
+            )
+
+        self._open_ts         = None
+        self._open_parts      = []
+        self._open_seqs       = []
+        self._open_gap        = False
+        self._open_first_recv = 0.0
+
+        # If the buffer has grown beyond the cap, drop the oldest whole groups so
         # the pipeline always shows near-real-time data rather than a stale backlog.
         while self._max_samples and self._total > self._max_samples and len(self._packets) > 1:
-            _, _, arr = self._packets.popleft()
+            _, _, arr, _ = self._packets.popleft()
             self._total -= len(arr)
 
     def add_context(self, pkt: DifiContextPacket):
@@ -144,14 +251,16 @@ class StreamBuffer:
         """
         if not self._packets:
             self.data_ts_int, self.data_ts_frac = 0, 0
+            self.data_received_at = 0.0
             return np.zeros(0, dtype=np.complex64)
 
         self.data_ts_int, self.data_ts_frac = self._packets[0][0], self._packets[0][1]
+        self.data_received_at = self._packets[0][3]
 
         collected = []
         remaining = chunk_size
         while remaining > 0 and self._packets:
-            p_ts_int, p_ts_frac, arr = self._packets[0]
+            p_ts_int, p_ts_frac, arr, p_recv_at = self._packets[0]
             if len(arr) <= remaining:
                 collected.append(arr)
                 remaining -= len(arr)
@@ -162,7 +271,7 @@ class StreamBuffer:
                 self._total -= remaining
                 if sample_rate_hz > 0:
                     p_ts_int, p_ts_frac = _advance_ts(p_ts_int, p_ts_frac, remaining, sample_rate_hz)
-                self._packets[0] = (p_ts_int, p_ts_frac, arr[remaining:])
+                self._packets[0] = (p_ts_int, p_ts_frac, arr[remaining:], p_recv_at)
                 remaining = 0
 
         return np.concatenate(collected).astype(np.complex64) if collected else np.zeros(0, dtype=np.complex64)
@@ -229,6 +338,12 @@ class Aggregator:
                         remaining streams before zero-filling them and
                         emitting anyway — must comfortably exceed the
                         largest configured sim delay + jitter across streams
+    group_timeout_ms  : how long a stream's in-progress (stream_id, timestamp)
+                        reassembly group may sit with no new packet before it's
+                        force-closed and treated as ready — see StreamBuffer.
+                        Only matters for the last group before a stream goes
+                        quiet; every other group closes immediately once a
+                        differently-stamped packet arrives.
     """
 
     def __init__(
@@ -242,10 +357,14 @@ class Aggregator:
         put_timeout_s: float    = 0.2,
         stale_timeout: float    = 5.0,
         target_latency_ms: float = 200.0,
+        group_timeout_ms: float = 50.0,
         hold_log                = None,   # pipeline_logger.PacketLogger, or None
+        group_log               = None,   # pipeline_logger.PacketLogger, or None
     ):
         self._capture          = capture
         self._hold_log          = hold_log
+        self._group_log        = group_log
+        self._group_timeout_s  = group_timeout_ms / 1000.0
         self._sample_rate_hz   = sample_rate_hz
         self._expected         = set(expected_streams) if expected_streams else None
         self._expected_count   = (
@@ -339,6 +458,13 @@ class Aggregator:
                     break
                 captured = self._capture.get(timeout=0.0)
 
+            # Force-close any stream's in-progress reassembly group that's
+            # gone quiet — otherwise the tail group of a burst (nothing later
+            # ever arrives to trigger its normal TS_CHANGED close) would sit
+            # open forever, invisible to ready()/consume().
+            for buf in self._buffers.values():
+                buf.poll_idle()
+
             # Keep emitting while a full cycle (or a deadline-expired
             # partial one) is available — lets a backlog drain at whatever
             # rate the pipeline can sustain, rather than one emission per
@@ -389,7 +515,10 @@ class Aggregator:
                 self._chunk_size * 4,
                 int(self._sample_rate_hz * self._target_latency_s * 3),
             )
-            self._buffers[stream_id] = StreamBuffer(stream_id, max_samples=max_samples)
+            self._buffers[stream_id] = StreamBuffer(
+                stream_id, max_samples=max_samples,
+                group_timeout_s=self._group_timeout_s, group_log=self._group_log,
+            )
             self._stream_ports[stream_id] = captured.source_port
             if self._expected is None:
                 print(f"[Aggregator] Discovered stream 0x{stream_id:08X} on port {captured.source_port} ({len(self._buffers)} of {self._expected_count or '?'})")
@@ -397,7 +526,7 @@ class Aggregator:
         buf = self._buffers[stream_id]
 
         if isinstance(pkt, DifiDataPacket):
-            buf.add_data(pkt)
+            buf.add_data(pkt, captured.received_at)
         elif isinstance(pkt, DifiContextPacket):
             buf.add_context(pkt)
 
@@ -466,7 +595,7 @@ class Aggregator:
                     stream_id=sid, samples=samples, context=buf.context,
                     received_at=buf.last_update, data_ts_int=ts_int, data_ts_frac=ts_frac,
                 ))
-                self._log_hold(sid, "READY", ts_int, ts_frac, len(samples))
+                self._log_hold(sid, "READY", ts_int, ts_frac, len(samples), buf.data_received_at)
             elif buf is not None and buf.context is not None and sid in self._next_expected_ts:
                 # Missed this cycle's deadline — zero-fill to preserve phase
                 # alignment for the other streams instead of stalling everyone.
@@ -480,7 +609,7 @@ class Aggregator:
                 self._next_expected_ts[sid] = _advance_ts(ts_int, ts_frac, self._chunk_size, fs)
                 self.deadline_misses += 1
                 self.deadline_misses_by_stream[sid] = self.deadline_misses_by_stream.get(sid, 0) + 1
-                self._log_hold(sid, "TIMEOUT_ZEROFILL", ts_int, ts_frac, self._chunk_size)
+                self._log_hold(sid, "TIMEOUT_ZEROFILL", ts_int, ts_frac, self._chunk_size, None)
             # else: cold start — this stream has never sent a first packet yet.
 
         if not blocks:
@@ -490,7 +619,23 @@ class Aggregator:
         self.last_chunk = chunk   # display tap — no queue consumption required
 
         try:
-            self._out_queue.put(chunk, timeout=self._put_timeout_s)
+            # put_nowait, not a blocking put(timeout=...): this call runs on
+            # the SAME thread that drains InputCapture and updates every
+            # stream's last-seen bookkeeping (buf.last_update). A blocking
+            # put here doesn't just delay this one chunk -- for as long as
+            # it blocks, NOTHING on this thread runs, so InputCapture's own
+            # queue (30 slots by default) backs up and starts dropping real,
+            # never-yet-processed packets, and every stream's staleness
+            # clock freezes (hold_ms and "did the source go quiet" both read
+            # last_update). Measured: at a trivial 200 pkt/s with a slow
+            # consumer, a 0.2s blocking put() here stalled the thread for
+            # 1.75 of every 2 seconds and dropped 85% of arriving packets --
+            # a self-inflicted cascade, not a real throughput ceiling.
+            # Dropping immediately when the queue is genuinely full keeps
+            # this thread free to keep draining and keep bookkeeping fresh,
+            # which is strictly better for a downstream consumer that's only
+            # briefly behind, and no worse for one that's sustained-overloaded.
+            self._out_queue.put_nowait(chunk)
             self.chunks_emitted += 1
         except queue.Full:
             self.packets_dropped += 1
@@ -499,16 +644,40 @@ class Aggregator:
                 print(f"[Aggregator] Output queue full — chunk dropped (total: {self.packets_dropped})")
             for block in blocks:
                 self._log_hold(block.stream_id, "LOST_QUEUE_FULL",
-                                block.data_ts_int, block.data_ts_frac, len(block.samples))
+                                block.data_ts_int, block.data_ts_frac, len(block.samples), None)
 
-    def _log_hold(self, sid: int, outcome: str, ts_int: int, ts_frac: int, samples: int):
-        """Record one stream's per-cycle outcome to the hold/loss evidence log."""
+    def _log_hold(self, sid: int, outcome: str, ts_int: int, ts_frac: int, samples: int,
+                  received_at):
+        """Record one stream's per-cycle outcome to the hold/loss evidence log.
+
+        Logs TWO different latency numbers, and they answer different
+        questions:
+          hold_ms          : time.time() [[this machine's clock]] minus the
+                              packet's own DIFI timestamp [[stamped on the
+                              TRANSMITTER's clock]]. Meaningful only if the
+                              two machines' clocks are synchronized -- on
+                              unsynchronized VMs this is contaminated by
+                              clock skew and can look arbitrarily wrong
+                              (inflated, deflated, even negative) with zero
+                              relation to real processing time.
+          local_latency_ms : time.monotonic() minus the monotonic instant
+                              InputCapture itself received the first packet
+                              of this chunk (received_at) -- both readings
+                              taken on THIS process's own clock. Immune to
+                              any cross-machine clock skew; this is the
+                              trustworthy number for "how long did the
+                              combiner itself take."
+        received_at is None for synthetic outcomes (zero-filled or dropped
+        for lack of queue room) that have no real captured packet behind them.
+        """
         if self._hold_log is None:
             return
         hold_ms = (time.time() - (ts_int + ts_frac / 1e12)) * 1000.0
+        local_latency_ms = (time.monotonic() - received_at) * 1000.0 if received_at is not None else ""
         self._hold_log.log(
             wall_clock_str(), "AGGREGATOR", f"0x{sid:08X}", outcome,
             f"{hold_ms:.2f}", ts_int, ts_frac, samples,
+            f"{local_latency_ms:.2f}" if local_latency_ms != "" else "",
         )
 
     # ── diagnostics ────────────────────────────────────────────────────────
@@ -574,14 +743,42 @@ class Aggregator:
         """Return {stream_id: source_port} for all discovered streams."""
         return dict(self._stream_ports)
 
-    def get_stream_previews(self) -> list:
-        """Return [(stream_id, samples, context)] for any stream that has data.
-        Does NOT consume buffered samples — read-only snapshot for display."""
+    def get_stream_previews(self, max_samples: int = 4096) -> list:
+        """Return [(stream_id, samples, context)] for any stream that has data,
+        each trimmed to at most the most recent `max_samples` samples.
+        Does NOT consume buffered samples — read-only snapshot for display.
+        Includes the still-open (not yet reassembled/closed) group too, so
+        the live spectrum doesn't visibly stall while a group waits to close.
+
+        Bounding to a trailing window is essential, not an optimization: a
+        caller here (the spectrum display) only ever looks at the last
+        seg_len (1024) samples anyway, but concatenating the FULL backlog
+        first -- as this used to do -- costs time linear in however much
+        data has piled up in buf._packets. Called on a 10Hz timer, that
+        turns any transient slowdown into a runaway feedback loop: a
+        growing backlog makes each preview call itself slower, stealing
+        more CPU from the very threads that would drain that backlog,
+        growing it further. Measured: with a 2-second backlog at ~4000
+        pkt/s combined, one unbounded call here took 47ms -- at 10Hz, that
+        alone is most of a CPU core, before any real packet processing.
+        """
         result = []
         for sid, buf in self._buffers.items():
-            if buf.context is not None and buf._total > 0:
-                samples = np.concatenate([arr for _, _, arr in buf._packets]).astype(np.complex64)
-                result.append((sid, samples, buf.context))
+            if buf.context is None:
+                continue
+            parts = list(buf._open_parts)
+            total = sum(len(p) for p in parts)
+            for _, _, arr, _ in reversed(buf._packets):
+                if total >= max_samples:
+                    break
+                parts.insert(0, arr)
+                total += len(arr)
+            if not parts:
+                continue
+            samples = np.concatenate(parts).astype(np.complex64)
+            if len(samples) > max_samples:
+                samples = samples[-max_samples:]
+            result.append((sid, samples, buf.context))
         return result
 
 

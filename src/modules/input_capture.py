@@ -33,7 +33,7 @@ from core.difi_packet import (
     PACKET_TYPE_DATA,
     PACKET_TYPE_CONTEXT,
 )
-from pipeline_logger import wall_clock_str
+from pipeline_logger import wall_clock_str, sample_fingerprint
 
 
 # ─────────────────────────────────────────────
@@ -137,11 +137,13 @@ class PortListener(threading.Thread):
                 pkt = DifiDataPacket.from_bytes(data)
                 self.stats["data_received"] += 1
                 n_samples = len(pkt.payload)
+                first_i, first_q = sample_fingerprint(pkt.payload)
 
             elif pkt_type == PACKET_TYPE_CONTEXT:
                 pkt = DifiContextPacket.from_bytes(data)
                 self.stats["context_received"] += 1
                 n_samples = 0
+                first_i, first_q = "", ""
 
             else:
                 # unknown packet type — skip silently
@@ -152,6 +154,7 @@ class PortListener(threading.Thread):
                 self._packet_logger.log(
                     wall_clock_str(), self.port, f"0x{pkt.stream_id:08X}", pkt_kind,
                     pkt.seq_num, pkt.timestamp_int, pkt.timestamp_frac, n_samples,
+                    first_i, first_q,
                 )
 
             # Non-blocking put: if the queue is full, drop this packet rather

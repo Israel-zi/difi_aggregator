@@ -31,7 +31,7 @@ from core.difi_packet import (
     PACKET_TYPE_DATA,
     PACKET_TYPE_CONTEXT,
 )
-from pipeline_logger import wall_clock_str
+from pipeline_logger import wall_clock_str, sample_fingerprint
 
 
 class DifiReceiver:
@@ -205,9 +205,11 @@ class DifiReceiver:
                 self._update_stream_buffer(pkt.stream_id, pkt.payload)
                 self.data_received += 1
                 if self._packet_logger is not None:
+                    first_i, first_q = sample_fingerprint(pkt.payload)
                     self._packet_logger.log(
                         wall_clock_str(), f"0x{sid:08X}", "DATA", pkt.seq_num,
                         pkt.timestamp_int, pkt.timestamp_frac, len(pkt.payload), seq_gap,
+                        first_i, first_q,
                     )
 
             elif pkt_type == PACKET_TYPE_CONTEXT:
@@ -224,6 +226,7 @@ class DifiReceiver:
                     self._packet_logger.log(
                         wall_clock_str(), f"0x{sid:08X}", "CONTEXT", pkt.seq_num,
                         pkt.timestamp_int, pkt.timestamp_frac, 0, False,
+                        "", "",
                     )
 
         except Exception as exc:

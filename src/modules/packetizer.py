@@ -33,7 +33,7 @@ from core.difi_packet import (
     TSF_REAL_TIME,
 )
 from modules.aggregator import Aggregator, StreamBlock
-from pipeline_logger import wall_clock_str
+from pipeline_logger import wall_clock_str, sample_fingerprint
 
 
 CONTEXT_MIN_INTERVAL_S = 0.05   # max 20 context packets/s per DIFI standard §4.3.1
@@ -210,20 +210,30 @@ class Packetizer:
                 data_bytes, seq = self._build_data(block)
 
                 try:
-                    self._out_queue.put((ctx_bytes, data_bytes), timeout=self._put_timeout_s)
+                    # put_nowait, not a blocking put(timeout=...) -- same reasoning
+                    # as Aggregator._emit_cycle: this call runs on the thread that
+                    # also drains the Aggregator's output queue, so a blocking put
+                    # here doesn't just delay this one packet, it stalls draining
+                    # upstream too, which backs up and drops real aggregated chunks
+                    # there instead. Fail fast and keep this thread free to drain.
+                    self._out_queue.put_nowait((ctx_bytes, data_bytes))
                     self.packets_produced += 1
                     if self._sent_log is not None:
+                        first_i, first_q = sample_fingerprint(block.samples)
                         self._sent_log.log(
                             wall_clock_str(), f"0x{sid:08X}", "DATA", seq,
                             block.data_ts_int, block.data_ts_frac, len(block.samples),
+                            first_i, first_q,
                         )
                 except queue.Full:
                     self.packets_dropped += 1
                     if self._hold_log is not None:
                         hold_ms = (time.time() - (block.data_ts_int + block.data_ts_frac / 1e12)) * 1000.0
+                        local_latency_ms = (time.monotonic() - block.received_at) * 1000.0
                         self._hold_log.log(
                             wall_clock_str(), "PACKETIZER", f"0x{sid:08X}", "LOST_QUEUE_FULL",
                             f"{hold_ms:.2f}", block.data_ts_int, block.data_ts_frac, len(block.samples),
+                            f"{local_latency_ms:.2f}",
                         )
 
 
