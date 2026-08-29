@@ -237,7 +237,8 @@ class Aggregator:
         expected_streams: list  = None,
         expected_count: int     = None,
         chunk_size: int         = 1024,
-        out_queue_size: int     = 8,
+        out_queue_size: int     = 32,
+        put_timeout_s: float    = 0.2,
         stale_timeout: float    = 5.0,
         target_latency_ms: float = 200.0,
     ):
@@ -251,6 +252,10 @@ class Aggregator:
         self._stale_timeout    = stale_timeout
         self._target_latency_s = target_latency_ms / 1000.0
         self._out_queue        = queue.Queue(maxsize=out_queue_size)
+        # See Packetizer's identical put_timeout_s: absorbs a transient
+        # downstream stall instead of permanently discarding a whole
+        # already-aggregated chunk (both streams' real IQ data at once).
+        self._put_timeout_s    = put_timeout_s
         self._buffers          = {}        # stream_id -> StreamBuffer
         self._stop_evt         = threading.Event()
         self._thread           = threading.Thread(
@@ -480,7 +485,7 @@ class Aggregator:
         self.last_chunk = chunk   # display tap — no queue consumption required
 
         try:
-            self._out_queue.put_nowait(chunk)
+            self._out_queue.put(chunk, timeout=self._put_timeout_s)
             self.chunks_emitted += 1
         except queue.Full:
             self.packets_dropped += 1

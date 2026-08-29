@@ -410,7 +410,15 @@ class TransmitterWindow(QMainWindow):
     # ── spectrum ───────────────────────────────────────────────────────────
 
     def _update_spectrum(self):
-        """Compute and display the expected signal spectrum from current UI parameters."""
+        """Compute and display the expected signal spectrum from current UI parameters.
+
+        Adds a small synthetic noise floor, freshly randomized on every call.
+        A noiseless ideal tone (or BW noise redrawn from a fixed seed, as
+        this used to do) is bit-for-bit identical on every redraw, which
+        reads as a frozen/dead display even while actively transmitting —
+        real spectrum analyzers visibly jitter tick-to-tick because of their
+        own noise floor, and this display should look the same way.
+        """
         fs       = self._fs.value_hz()
         rf_ref   = self._rf_ref()
         tone_bb  = self._tone.value_hz() - rf_ref
@@ -428,11 +436,13 @@ class TransmitterWindow(QMainWindow):
             self._curve.setData([], [])
             return
 
+        rng     = np.random.default_rng()   # fresh noise each tick -> visibly live display
+        amp_lin = 10 ** (amp_dbm / 20.0)
+
         if sig_type == SIGNAL_CW:
             iq = np.exp(1j * 2 * np.pi * tone_bb * t).astype(np.complex64)
-            iq *= 10 ** (amp_dbm / 20.0)
+            iq *= amp_lin
         else:  # BW
-            rng    = np.random.default_rng(0)   # fixed seed → stable display
             noise  = (rng.standard_normal(seg_len) + 1j * rng.standard_normal(seg_len)).astype(np.complex64)
             nyq    = fs / 2.0
             cutoff = max(min(bw / 2.0 / nyq, 0.499), 1e-4)
@@ -441,7 +451,13 @@ class TransmitterWindow(QMainWindow):
             fq     = sp_sig.lfilter(fir, [1.0], noise.imag)
             iq     = (fi + 1j * fq).astype(np.complex64)
             iq    *= np.exp(1j * 2 * np.pi * tone_bb * t)
-            iq    *= 10 ** (amp_dbm / 20.0)
+            iq    *= amp_lin
+
+        # Synthetic noise floor ~45 dB below the signal peak.
+        floor_amp = amp_lin * 10 ** (-45.0 / 20.0)
+        iq = iq + floor_amp * (
+            rng.standard_normal(seg_len) + 1j * rng.standard_normal(seg_len)
+        ).astype(np.complex64)
 
         w      = np.hanning(seg_len)
         w_amp  = float(np.sum(w))

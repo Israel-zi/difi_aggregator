@@ -37,6 +37,11 @@ _STREAM_COLORS = [
     (255, 100, 255),  # stream index 3+ — magenta
 ]
 
+# How long a stream may go quiet before the UI calls it inactive/stopped.
+# Pure display debounce, not a data-path timeout — see packetizer_app.py's
+# identical constant for the full rationale.
+STREAM_STALE_S = 1.0
+
 
 def _stream_color(sid: int):
     return pg.mkPen(_STREAM_COLORS[(sid - 1) % len(_STREAM_COLORS)], width=1)
@@ -56,6 +61,55 @@ def _stream_fft(iq, ctx, seg_len: int = 1024):
         np.fft.fftfreq(seg_len, d=1.0 / ctx.sample_rate_hz)
     ) + ctx.rf_ref_freq_hz
     return freqs, mag_db
+
+
+class ReceiverStreamRow(QWidget):
+    """
+    One discovered-stream status row: [●] [stream id] [fs] [RF] [status]
+
+    Read-only — the receiver only auto-discovers streams from incoming
+    Context packets, there's nothing here for the user to configure.
+    The LED and status text are the whole point: a stream that stops
+    sending must visibly go from "live" to "stopped", not just sit in a
+    flat list forever looking identical to an active one.
+    """
+
+    def __init__(self, sid: int, parent=None):
+        super().__init__(parent)
+        self.sid = sid
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(2, 2, 2, 2)
+        lay.setSpacing(8)
+
+        self._led = QLabel("●")
+        self._led.setFixedWidth(16)
+        lay.addWidget(self._led)
+
+        self._sid_lbl = QLabel(f"0x{sid:08X}")
+        self._sid_lbl.setFixedWidth(100)
+        lay.addWidget(self._sid_lbl)
+
+        self._fs_lbl = QLabel("—")
+        self._fs_lbl.setFixedWidth(90)
+        lay.addWidget(self._fs_lbl)
+
+        self._rf_lbl = QLabel("—")
+        self._rf_lbl.setFixedWidth(90)
+        lay.addWidget(self._rf_lbl)
+
+        self._status_lbl = QLabel("")
+        lay.addWidget(self._status_lbl)
+        lay.addStretch()
+
+    def update_state(self, ctx, active: bool):
+        if ctx is not None:
+            self._fs_lbl.setText(f"{ctx.sample_rate_hz / 1e6:.3f} MHz")
+            self._rf_lbl.setText(f"{ctx.rf_ref_freq_hz / 1e6:.3f} MHz")
+        color = "#00cc44" if active else "#888888"
+        self._led.setStyleSheet(f"color: {color}; font-size: 16px;")
+        self._sid_lbl.setStyleSheet("color: #dddddd;" if active else "color: #888888;")
+        self._status_lbl.setText("" if active else "stopped")
+        self._status_lbl.setStyleSheet("color: #cc5555; font-size: 11px;")
 
 
 class ReceiverWindow(QMainWindow):
@@ -145,22 +199,35 @@ class ReceiverWindow(QMainWindow):
         self._lbl_data  = QLabel("0")
         self._lbl_ctx   = QLabel("0")
         self._lbl_errs  = QLabel("0")
-        self._lbl_fs    = QLabel("—")
-        self._lbl_rf    = QLabel("—")
-        self._lbl_sid   = QLabel("—")
         stats_grid.addWidget(QLabel("Data packets:"),   0, 0)
         stats_grid.addWidget(self._lbl_data,            0, 1)
         stats_grid.addWidget(QLabel("Context packets:"), 1, 0)
         stats_grid.addWidget(self._lbl_ctx,             1, 1)
         stats_grid.addWidget(QLabel("Parse errors:"),   2, 0)
         stats_grid.addWidget(self._lbl_errs,            2, 1)
-        stats_grid.addWidget(QLabel("Sample rate:"),    3, 0)
-        stats_grid.addWidget(self._lbl_fs,              3, 1)
-        stats_grid.addWidget(QLabel("RF reference:"),   4, 0)
-        stats_grid.addWidget(self._lbl_rf,              4, 1)
-        stats_grid.addWidget(QLabel("Stream ID:"),      5, 0)
-        stats_grid.addWidget(self._lbl_sid,             5, 1)
         left_layout.addWidget(stats_box)
+
+        # Streams — one row per discovered stream ID, LED shows live/stopped
+        streams_box  = QGroupBox("Streams")
+        streams_vlay = QVBoxLayout(streams_box)
+        streams_vlay.setSpacing(2)
+        hdr = QHBoxLayout()
+        hdr.setSpacing(8)
+        hdr.addSpacing(16)
+        for lbl, w in [("Stream ID", 100), ("Sample rate", 90), ("RF ref", 90)]:
+            l = QLabel(lbl)
+            l.setFixedWidth(w)
+            l.setStyleSheet("color: #888888; font-size: 11px;")
+            hdr.addWidget(l)
+        hdr.addStretch()
+        streams_vlay.addLayout(hdr)
+        self._stream_rows_container = QWidget()
+        self._stream_rows_layout    = QVBoxLayout(self._stream_rows_container)
+        self._stream_rows_layout.setSpacing(2)
+        self._stream_rows_layout.setContentsMargins(0, 0, 0, 0)
+        streams_vlay.addWidget(self._stream_rows_container)
+        left_layout.addWidget(streams_box)
+        self._stream_rows: dict = {}   # stream_id -> ReceiverStreamRow
 
         left_layout.addStretch()
 
@@ -244,6 +311,10 @@ class ReceiverWindow(QMainWindow):
         for c in self._curves.values():
             c.setData([], [])
         self._curves.clear()
+        for row in self._stream_rows.values():
+            self._stream_rows_layout.removeWidget(row)
+            row.deleteLater()
+        self._stream_rows.clear()
         self._start_btn.setEnabled(True)
         self._stop_btn.setEnabled(False)
         self._status.showMessage("Stopped")
@@ -263,16 +334,30 @@ class ReceiverWindow(QMainWindow):
 
         snaps = rx.get_stream_snapshots()
 
-        # Pick any available context for stats labels
-        ctx = rx.context
-        if ctx:
-            self._lbl_fs.setText(f"{ctx.sample_rate_hz / 1e6:.3f} MHz")
-            self._lbl_rf.setText(f"{ctx.rf_ref_freq_hz / 1e6:.3f} MHz")
+        # Per-stream status rows — LED + fs/RF, explicitly marked "stopped"
+        # once a stream goes stale instead of lingering in a flat list
+        # indistinguishable from a still-live one.
+        last_seen     = rx.stream_last_seen()
+        now           = time.monotonic()
+        stale_cutoff  = now - STREAM_STALE_S   # matches the spectrum-curve cutoff below
+        remove_cutoff = now - 15.0             # stopped long enough to drop the row entirely
 
-        # Show all active stream IDs
-        if snaps:
-            sid_str = ", ".join(f"0x{s:08X}" for s in snaps)
-            self._lbl_sid.setText(sid_str)
+        for sid, (_iq, ctx_s) in snaps.items():
+            last = last_seen.get(sid, 0)
+            if last < remove_cutoff:
+                continue
+            if sid not in self._stream_rows:
+                row = ReceiverStreamRow(sid)
+                self._stream_rows_layout.addWidget(row)
+                self._stream_rows[sid] = row
+            self._stream_rows[sid].update_state(ctx_s, active=last >= stale_cutoff)
+
+        for sid in list(self._stream_rows):
+            last = last_seen.get(sid, 0)
+            if last < remove_cutoff:
+                row = self._stream_rows.pop(sid)
+                self._stream_rows_layout.removeWidget(row)
+                row.deleteLater()
 
         # Wait for at least one context before drawing
         if not snaps or all(c is None for _, c in snaps.values()):
@@ -282,8 +367,6 @@ class ReceiverWindow(QMainWindow):
             return
 
         # Per-stream spectra — one curve per stream ID
-        last_seen    = rx.stream_last_seen()
-        stale_cutoff = time.monotonic() - 3.0
         for sid, (iq, ctx_s) in snaps.items():
             if ctx_s is None or len(iq) == 0:
                 continue
@@ -301,6 +384,7 @@ class ReceiverWindow(QMainWindow):
             self._y_range_applied = True
 
         n_streams = len([c for _, c in snaps.values() if c is not None])
+        ctx = rx.context
         fs_str = f"{ctx.sample_rate_hz / 1e6:.3f} MHz" if ctx else "?"
         self._status.showMessage(
             f"Listening | data={rx.data_received:,} | "

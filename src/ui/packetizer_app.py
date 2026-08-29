@@ -47,6 +47,14 @@ _STREAM_COLORS = [
     (255, 100, 255),  # stream index 3+ — magenta
 ]
 
+# How long a stream may go quiet before the UI calls it inactive/stopped.
+# Must stay well above normal packet spacing (chunk_size/sample_rate) so an
+# ordinary gap between packets never looks like a stop, but otherwise as
+# short as possible -- this is a pure display debounce, not a data-path
+# timeout, and a large value here just makes the UI feel laggy when a
+# stream genuinely stops or changes.
+STREAM_STALE_S = 1.0
+
 
 def _stream_color(sid: int):
     return pg.mkPen(_STREAM_COLORS[(sid - 1) % len(_STREAM_COLORS)], width=1)
@@ -666,7 +674,7 @@ class PacketizerWindow(QMainWindow):
 
         last_seen    = agg.stream_last_seen()
         stream_ports = agg.stream_source_ports()
-        cutoff       = now - 3.0
+        cutoff       = now - STREAM_STALE_S
         port_to_sid  = {port: sid for sid, port in stream_ports.items()}
         for row in self._stream_rows:
             sid = port_to_sid.get(row.port())
@@ -690,7 +698,7 @@ class PacketizerWindow(QMainWindow):
 
         now          = time.monotonic()
         last_seen    = agg.stream_last_seen()
-        stale_cutoff = now - 3.0
+        stale_cutoff = now - STREAM_STALE_S
 
         # Build live_sids from the aggregator's authoritative port→sid mapping so
         # that display recovers immediately when a stream reconnects, without waiting

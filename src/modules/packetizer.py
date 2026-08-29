@@ -57,10 +57,19 @@ class Packetizer:
     def __init__(
         self,
         aggregator: Aggregator,
-        out_queue_size: int = 32,
+        out_queue_size: int = 128,
+        put_timeout_s: float = 0.2,
     ):
         self._aggregator      = aggregator
         self._out_queue       = queue.Queue(maxsize=out_queue_size)
+        # A transient consumer stall (Sender thread briefly descheduled, GC
+        # pause, etc.) should not permanently discard already-aggregated
+        # real IQ data. Blocking put() with a bounded timeout absorbs that
+        # instead of the old put_nowait()-and-drop, while still protecting
+        # against unbounded memory/latency growth under genuine sustained
+        # overload -- a full queue plus an expired timeout is real, lasting
+        # backpressure, not a one-off hiccup, and is still dropped.
+        self._put_timeout_s   = put_timeout_s
         self._stop_evt        = threading.Event()
         self._thread          = threading.Thread(
             target=self._run, daemon=True, name="packetizer"
@@ -191,7 +200,7 @@ class Packetizer:
                 data_bytes = self._build_data(block)
 
                 try:
-                    self._out_queue.put_nowait((ctx_bytes, data_bytes))
+                    self._out_queue.put((ctx_bytes, data_bytes), timeout=self._put_timeout_s)
                     self.packets_produced += 1
                 except queue.Full:
                     self.packets_dropped += 1
