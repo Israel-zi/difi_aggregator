@@ -31,7 +31,8 @@ import pyqtgraph as pg
 
 from modules.generator import DifiGenerator, SIGNAL_CW, SIGNAL_BW, SIGNAL_OFF, SIGNAL_PATTERN
 from ui.freq_input     import FreqInput
-from pipeline_logger   import make_run_dir, PacketLogger
+from pipeline_logger   import make_run_dir, AsyncPacketLogger as PacketLogger
+from gil_friendly_exec import run_gil_friendly, request_stop
 
 
 class TransmitterWindow(QMainWindow):
@@ -374,6 +375,11 @@ class TransmitterWindow(QMainWindow):
 
         port = self._dest_port.value()
         self._plot.setTitle(f"Transmitter Output — port {port}")
+        # Auto-center the display on the RF frequency/sample rate actually
+        # configured, instead of leaving it at the fixed 1 MHz default --
+        # unlike the Receiver's version this needs no external data, since
+        # this window already knows its own signal's real parameters.
+        self._auto_display()
         self._status.showMessage(
             f"Sending to {ip}:{port} | "
             f"stream=0x{sid:08X} | fs={fs/1e6:.2f} MHz | "
@@ -406,8 +412,18 @@ class TransmitterWindow(QMainWindow):
     def _tick(self):
         if not self._running or not self._gen:
             return
-        self._stat.setText(f"Running — {self._gen.pkt_count:,} pkts sent")
-        self._stat.setStyleSheet("color: #00cc44;")
+        errs = self._gen.send_errors
+        if errs:
+            # Real send failures at the OS level -- these packets are already
+            # in data_sent.csv (logged before dispatch) but never left this
+            # machine. Surfaced in red since the windowed EXE's console
+            # prints go to a log file the user won't see until after Stop.
+            self._stat.setText(f"Running — {self._gen.pkt_count:,} pkts sent | "
+                                f"⚠ {errs:,} sendto() FAILED")
+            self._stat.setStyleSheet("color: #ff4444;")
+        else:
+            self._stat.setText(f"Running — {self._gen.pkt_count:,} pkts sent")
+            self._stat.setStyleSheet("color: #00cc44;")
         self._update_spectrum()
 
     def _on_param_changed(self, *_):
@@ -529,19 +545,31 @@ class TransmitterWindow(QMainWindow):
     def closeEvent(self, event):
         self._stop()
         event.accept()
+        # See gil_friendly_exec.py / packetizer_app.py's identical fix --
+        # app.lastWindowClosed alone was not reliably ending the polling
+        # loop, leaving an orphaned background process after the window
+        # closed. Calling request_stop() directly here doesn't depend on
+        # that signal firing correctly under manual polling.
+        request_stop(QApplication.instance())
 
 
 def main():
     from logging_setup import setup_frozen_file_logging
     log_path = setup_frozen_file_logging("Transmitter")
 
-    pg.setConfigOptions(antialias=True)
+    # See packetizer_app.py's identical fix: antialias=True is expensive on
+    # a frequently-redrawn curve and was never actually needed here.
+    pg.setConfigOptions(antialias=False)
     app = QApplication(sys.argv)
     win = TransmitterWindow()
     if log_path:
         win._status.showMessage(f"Logging to {log_path}")
     win.show()
-    sys.exit(app.exec())
+    # See gil_friendly_exec.py -- app.exec()'s native Windows event loop
+    # was measured to starve every other thread in the process (the
+    # generator/dispatcher threads here); this polling loop avoids that.
+    app.lastWindowClosed.connect(lambda: request_stop(app))
+    sys.exit(run_gil_friendly(app))
 
 
 if __name__ == "__main__":

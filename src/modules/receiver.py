@@ -32,6 +32,7 @@ from core.difi_packet import (
     PACKET_TYPE_CONTEXT,
 )
 from pipeline_logger import wall_clock_str, sample_fingerprint
+from socket_warmup import warm_up_socket
 
 
 class DifiReceiver:
@@ -82,6 +83,14 @@ class DifiReceiver:
     def start(self):
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        # See PortListener's identical setsockopt in input_capture.py for why:
+        # the OS default UDP receive buffer is small enough that a real burst
+        # can overflow it and get silently dropped before Python ever calls
+        # recvfrom() -- invisible to every application-level counter here.
+        try:
+            self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 512 * 1024)
+        except OSError:
+            pass
         self._sock.settimeout(1.0)
         self._sock.bind((self._host, self._port))
         self._thread.start()
@@ -117,6 +126,10 @@ class DifiReceiver:
         self._stop_evt = threading.Event()
         self._sock     = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 512 * 1024)
+        except OSError:
+            pass
         self._sock.settimeout(1.0)
         self._sock.bind((self._host, self._port))
         self._thread = threading.Thread(target=self._run, daemon=True, name="receiver")
@@ -170,6 +183,15 @@ class DifiReceiver:
     # ── main loop ──────────────────────────────────────────────────────────
 
     def _run(self):
+        # See socket_warmup.py: a just-bound socket does not actually
+        # deliver inbound traffic for several seconds on this host, even
+        # though bind() itself already returned -- absorb that cost here
+        # before treating any loss as real.
+        warm_ms, leaked = warm_up_socket(self._sock, self._port)
+        print(f"[Receiver] Socket warm-up took {warm_ms:.0f} ms")
+        if leaked is not None and not self._stop_evt.is_set():
+            self._handle(leaked)
+
         while not self._stop_evt.is_set():
             try:
                 data, _ = self._sock.recvfrom(self.MAX_UDP_SIZE)

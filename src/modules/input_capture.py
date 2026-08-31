@@ -34,6 +34,8 @@ from core.difi_packet import (
     PACKET_TYPE_CONTEXT,
 )
 from pipeline_logger import wall_clock_str, sample_fingerprint
+from thread_priority import boost_current_thread, THREAD_PRIORITY_TIME_CRITICAL, THREAD_PRIORITY_HIGHEST
+from socket_warmup import warm_up_socket
 
 
 # ─────────────────────────────────────────────
@@ -82,6 +84,28 @@ class PortListener(threading.Thread):
         # ever finding out why no packets are arriving.
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        # Windows' default UDP receive buffer is small (measured 64KB on this
+        # host) -- some headroom above that default is worth having so a
+        # brief burst doesn't get dropped outright. But this must stay
+        # modest: this thread's actual sustained drain rate (recvfrom -> parse
+        # -> enqueue) is itself limited to roughly 250-300 pkt/s under GIL
+        # contention with the several other threads in this process (measured
+        # directly, independent of buffer size) -- a large buffer does NOT
+        # fix that ceiling, it just lets packets queue in the KERNEL, unseen,
+        # instead of being dropped. A previous 8MB setting here produced
+        # exactly that: measured hold_ms climbing smoothly to a steady 7-9
+        # SECONDS of latency (~2046 queued packets / ~275 pkt/s drain rate),
+        # while every application-level metric stayed healthy because it
+        # only starts counting after a packet is already out of the kernel.
+        # That's worse than dropping for a live display -- stale-but-present
+        # beats absent, but not by 8 seconds. Keep this bounded to roughly
+        # a few hundred milliseconds of true burst absorption at the REAL
+        # drain rate, not a multi-second reservoir: 512KB / ~4.1KB per
+        # packet /~275 pkt/s drain =~ 0.45s worst-case queuing delay.
+        try:
+            self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 512 * 1024)
+        except OSError:
+            pass   # best-effort -- some platforms/permissions cap this; not fatal
         self._sock.settimeout(self.timeout)
         try:
             self._sock.bind((self.host, self.port))
@@ -106,6 +130,26 @@ class PortListener(threading.Thread):
                 pass
 
     def run(self):
+        # See thread_priority.py: this is the single most latency-critical
+        # thread in the whole pipeline -- every millisecond it isn't
+        # scheduled to call recvfrom() is a millisecond the OS's UDP
+        # receive buffer isn't being drained, and on a CPU-constrained
+        # machine that's exactly what causes real datagrams to be dropped
+        # before this process ever sees them. Best-effort; a failed boost
+        # (non-Windows, or the call itself failing) never blocks capture.
+        boost_current_thread(THREAD_PRIORITY_TIME_CRITICAL)
+
+        # See socket_warmup.py: a just-bound socket does not actually
+        # deliver inbound traffic for several seconds on this host, even
+        # though bind() itself already returned. Any real packets sent to
+        # this port before this finishes are silently dropped -- absorb
+        # that cost here, before declaring this port ready, rather than
+        # losing real acquisition data to it.
+        warm_ms, leaked = warm_up_socket(self._sock, self.port)
+        print(f"[Capture] Port {self.port} socket warm-up took {warm_ms:.0f} ms")
+        if leaked is not None and not self._stop_evt.is_set():
+            self._parse_and_enqueue(leaked)
+
         print(f"[Capture] Listening on {self.host}:{self.port}")
 
         while not self._stop_evt.is_set():
@@ -231,6 +275,14 @@ class InputCapture:
             listener.stop()
         for listener in self._listeners:
             listener.join(timeout=2.0)
+            if listener.is_alive():
+                # A listener stuck here keeps its socket bound and keeps
+                # running in the background, invisible, while the next
+                # Listen cycle creates a brand new set on top of it -- a
+                # plausible explanation for performance degrading across
+                # repeated Stop/Start cycles within one long-running session.
+                print(f"[Capture] WARNING: listener on port {listener.port} "
+                      f"did not stop within 2s -- still running")
         print("[Capture] All listeners stopped")
 
     def add_port(self, port: int, host: str = "0.0.0.0"):
@@ -341,7 +393,29 @@ class JitterBuffer:
     def stop(self):
         self._stop_evt.set()
         self._thread.join(timeout=3.0)
-        print(f"[JitterBuffer] Stopped | gaps detected: {self.gaps_detected}")
+        if self._thread.is_alive():
+            print("[JitterBuffer] WARNING: worker thread did not stop within 3s -- still running")
+        # _run()'s loop exits as soon as _stop_evt is set, without draining
+        # whatever's still sitting in the per-stream heaps waiting out its
+        # hold window -- every one of those packets was real, already-
+        # captured data that would otherwise be silently discarded here,
+        # invisible to every counter (confirmed directly: at 1000 pkt/s with
+        # a 200ms hold, capture-stage receive count ran ~900 packets ahead
+        # of what the Aggregator ever emitted, entirely explained by this).
+        # Flush them out now, still in timestamp order per stream, so a
+        # stop mid-flight loses nothing that was actually captured.
+        flushed = 0
+        with self._lock:
+            for sid, heap in self._heaps.items():
+                while heap:
+                    _, _, _, captured = heapq.heappop(heap)
+                    try:
+                        self._out_queue.put_nowait(captured)
+                        flushed += 1
+                    except queue.Full:
+                        self.gaps_detected += 1
+            self._heaps.clear()
+        print(f"[JitterBuffer] Stopped | gaps detected: {self.gaps_detected} | flushed on stop: {flushed}")
 
     def get(self, timeout: float = 0.1):
         """Drop-in replacement for InputCapture.get()."""
@@ -358,6 +432,10 @@ class JitterBuffer:
     # ── internal ──────────────────────────────────────────────────────────
 
     def _run(self):
+        # High, not time-critical: still above normal (so it doesn't fall
+        # behind Packetizer/GUI work under CPU contention), but the port
+        # listeners themselves come first -- see thread_priority.py.
+        boost_current_thread(THREAD_PRIORITY_HIGHEST)
         while not self._stop_evt.is_set():
             try:
                 captured = self._capture.get(timeout=0.02)
@@ -366,7 +444,13 @@ class JitterBuffer:
                         try:
                             self._out_queue.put_nowait(captured)
                         except queue.Full:
-                            pass
+                            # Was previously silently discarded with no
+                            # counter at all -- pass-through mode's own
+                            # gaps_detected stat only ever incremented on
+                            # the hold-mode _drain() path, so this specific
+                            # drop point was completely invisible even in
+                            # memory, let alone in any log.
+                            self.gaps_detected += 1
                     else:
                         self._push(captured)
                 if self._enabled:

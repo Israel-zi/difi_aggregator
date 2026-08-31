@@ -28,7 +28,8 @@ import pyqtgraph as pg
 
 from modules.receiver import DifiReceiver
 from ui.freq_input    import FreqInput
-from pipeline_logger  import make_run_dir, PacketLogger
+from pipeline_logger  import make_run_dir, AsyncPacketLogger as PacketLogger
+from gil_friendly_exec import run_gil_friendly, request_stop
 
 
 _STREAM_COLORS = [
@@ -310,6 +311,14 @@ class ReceiverWindow(QMainWindow):
         self._stop_btn.setEnabled(True)
         self._timer.start()
         self._apply_range()
+        # Auto-center the display on whatever RF frequency the incoming
+        # signal actually reports, instead of leaving it at the fixed
+        # 2.5 MHz default -- a real signal well outside that default span
+        # (any RF far from a few MHz) would otherwise show nothing at all
+        # unless the user manually pressed Auto first. _auto_display()
+        # already retries every 500ms until a context packet arrives, so
+        # calling it here is safe even before any data has shown up yet.
+        self._auto_display()
         self._status.showMessage(f"Listening on 0.0.0.0:{port} | log: {run_dir}")
 
     def _stop(self):
@@ -456,19 +465,30 @@ class ReceiverWindow(QMainWindow):
     def closeEvent(self, event):
         self._stop()
         event.accept()
+        # See gil_friendly_exec.py / packetizer_app.py's identical fix --
+        # app.lastWindowClosed alone was not reliably ending the polling
+        # loop, leaving an orphaned background process after the window
+        # closed. Calling request_stop() directly here doesn't depend on
+        # that signal firing correctly under manual polling.
+        request_stop(QApplication.instance())
 
 
 def main():
     from logging_setup import setup_frozen_file_logging
     log_path = setup_frozen_file_logging("Receiver")
 
-    pg.setConfigOptions(antialias=True)
+    # See packetizer_app.py's identical fix.
+    pg.setConfigOptions(antialias=False)
     app = QApplication(sys.argv)
     win = ReceiverWindow()
     if log_path:
         win._status.showMessage(f"Logging to {log_path}")
     win.show()
-    sys.exit(app.exec())
+    # See gil_friendly_exec.py -- app.exec()'s native Windows event loop
+    # was measured to starve every other thread in the process; this
+    # polling loop avoids that.
+    app.lastWindowClosed.connect(lambda: request_stop(app))
+    sys.exit(run_gil_friendly(app))
 
 
 if __name__ == "__main__":

@@ -16,6 +16,7 @@ IEEE-ISTO Std 4900-2021 Figure 7:
 """
 
 import os
+import socket
 import sys
 import queue
 import time
@@ -51,29 +52,58 @@ class Packetizer:
     Parameters
     ----------
     aggregator     : Aggregator instance to read chunks from
-    out_queue_size : max depth of the output queue (should be >= expected
-                     streams × burst depth)
+    dest_host, dest_port : when both given, this thread sends each built
+                     packet directly over its own UDP socket instead of
+                     queueing it for a separate Sender thread/object to
+                     drain. That's a deliberate simplification, not just a
+                     style choice: an isolated A/B test on the real
+                     production app found receive-side packet loss roughly
+                     5x worse with the Packetizer+Sender pair running versus
+                     Packetizer alone (10% vs 50%+, same everything else) --
+                     evidence that each additional thread sharing this
+                     process's GIL measurably starves the OTHER threads
+                     (the port listeners, critically) of the CPU time they
+                     need to keep draining the OS's UDP receive buffer
+                     promptly. Sender was strictly downstream of Packetizer
+                     with nothing else feeding it, so folding its one job
+                     (take what Packetizer just built, send it) directly
+                     into Packetizer's own thread removes a full thread and
+                     a full queue hand-off for zero functional change.
+                     When dest_host/dest_port are omitted (e.g. the
+                     self-test below, or any other caller that wants to
+                     pull packets out itself), the original queue-based
+                     .get() interface still works exactly as before.
+    out_queue_size : max depth of the output queue, only relevant when NOT
+                     using direct-send (dest_host/dest_port omitted)
     """
 
     def __init__(
         self,
         aggregator: Aggregator,
-        out_queue_size: int = 128,
-        put_timeout_s: float = 0.2,
-        hold_log             = None,   # pipeline_logger.PacketLogger, or None — shared with Aggregator
-        sent_log             = None,   # pipeline_logger.PacketLogger, or None
+        dest_host: str        = None,
+        dest_port: int        = None,
+        out_queue_size: int   = 128,
+        put_timeout_s: float  = 0.2,
+        hold_log              = None,   # pipeline_logger.PacketLogger, or None — shared with Aggregator
+        sent_log              = None,   # pipeline_logger.PacketLogger, or None
     ):
         self._aggregator      = aggregator
         self._hold_log        = hold_log
         self._sent_log        = sent_log
-        self._out_queue       = queue.Queue(maxsize=out_queue_size)
-        # A transient consumer stall (Sender thread briefly descheduled, GC
-        # pause, etc.) should not permanently discard already-aggregated
-        # real IQ data. Blocking put() with a bounded timeout absorbs that
-        # instead of the old put_nowait()-and-drop, while still protecting
-        # against unbounded memory/latency growth under genuine sustained
-        # overload -- a full queue plus an expired timeout is real, lasting
-        # backpressure, not a one-off hiccup, and is still dropped.
+        self._direct_send     = dest_host is not None and dest_port is not None
+        self._dest            = (dest_host, dest_port) if self._direct_send else None
+        self._sock            = socket.socket(socket.AF_INET, socket.SOCK_DGRAM) if self._direct_send else None
+        self._out_queue       = None if self._direct_send else queue.Queue(maxsize=out_queue_size)
+        # A transient consumer stall (in queue mode -- Sender-equivalent
+        # briefly descheduled, GC pause, etc.) should not permanently
+        # discard already-aggregated real IQ data. Blocking put() with a
+        # bounded timeout absorbs that instead of the old
+        # put_nowait()-and-drop, while still protecting against unbounded
+        # memory/latency growth under genuine sustained overload -- a full
+        # queue plus an expired timeout is real, lasting backpressure, not
+        # a one-off hiccup, and is still dropped. Not used in direct-send
+        # mode -- there's no queue to fill, sendto() either succeeds or
+        # raises immediately.
         self._put_timeout_s   = put_timeout_s
         self._stop_evt        = threading.Event()
         self._thread          = threading.Thread(
@@ -90,20 +120,40 @@ class Packetizer:
 
         self.packets_produced = 0
         self.packets_dropped  = 0
+        # Only meaningful in direct-send mode -- mirrors the old DifiSender's
+        # stats so existing displays (e.g. "Pkts forwarded") keep working
+        # unchanged by just reading these instead.
+        self.packets_sent     = 0
+        self.bytes_sent       = 0
 
     # ── lifecycle ──────────────────────────────────────────────────────────
 
     def start(self):
         self._thread.start()
-        print("[Packetizer] Started — forwarding original stream IDs")
+        if self._direct_send:
+            print(f"[Packetizer] Started — forwarding original stream IDs | "
+                  f"dest={self._dest[0]}:{self._dest[1]}")
+        else:
+            print("[Packetizer] Started — forwarding original stream IDs")
 
     def stop(self):
         self._stop_evt.set()
         self._thread.join(timeout=3.0)
+        if self._thread.is_alive():
+            print("[Packetizer] WARNING: worker thread did not stop within 3s -- still running")
+        if self._sock is not None:
+            try:
+                self._sock.close()
+            except OSError:
+                pass
         print(f"[Packetizer] Stopped | packets produced: {self.packets_produced}")
 
     def get(self, timeout: float = 0.1):
-        """Retrieve next (context_bytes_or_None, data_bytes). Returns None on timeout."""
+        """Retrieve next (context_bytes_or_None, data_bytes). Returns None on
+        timeout, or always None in direct-send mode (nothing to retrieve --
+        packets already went out over this object's own socket)."""
+        if self._out_queue is None:
+            return None
         try:
             return self._out_queue.get(timeout=timeout)
         except queue.Empty:
@@ -115,12 +165,15 @@ class Packetizer:
 
     def flush_queue(self):
         """Drain the output queue and reset context timers so the next chunk
-        sends fresh context packets for all streams to the receiver."""
-        while True:
-            try:
-                self._out_queue.get_nowait()
-            except queue.Empty:
-                break
+        sends fresh context packets for all streams to the receiver. In
+        direct-send mode there's no queue to drain, but the timer reset
+        still applies."""
+        if self._out_queue is not None:
+            while True:
+                try:
+                    self._out_queue.get_nowait()
+                except queue.Empty:
+                    break
         self._last_ctx_times.clear()
 
     # ── per-stream sequence helpers ────────────────────────────────────────
@@ -208,6 +261,27 @@ class Packetizer:
                     self._last_ctx_times[sid] = now
 
                 data_bytes, seq = self._build_data(block)
+
+                if self._direct_send:
+                    try:
+                        if ctx_bytes:
+                            self._sock.sendto(ctx_bytes, self._dest)
+                            self.bytes_sent += len(ctx_bytes)
+                        self._sock.sendto(data_bytes, self._dest)
+                        self.bytes_sent += len(data_bytes)
+                        self.packets_produced += 1
+                        self.packets_sent += 1
+                        if self._sent_log is not None:
+                            first_i, first_q = sample_fingerprint(block.samples)
+                            self._sent_log.log(
+                                wall_clock_str(), f"0x{sid:08X}", "DATA", seq,
+                                block.data_ts_int, block.data_ts_frac, len(block.samples),
+                                first_i, first_q,
+                            )
+                    except OSError as exc:
+                        self.packets_dropped += 1
+                        print(f"[Packetizer] sendto() failed: {exc}")
+                    continue
 
                 try:
                     # put_nowait, not a blocking put(timeout=...) -- same reasoning

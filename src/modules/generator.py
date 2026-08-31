@@ -106,6 +106,11 @@ class DifiGenerator:
         self._last_ctx_time = 0.0   # 0 ensures context is sent before the first data packet
         self._packet_logger = packet_logger
 
+        # Data-packet DIFI timestamps are derived from this fixed epoch +
+        # cumulative sample count -- see _next_data_timestamp().
+        self._ts_epoch        = None
+        self._ts_sample_index = 0
+
         self._build_bw_filter()
 
     # ── signal generation ──────────────────────────────────────────────────
@@ -222,8 +227,45 @@ class DifiGenerator:
             tsf                 = TSF_REAL_TIME,
         ).to_bytes()
 
+    def _next_data_timestamp(self, n_samples: int) -> tuple:
+        """Compute this data packet's DIFI timestamp analytically from a
+        fixed epoch plus cumulative sample count, instead of re-querying
+        the OS clock (now_timestamp() -> time.time()) once per packet.
+
+        Measured directly on this machine: time.time()'s actual update
+        granularity is ~1-1.6ms, not the picosecond precision the DIFI
+        timestamp field's format implies. At any packet rate anywhere near
+        that (1000 pkt/s is exactly 1 packet/ms), calling it per packet
+        produces frequent IDENTICAL timestamps across genuinely different,
+        sequential sample blocks -- confirmed as the root cause of real,
+        measured cross-packet reordering downstream: the Combiner's
+        StreamBuffer groups packets by exact (ts_int, ts_frac) match, so
+        tied timestamps get bundled into one reassembly group, and when
+        that bundle later has to be split across multiple output chunks,
+        the synthetic sub-timestamps computed for the split portions don't
+        always preserve the original packets' true order (16-18% of
+        consecutive-packet transitions measured out of order at the
+        Receiver, despite zero sequence gaps -- nothing lost, but not
+        correctly time-ordered either).
+
+        Deriving each timestamp as (epoch + sample_index / sample_rate_hz)
+        instead keeps full TSF_REAL_TIME (absolute UTC) semantics -- still
+        a real wall-clock-anchored time -- while being monotonic and
+        unique per packet by construction: consecutive packets always
+        differ by exactly samples_per_pkt / sample_rate_hz seconds, which
+        arithmetic can represent distinctly regardless of how coarsely the
+        OS clock itself updates.
+        """
+        if self._ts_epoch is None:
+            self._ts_epoch = time.time()
+        t = self._ts_epoch + self._ts_sample_index / self.sample_rate_hz
+        self._ts_sample_index += n_samples
+        ts_int = int(t)
+        ts_frac = int((t - ts_int) * 1e12)
+        return ts_int, ts_frac
+
     def _make_data(self, samples: np.ndarray) -> bytes:
-        ts_int, ts_frac = now_timestamp()
+        ts_int, ts_frac = self._next_data_timestamp(len(samples))
         seq = self._next_seq("_data_seq")
         if self._packet_logger is not None:
             first_i, first_q = sample_fingerprint(samples)
@@ -345,6 +387,13 @@ class DifiGenerator:
     def pkt_count(self) -> int:
         return self._pkt_count
 
+    @property
+    def send_errors(self) -> int:
+        """Count of packets logged as 'sent' that actually failed at sendto()
+        -- see DelayedDispatcher. Non-zero here means data_sent.csv is
+        overcounting what actually left this machine."""
+        return self._dispatcher.send_errors
+
     def close(self):
         self._running = False
         self._dispatcher.stop()
@@ -352,6 +401,10 @@ class DifiGenerator:
             self._sock.close()
         except OSError:
             pass
+        if self._dispatcher.send_errors:
+            print(f"[Generator] stream=0x{self.stream_id:08X} | "
+                  f"WARNING: {self._dispatcher.send_errors} packet(s) logged as sent "
+                  f"but failed at sendto() -- see earlier [Generator] sendto() lines")
 
 
 if __name__ == "__main__":

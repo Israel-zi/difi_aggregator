@@ -38,6 +38,7 @@ if not getattr(sys, 'frozen', False):
 from core.difi_packet import DifiDataPacket, DifiContextPacket
 from modules.input_capture import CapturedPacket, InputCapture
 from pipeline_logger import wall_clock_str, sample_fingerprint
+from thread_priority import boost_current_thread, THREAD_PRIORITY_HIGHEST
 
 
 def _advance_ts(ts_int: int, ts_frac: int, n_samples: int, sample_rate_hz: float) -> tuple:
@@ -135,7 +136,8 @@ class StreamBuffer:
     """
 
     def __init__(self, stream_id: int, max_samples: int = 0,
-                 group_timeout_s: float = 0.05, group_log=None):
+                 group_timeout_s: float = 0.05, group_log=None,
+                 target_latency_s: float = 0.2):
         self.stream_id      = stream_id
         self._packets       = deque()     # (ts_int, ts_frac, np.ndarray, first_received_at) per CLOSED group
         self._total         = 0           # total samples buffered across closed groups
@@ -143,7 +145,23 @@ class StreamBuffer:
         self.last_update    = time.monotonic()
         # Hard cap: when > 0, oldest closed groups are dropped once _total exceeds
         # this. Keeps pipeline latency bounded at max_samples / sample_rate seconds.
-        self._max_samples   = max_samples
+        #
+        # This is sized off the caller's ASSUMED sample_rate_hz at construction
+        # time, before any real context packet has arrived -- if the actual
+        # stream turns out to run much faster (a real, measured case: 1.024
+        # MSps vs. an assumed 48 kHz default, a 21x difference), that cap
+        # represents only a few tens of milliseconds of true buffering
+        # headroom instead of the intended few hundred, and any jitter/hold
+        # near that scale silently evicts whole groups of real, already-
+        # captured data with zero counter or log anywhere. add_context()
+        # below recomputes this once the real rate is known.
+        self._max_samples      = max_samples
+        self._target_latency_s = target_latency_s
+        # Groups evicted here were real, successfully-captured data that
+        # arrived too late relative to this cap -- previously not counted
+        # anywhere at all.
+        self.groups_dropped_capacity = 0
+        self.samples_dropped_capacity = 0
         # DIFI timestamp of the most recently emitted chunk (set by consume()).
         self.data_ts_int    = 0
         self.data_ts_frac   = 0
@@ -200,6 +218,14 @@ class StreamBuffer:
         if self._open_ts is not None and (time.monotonic() - self._open_last_seen) >= self._group_timeout_s:
             self._close_open_group("TIMEOUT")
 
+    def force_close(self):
+        """Unconditionally close the open group regardless of idle time --
+        used only when the pipeline is shutting down, so whatever real data
+        arrived most recently isn't left invisible to ready()/consume()
+        just because it hasn't been quiet long enough yet."""
+        if self._open_ts is not None:
+            self._close_open_group("SHUTDOWN")
+
     def _close_open_group(self, reason: str):
         ts_int, ts_frac = self._open_ts
         seqs    = self._open_seqs
@@ -232,10 +258,21 @@ class StreamBuffer:
         while self._max_samples and self._total > self._max_samples and len(self._packets) > 1:
             _, _, arr, _ = self._packets.popleft()
             self._total -= len(arr)
+            self.groups_dropped_capacity += 1
+            self.samples_dropped_capacity += len(arr)
 
     def add_context(self, pkt: DifiContextPacket):
         self.context     = pkt
         self.last_update = time.monotonic()
+        # The backlog cap was sized off an assumed rate at buffer-creation
+        # time, before any context packet had arrived. Now that the real
+        # rate is known, widen the cap if it turns out the stream runs
+        # faster than assumed -- never shrink it, only grow to cover
+        # whatever the true rate demands for the configured latency budget.
+        if pkt.sample_rate_hz > 0:
+            real_cap = int(pkt.sample_rate_hz * self._target_latency_s * 3)
+            if real_cap > self._max_samples:
+                self._max_samples = real_cap
 
     def ready(self, chunk_size: int) -> bool:
         return self._total >= chunk_size and self.context is not None
@@ -431,8 +468,19 @@ class Aggregator:
     def stop(self):
         self._stop_evt.set()
         self._thread.join(timeout=3.0)
+        if self._thread.is_alive():
+            # join() timing out silently here would leave this thread running
+            # in the background, invisible, competing for the GIL with
+            # whatever the NEXT Listen cycle creates -- exactly the kind of
+            # leak that would explain performance degrading across repeated
+            # Stop/Start cycles within one long-running Combiner session.
+            print("[Aggregator] WARNING: worker thread did not stop within 3s -- still running")
+        cap_drops   = sum(b.groups_dropped_capacity for b in self._buffers.values())
+        cap_samples = sum(b.samples_dropped_capacity for b in self._buffers.values())
         print(f"[Aggregator] Stopped | chunks emitted: {self.chunks_emitted} | "
-              f"deadline misses: {self.deadline_misses}")
+              f"deadline misses: {self.deadline_misses} | "
+              f"output-queue-full drops: {self.packets_dropped} | "
+              f"capacity-cap drops: {cap_drops} groups ({cap_samples} samples)")
 
     def get(self, timeout: float = 0.1):
         """Retrieve the next AggregatedChunk. Returns None on timeout."""
@@ -444,6 +492,11 @@ class Aggregator:
     # ── main loop ──────────────────────────────────────────────────────────
 
     def _run(self):
+        # See thread_priority.py -- this thread drains InputCapture's own
+        # queue; keeping it ahead of Packetizer/GUI under CPU contention
+        # prevents that queue backing up and, upstream, InputCapture
+        # dropping packets it never gets asked to enqueue in time for.
+        boost_current_thread(THREAD_PRIORITY_HIGHEST)
         while not self._stop_evt.is_set():
             # Fully drain whatever has already arrived before judging
             # readiness — draining only one packet per iteration would let
@@ -472,9 +525,33 @@ class Aggregator:
             while self._maybe_emit():
                 pass
 
-    def _maybe_emit(self) -> bool:
+        # Shutting down: drain whatever arrived in the final moments (e.g.
+        # JitterBuffer's own stop() just flushed its held packets into our
+        # input queue), force-close any still-open reassembly group instead
+        # of waiting for its normal idle timeout, and force-emit anything
+        # that's ready without waiting out target_latency_ms for stragglers
+        # -- otherwise real, already-buffered data for a stream that just
+        # hadn't waited its full grace period yet is silently abandoned
+        # here. Measured directly: this was a real, repeatable loss source
+        # in multi-stream runs, invisible to every other counter.
+        captured = self._capture.get(timeout=0.02)
+        while captured is not None:
+            self._handle_packet(captured)
+            captured = self._capture.get(timeout=0.0)
+        for buf in self._buffers.values():
+            buf.force_close()
+        while self._maybe_emit(force=True):
+            pass
+
+    def _maybe_emit(self, force: bool = False) -> bool:
         """Emit one AggregatedChunk if a full cycle is ready, or a partial
-        one has waited past target_latency_ms. Returns True iff it emitted."""
+        one has waited past target_latency_ms. Returns True iff it emitted.
+
+        force=True skips the "wait for stragglers" grace period entirely --
+        used only when shutting down, so a stream that was already ready
+        and simply hadn't waited out its full target_latency_ms yet doesn't
+        have its real, already-buffered data abandoned just because the
+        pipeline stopped a few milliseconds before that clock ran out."""
         stream_ids = self._cycle_stream_ids()
         if not stream_ids:
             self._pending_since = None
@@ -491,7 +568,7 @@ class Aggregator:
         if self._pending_since is None:
             self._pending_since = now
 
-        if ready < stream_ids and (now - self._pending_since) < self._target_latency_s:
+        if not force and ready < stream_ids and (now - self._pending_since) < self._target_latency_s:
             return False   # still within budget — give the stragglers a chance
 
         self._emit_cycle(stream_ids, ready)
@@ -518,6 +595,7 @@ class Aggregator:
             self._buffers[stream_id] = StreamBuffer(
                 stream_id, max_samples=max_samples,
                 group_timeout_s=self._group_timeout_s, group_log=self._group_log,
+                target_latency_s=self._target_latency_s,
             )
             self._stream_ports[stream_id] = captured.source_port
             if self._expected is None:

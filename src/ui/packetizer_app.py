@@ -3,15 +3,33 @@ packetizer_app.py
 -----------------
 DIFI Aggregator — Combiner GUI.
 
-Two-phase operation:
-  ▶ Listen   — starts InputCapture + JitterBuffer + Aggregator (spectrum visible)
-  ▶ Forward  — additionally starts Packetizer + Sender (data flows to Receiver VM)
-  ■ Stop     — stops everything
+This window is a thin control panel only — it never touches a UDP socket
+or an aggregation buffer itself. Pressing Listen spawns the actual packet
+pipeline (InputCapture + JitterBuffer + Aggregator + Packetizer) in a
+SEPARATE OS PROCESS (see combiner_worker.py) and talks to it over
+multiprocessing.Queue. Rate-sweep A/B testing found that running those
+worker threads in-process alongside this Qt window hit a hard throughput
+ceiling around 2000-2400 pkt/s, while the identical threads run with no Qt
+involved at all stayed lossless past 4000 pkt/s -- so the fix is to not
+share a process with Qt at all, not to keep tuning around it.
 
-Stream rows auto-discover which stream ID arrives on each configured port.
-Per-row checkboxes:
-  Live — show/hide this stream's spectrum curve independently
-  Fwd  — include/exclude this stream from forwarding to the Receiver
+This also means there is no live per-packet/per-chunk stats display here
+any more -- that data lives in the worker process, and the whole point is
+not adding a channel that pulls it back out every few hundred ms. The CSV
+logs (written by the worker, path shown in the status bar) are the
+source of truth for what happened during a run.
+
+Two-phase operation:
+  ▶ Listen   — starts the worker process, which starts InputCapture +
+               JitterBuffer + Aggregator
+  ▶ Forward  — tells the worker to additionally start Packetizer (data
+               flows to the Receiver)
+  ■ Stop     — tells the worker to stop everything and exits its process
+
+Stream rows configure which ports to listen on. Each row's Fwd checkbox
+selects whether packets arriving on that port are forwarded — filtering is
+by port (what this window actually knows), translated to the discovered
+stream ID inside the worker process.
 """
 
 import os
@@ -22,84 +40,40 @@ if not getattr(sys, 'frozen', False):
     if _src not in sys.path:
         sys.path.insert(0, _src)
 
-import time
-import numpy as np
+import multiprocessing
+import queue as _queue
 
 from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QGroupBox, QStatusBar,
-    QLineEdit, QSpinBox, QDoubleSpinBox, QCheckBox, QSplitter,
+    QLineEdit, QSpinBox, QCheckBox,
 )
-import pyqtgraph as pg
 
-from modules.input_capture import InputCapture, JitterBuffer
-from modules.aggregator    import Aggregator
-from modules.packetizer    import Packetizer
-from modules.sender        import DifiSender
-from ui.freq_input         import FreqInput
-from pipeline_logger       import make_run_dir, PacketLogger
-
-
-_STREAM_COLORS = [
-    (100, 220, 255),  # stream index 0 — cyan
-    (255, 170,  50),  # stream index 1 — orange
-    (100, 255, 100),  # stream index 2 — lime
-    (255, 100, 255),  # stream index 3+ — magenta
-]
-
-# How long a stream may go quiet before the UI calls it inactive/stopped.
-# Must stay well above normal packet spacing (chunk_size/sample_rate) so an
-# ordinary gap between packets never looks like a stop, but otherwise as
-# short as possible -- this is a pure display debounce, not a data-path
-# timeout, and a large value here just makes the UI feel laggy when a
-# stream genuinely stops or changes.
-STREAM_STALE_S = 1.0
-
-
-def _stream_color(sid: int):
-    return pg.mkPen(_STREAM_COLORS[(sid - 1) % len(_STREAM_COLORS)], width=1)
-
-
-def _stream_fft(iq, ctx, seg_len: int = 1024):
-    """Single-window Hann FFT magnitude spectrum for one IQ buffer."""
-    w     = np.hanning(seg_len)
-    w_amp = float(np.sum(w))
-    n     = min(len(iq), seg_len)
-    seg   = iq[-n:].copy()
-    if n < seg_len:
-        seg = np.pad(seg, (0, seg_len - n))
-    X      = np.fft.fftshift(np.fft.fft(seg * w))
-    mag_db = 20.0 * np.log10(np.abs(X) / w_amp + 1e-7)
-    freqs  = np.fft.fftshift(
-        np.fft.fftfreq(seg_len, d=1.0 / ctx.sample_rate_hz)
-    ) + ctx.rf_ref_freq_hz
-    return freqs, mag_db
+from pipeline_logger    import make_run_dir
+from combiner_worker    import worker_main
+from gil_friendly_exec  import run_gil_friendly, request_stop
 
 
 class StreamRow(QWidget):
     """
     One listen-stream row.
-    Layout: [#] Port:[spinbox] [stream-id] [●led] [Live☑] [Fwd☑] [−]
+    Layout: [#] Port:[spinbox] [Fwd☑] [−]
 
     Signals
     -------
     removed        — user clicked the remove button
     filter_changed — Fwd checkbox toggled (forwarding filter)
-    live_changed   — Live checkbox toggled (spectrum display)
     """
 
     removed        = Signal(object)
     filter_changed = Signal()
-    live_changed   = Signal()
 
     def __init__(self, index: int, default_port: int, parent=None):
         super().__init__(parent)
         lay = QHBoxLayout(self)
         lay.setContentsMargins(2, 2, 2, 2)
         lay.setSpacing(6)
-
-        self._sid_val: int | None = None
 
         self._idx_lbl = QLabel(f"{index}")
         self._idx_lbl.setFixedWidth(18)
@@ -117,26 +91,22 @@ class StreamRow(QWidget):
         self._sid_lbl.setFixedWidth(120)
         lay.addWidget(self._sid_lbl)
 
-        # Activity LED — auto-updated, not user-interactive
+        # Activity LED -- driven by a lightweight heartbeat from the worker
+        # process (~1/s, just port->stream-id/active booleans, not a full
+        # stats poll), not the earlier per-tick Aggregator-state query that
+        # ran in the GUI process.
         self._led = QLabel("●")
         self._led.setStyleSheet("color: #444444; font-size: 18px;")
         self._led.setFixedWidth(22)
         lay.addWidget(self._led)
 
-        # Live checkbox — controls spectrum display
-        self._live_cb = QCheckBox()
-        self._live_cb.setChecked(True)
-        self._live_cb.setEnabled(False)
-        self._live_cb.setToolTip("Show / hide this stream's spectrum curve")
-        self._live_cb.setFixedWidth(36)
-        self._live_cb.stateChanged.connect(lambda _: self.live_changed.emit())
-        lay.addWidget(self._live_cb)
-
-        # Fwd checkbox — controls forwarding to Receiver
+        # Fwd checkbox — controls forwarding to Receiver. Always enabled:
+        # filtering is by port, decided up front, not by the stream ID
+        # this row's LED/label display (which just reflects what the
+        # worker last reported, for operator visibility).
         self._fwd_cb = QCheckBox()
         self._fwd_cb.setChecked(True)
-        self._fwd_cb.setEnabled(False)
-        self._fwd_cb.setToolTip("Forward this stream to the Receiver VM")
+        self._fwd_cb.setToolTip("Forward packets arriving on this port to the Receiver")
         self._fwd_cb.setFixedWidth(36)
         self._fwd_cb.stateChanged.connect(lambda _: self.filter_changed.emit())
         lay.addWidget(self._fwd_cb)
@@ -157,43 +127,25 @@ class StreamRow(QWidget):
     def port(self) -> int:
         return self._port.value()
 
-    def stream_id(self) -> int | None:
-        return self._sid_val
+    def forwarded_port(self) -> int | None:
+        """Return this row's port if Fwd is checked, else None."""
+        return self._port.value() if self._fwd_cb.isChecked() else None
 
-    def set_stream_id(self, sid: int):
-        if sid != self._sid_val:
-            self._sid_val = sid
+    def set_stream_id(self, sid: int | None):
+        if sid is None:
+            self._sid_lbl.setText("(waiting…)")
+            self._sid_lbl.setStyleSheet("color: #666666; font-size: 11px;")
+        else:
             self._sid_lbl.setText(f"0x{sid:08X}")
             self._sid_lbl.setStyleSheet("color: #aaaaaa; font-size: 11px;")
-            self._fwd_cb.setEnabled(True)
-            self._live_cb.setEnabled(True)
 
     def set_active(self, active: bool):
         color = "#00cc44" if active else "#444444"
         self._led.setStyleSheet(f"color: {color}; font-size: 18px;")
 
-    def is_live(self) -> bool:
-        """True when the Live checkbox is checked (show spectrum curve)."""
-        return self._live_cb.isChecked()
-
-    def forwarded_stream_id(self) -> int | None:
-        """Return stream ID if Fwd is checked and stream is discovered, else None."""
-        if self._fwd_cb.isChecked() and self._sid_val is not None:
-            return self._sid_val
-        return None
-
-    def reset_stream_id(self):
-        """Clear the discovered stream ID — row goes back to '(waiting…)' state."""
-        self._sid_val = None
-        self._sid_lbl.setText("(waiting…)")
-        self._sid_lbl.setStyleSheet("color: #666666; font-size: 11px;")
-        self._live_cb.setEnabled(False)
-        self._fwd_cb.setEnabled(False)
-
     def set_locked(self, locked: bool):
         self._port.setEnabled(not locked)
-        # Remove button always stays enabled — rows can be removed while listening.
-        # Live and Fwd checkboxes always stay unlocked too.
+        # Remove button and Fwd checkbox always stay enabled while listening.
 
 
 class PacketizerWindow(QMainWindow):
@@ -201,10 +153,12 @@ class PacketizerWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("DIFI Combiner")
-        self.setMinimumSize(1200, 720)
-        self._listening   = False   # capture + aggregator running
-        self._forwarding  = False   # packetizer + sender running
-        self._modules     = {}
+        self.setMinimumSize(900, 480)
+        self._listening   = False   # worker process is up and capturing
+        self._forwarding  = False   # worker is also forwarding to Receiver
+        self._proc        = None    # multiprocessing.Process (worker)
+        self._cmd_q       = None
+        self._status_q    = None
         self._run_dir     = None    # log folder for the current Listen session
         self._stream_rows: list = []
         self._build_ui()
@@ -216,15 +170,7 @@ class PacketizerWindow(QMainWindow):
     def _build_ui(self):
         central = QWidget()
         self.setCentralWidget(central)
-        root = QHBoxLayout(central)
-        root.setContentsMargins(0, 0, 0, 0)
-
-        splitter = QSplitter(Qt.Orientation.Horizontal)
-        root.addWidget(splitter)
-
-        # ── left panel: controls ──────────────────────────────────────────
-        left     = QWidget()
-        left_lay = QVBoxLayout(left)
+        left_lay = QVBoxLayout(central)
         left_lay.setSpacing(8)
 
         # Inputs
@@ -232,12 +178,10 @@ class PacketizerWindow(QMainWindow):
         in_vlay = QVBoxLayout(in_box)
         in_vlay.setSpacing(4)
 
-        # Column header — matches StreamRow layout exactly
-        # Row left-edge: margin(2) + idx(18) + spacing(6) = 26 before spinbox
         hdr = QHBoxLayout()
         hdr.setSpacing(6)
         hdr.addSpacing(26)
-        for lbl, w in [("Port", 100), ("Stream ID (auto)", 120), ("●", 22), ("Live", 36), ("Fwd", 36)]:
+        for lbl, w in [("Port", 100), ("Stream ID (auto)", 120), ("●", 22), ("Fwd", 36)]:
             l = QLabel(lbl)
             l.setFixedWidth(w)
             l.setStyleSheet("color: #888888; font-size: 11px;")
@@ -313,33 +257,6 @@ class PacketizerWindow(QMainWindow):
         out_vlay.addLayout(port_row)
         left_lay.addWidget(out_box)
 
-        # Stats
-        stats_box  = QGroupBox("Statistics")
-        stats_vlay = QVBoxLayout(stats_box)
-
-        row_a = QHBoxLayout()
-        row_a.addWidget(QLabel("Chunks emitted:"))
-        self._lbl_chunks = QLabel("0")
-        row_a.addWidget(self._lbl_chunks)
-        row_a.addSpacing(16)
-        row_a.addWidget(QLabel("Pkts forwarded:"))
-        self._lbl_pkts = QLabel("0")
-        row_a.addWidget(self._lbl_pkts)
-        row_a.addStretch()
-        stats_vlay.addLayout(row_a)
-
-        row_b = QHBoxLayout()
-        row_b.addWidget(QLabel("Drops:"))
-        self._lbl_drops = QLabel("0")
-        row_b.addWidget(self._lbl_drops)
-        row_b.addSpacing(16)
-        row_b.addWidget(QLabel("Chunk rate:"))
-        self._lbl_rate = QLabel("—")
-        row_b.addWidget(self._lbl_rate)
-        row_b.addStretch()
-        stats_vlay.addLayout(row_b)
-        left_lay.addWidget(stats_box)
-
         left_lay.addStretch()
 
         # Buttons: Listen | Forward | Stop
@@ -359,102 +276,19 @@ class PacketizerWindow(QMainWindow):
         btn_row.addWidget(self._stop_btn)
         left_lay.addLayout(btn_row)
 
-        splitter.addWidget(left)
-
-        # ── right panel: display controls + spectrum ──────────────────────
-        right     = QWidget()
-        right_lay = QVBoxLayout(right)
-        right_lay.setContentsMargins(4, 4, 4, 4)
-        right_lay.setSpacing(4)
-
-        disp_box  = QGroupBox("Display")
-        disp_vlay = QVBoxLayout(disp_box)
-        disp_vlay.setSpacing(4)
-
-        row1 = QHBoxLayout()
-        row1.addWidget(QLabel("Center:"))
-        self._disp_center = FreqInput(default_hz=2.5e6)
-        row1.addWidget(self._disp_center)
-        row1.addSpacing(16)
-        row1.addWidget(QLabel("Span:"))
-        self._disp_span = FreqInput(default_hz=5e6)
-        row1.addWidget(self._disp_span)
-        row1.addStretch()
-        disp_vlay.addLayout(row1)
-
-        row2 = QHBoxLayout()
-        row2.addWidget(QLabel("Amplitude:"))
-        self._disp_amp = QDoubleSpinBox()
-        self._disp_amp.setRange(-200, 50)
-        self._disp_amp.setDecimals(1)
-        self._disp_amp.setSingleStep(10)
-        self._disp_amp.setValue(-10)
-        self._disp_amp.setSuffix(" dB")
-        self._disp_amp.setFixedWidth(120)
-        row2.addWidget(self._disp_amp)
-        row2.addSpacing(16)
-        row2.addWidget(QLabel("dB / div:"))
-        self._disp_dbdiv = QDoubleSpinBox()
-        self._disp_dbdiv.setRange(1, 100)
-        self._disp_dbdiv.setDecimals(1)
-        self._disp_dbdiv.setValue(10)
-        self._disp_dbdiv.setSuffix(" dB")
-        self._disp_dbdiv.setFixedWidth(110)
-        row2.addWidget(self._disp_dbdiv)
-        auto_btn = QPushButton("Auto")
-        auto_btn.setFixedWidth(60)
-        auto_btn.clicked.connect(self._auto_display)
-        row2.addWidget(auto_btn)
-        row2.addStretch()
-        disp_vlay.addLayout(row2)
-
-        self._disp_center.changed.connect(self._apply_range)
-        self._disp_span.changed.connect(self._apply_range)
-        self._disp_amp.valueChanged.connect(self._apply_range)
-        self._disp_dbdiv.valueChanged.connect(self._apply_range)
-
-        right_lay.addWidget(disp_box)
-
-        self._plot = pg.PlotWidget(
-            title="Combiner Input"
-        )
-        self._plot.setLabel("bottom", "Frequency", units="Hz")
-        self._plot.setLabel("left",   "Magnitude", units="dB")
-        self._plot.showGrid(x=True, y=True, alpha=0.3)
-        self._plot.enableAutoRange(axis="xy", enable=False)
-        self._plot.getPlotItem().getViewBox().enableAutoRange(enable=False)
-        self._curves: dict = {}
-
-        self._ref_line = pg.InfiniteLine(
-            angle=0, movable=False,
-            pen=pg.mkPen("y", width=1, style=Qt.PenStyle.DashLine),
-        )
-        self._plot.addItem(self._ref_line)
-
-        self._plot.getPlotItem().getViewBox().sigRangeChanged.connect(
-            lambda vb, ranges: self._sync_viewport_to_spinboxes()
-        )
-
-        right_lay.addWidget(self._plot)
-        splitter.addWidget(right)
-        splitter.setSizes([420, 780])
-
         self._status = QStatusBar()
         self.setStatusBar(self._status)
         self._status.showMessage("Ready — add streams and press Listen")
 
-        self._stats_timer = QTimer()
-        self._stats_timer.setInterval(500)
-        self._stats_timer.timeout.connect(self._tick)
-
-        self._spec_timer = QTimer()
-        self._spec_timer.setInterval(100)
-        self._spec_timer.timeout.connect(self._update_spectrum)
-
-        self._prev_chunks = 0
-        self._prev_tick_t = 0.0
-
-        self._apply_range()
+        # Drains the worker's status queue -- state-transition events only
+        # (listening/forwarding/stopped/errors), not a live stats poll. This
+        # is the one thing still ticking on the GUI thread, and it does
+        # nothing but a non-blocking Queue read, so it doesn't reintroduce
+        # the contention this whole split exists to avoid.
+        self._status_timer = QTimer()
+        self._status_timer.setInterval(200)
+        self._status_timer.timeout.connect(self._poll_status)
+        self._status_timer.start()
 
     # ── dynamic row management ─────────────────────────────────────────────
 
@@ -465,33 +299,18 @@ class PacketizerWindow(QMainWindow):
         row = StreamRow(index=n, default_port=port)
         row.removed.connect(self._remove_stream_row)
         row.filter_changed.connect(self._on_filter_changed)
-        row.live_changed.connect(self._update_spectrum)
         row.set_locked(self._listening)
         self._rows_layout.insertWidget(self._rows_layout.count() - 1, row)
         self._stream_rows.append(row)
 
         if self._listening:
-            # Start a new listener for this port immediately.
-            # Do NOT adjust expected_count — the aggregator uses stale-aware
-            # active-stream detection so the new port won't block existing streams.
-            capture = self._modules.get("capture")
-            if capture:
-                capture.add_port(port)
+            self._send_cmd(cmd="add_port", port=port)
 
     def _remove_stream_row(self, row: StreamRow):
         if len(self._stream_rows) <= 1:
             return
         if self._listening:
-            capture = self._modules.get("capture")
-            agg     = self._modules.get("aggregator")
-            if capture:
-                capture.remove_port(row.port())
-            if agg:
-                agg.remove_stream_by_port(row.port())
-            # Clear its spectrum curve immediately
-            sid = row.stream_id()
-            if sid is not None and sid in self._curves:
-                self._curves.pop(sid).setData([], [])
+            self._send_cmd(cmd="remove_port", port=row.port())
         self._rows_layout.removeWidget(row)
         row.deleteLater()
         self._stream_rows.remove(row)
@@ -505,10 +324,64 @@ class PacketizerWindow(QMainWindow):
         self._chunk.setEnabled(not locked)
         self._hold_ms.setEnabled(not locked)
 
+    # ── IPC helpers ────────────────────────────────────────────────────────
+
+    def _send_cmd(self, **kwargs):
+        if self._cmd_q is not None:
+            self._cmd_q.put(kwargs)
+
+    def _poll_status(self):
+        if self._status_q is None:
+            return
+        while True:
+            try:
+                msg = self._status_q.get_nowait()
+            except _queue.Empty:
+                return
+            self._handle_status(msg)
+
+    def _handle_status(self, msg: dict):
+        kind = msg.get("status")
+        if kind == "listening":
+            self._status.showMessage(
+                f"Listening on ports {msg['ports']}  |  log: {msg['run_dir']}"
+            )
+        elif kind == "listen_error":
+            self._status.showMessage(f"Listen failed: {msg['error']}")
+            self._teardown_process()
+            self._reset_ui_to_stopped()
+        elif kind == "port_error":
+            self._status.showMessage(f"Port {msg['port']} failed: {msg['error']}")
+        elif kind == "forwarding":
+            host, port = msg["dest"]
+            self._status.showMessage(
+                f"Running  →  {host}:{port}  |  log: {self._run_dir}"
+            )
+        elif kind == "forward_stopped":
+            self._status.showMessage(f"Forwarding stopped — still listening | log: {self._run_dir}")
+        elif kind == "stopped":
+            s = msg.get("summary", {})
+            self._status.showMessage(
+                f"Stopped | received={s.get('data_received', 0):,} "
+                f"chunks={s.get('chunks_emitted', 0):,} "
+                f"drops={s.get('packets_dropped', 0):,} | log: {msg.get('run_dir', '')}"
+            )
+        elif kind == "activity":
+            ports = msg.get("ports", {})
+            for row in self._stream_rows:
+                info = ports.get(row.port())
+                if info is None:
+                    row.set_stream_id(None)
+                    row.set_active(False)
+                else:
+                    row.set_stream_id(info["stream_id"])
+                    row.set_active(info["active"])
+
     # ── lifecycle ──────────────────────────────────────────────────────────
 
     def _listen(self):
-        """Start capture + aggregator so the spectrum is visible (no forwarding yet)."""
+        """Spawn the worker process and tell it to start capturing (no
+        forwarding yet)."""
         if self._listening:
             return
 
@@ -519,63 +392,24 @@ class PacketizerWindow(QMainWindow):
             self._status.showMessage("Error: duplicate listen ports")
             return
 
-        ports_str  = "/".join(str(p) for p in ports)
-        self._plot.setTitle(f"Combiner Input — ports {ports_str}")
-
         self._run_dir = make_run_dir("Combiner")
-        recv_log = PacketLogger(
-            self._run_dir, "data_received.csv",
-            ["wall_clock", "source_port", "stream_id", "pkt_type", "seq",
-             "difi_ts_int", "difi_ts_frac", "samples", "first_i", "first_q"],
+        self._cmd_q    = multiprocessing.Queue()
+        self._status_q = multiprocessing.Queue()
+        self._proc = multiprocessing.Process(
+            target=worker_main, args=(self._cmd_q, self._status_q), daemon=True,
         )
-        hold_log = PacketLogger(
-            self._run_dir, "hold_and_loss.csv",
-            ["wall_clock", "stage", "stream_id", "outcome", "hold_ms",
-             "difi_ts_int", "difi_ts_frac", "samples", "local_latency_ms"],
-        )
-        group_log = PacketLogger(
-            self._run_dir, "group_reassembly.csv",
-            ["wall_clock", "stream_id", "difi_ts_int", "difi_ts_frac",
-             "packet_count", "samples", "seq_first", "seq_last",
-             "complete", "close_reason", "first_i", "first_q", "local_latency_ms"],
+        self._proc.start()
+        self._send_cmd(
+            cmd="listen", ports=ports, chunk_size=chunk_size,
+            hold_ms=self._hold_ms.value(), run_dir=self._run_dir,
         )
 
-        capture    = InputCapture(ports=ports, packet_logger=recv_log)
-        jitter     = JitterBuffer(capture, hold_ms=self._hold_ms.value())
-        aggregator = Aggregator(
-            capture          = jitter,
-            expected_streams = None,
-            expected_count   = len(ports),
-            chunk_size       = chunk_size,
-            hold_log         = hold_log,
-            group_log        = group_log,
-        )
-
-        self._modules.update(
-            capture=capture, jitter=jitter, aggregator=aggregator,
-            recv_log=recv_log, hold_log=hold_log, group_log=group_log,
-        )
-
-        capture.start()
-        time.sleep(0.05)
-        jitter.start()
-        aggregator.start()
-
-        self._listening   = True
-        self._prev_chunks = 0
-        self._prev_tick_t = time.monotonic()
+        self._listening = True
         self._set_locked(True)
         self._listen_btn.setEnabled(False)
         self._forward_btn.setEnabled(True)
         self._stop_btn.setEnabled(True)
-        self._stats_timer.start()
-        self._spec_timer.start()
-        self._apply_range()
-
-        self._status.showMessage(
-            f"Listening on ports {ports} — discovering streams…  "
-            f"(press Forward to start sending to Receiver) | log: {self._run_dir}"
-        )
+        self._status.showMessage(f"Starting — ports {ports}  |  log: {self._run_dir}")
 
     def _on_forward_clicked(self):
         """Toggle forwarding on/off — Forward button handler."""
@@ -585,101 +419,62 @@ class PacketizerWindow(QMainWindow):
             self._forward()
 
     def _forward(self):
-        """Start forwarding the aggregated stream to the Receiver VM."""
+        """Tell the worker to start forwarding the aggregated stream."""
         if not self._listening or self._forwarding:
             return
 
         dest_ip   = self._dest_ip.text().strip()
         dest_port = self._dest_port.value()
-
-        sent_log = PacketLogger(
-            self._run_dir, "data_sent.csv",
-            ["wall_clock", "stream_id", "pkt_type", "seq", "difi_ts_int",
-             "difi_ts_frac", "samples", "first_i", "first_q"],
+        self._send_cmd(
+            cmd="forward", dest_host=dest_ip, dest_port=dest_port,
+            forward_ports=self._current_forward_ports(),
         )
-        packetizer = Packetizer(
-            aggregator = self._modules["aggregator"],
-            hold_log   = self._modules["hold_log"],
-            sent_log   = sent_log,
-        )
-        sender     = DifiSender(
-            packetizer = packetizer,
-            dest_host  = dest_ip,
-            dest_port  = dest_port,
-        )
-
-        self._modules.update(packetizer=packetizer, sender=sender, sent_log=sent_log)
-        # Apply the current Fwd-checkbox state before the first packet goes out.
-        fwd_filter = self._current_forward_filter()
-        if fwd_filter is not None:
-            packetizer.set_forward_filter(fwd_filter)
-        packetizer.start()
-        sender.start()
 
         self._forwarding = True
         self._forward_btn.setText("■  Stop Fwd")
         self._dest_ip.setEnabled(False)
         self._dest_port.setEnabled(False)
-
-        ports = [r.port() for r in self._stream_rows]
-        self._status.showMessage(
-            f"Running — ports {ports}  →  {dest_ip}:{dest_port}  |  "
-            f"forwarding {len(ports)} stream(s) | log: {self._run_dir}"
-        )
+        self._status.showMessage(f"Starting forward  →  {dest_ip}:{dest_port}")
 
     def _stop_forward(self):
-        """Stop forwarding only — keep listening and spectrum active."""
+        """Stop forwarding only — keep listening."""
         if not self._forwarding:
             return
-        m = self._modules
-        m["sender"].stop()
-        m["packetizer"].stop()
-        if "sent_log" in m:
-            m["sent_log"].close()
-        self._modules.pop("sender", None)
-        self._modules.pop("packetizer", None)
-        self._modules.pop("sent_log", None)
+        self._send_cmd(cmd="stop_forward")
         self._forwarding = False
         self._forward_btn.setText("▶  Forward")
         self._dest_ip.setEnabled(True)
         self._dest_port.setEnabled(True)
-        self._status.showMessage("Forwarding stopped — still listening (press Forward to resume)")
 
     def _stop(self):
-        """Stop everything — forwarding and listening."""
+        """Stop everything and tear down the worker process."""
         if not self._listening:
             return
 
-        self._stats_timer.stop()
-        self._spec_timer.stop()
-        m = self._modules
+        self._send_cmd(cmd="shutdown")
+        self._teardown_process()
+        self._reset_ui_to_stopped()
 
-        if self._forwarding:
-            m["sender"].stop()
-            m["packetizer"].stop()
-            if "sent_log" in m:
-                m["sent_log"].close()
-            self._forwarding = False
+    def _teardown_process(self):
+        """Join the worker process, force-terminating it if it doesn't exit
+        promptly -- see closeEvent for why this must never leave an
+        orphaned background process still bound to its ports."""
+        if self._proc is not None:
+            self._proc.join(timeout=3.0)
+            if self._proc.is_alive():
+                self._proc.terminate()
+                self._proc.join(timeout=2.0)
+        self._proc     = None
+        self._cmd_q    = None
+        self._status_q = None
 
-        m["aggregator"].stop()
-        m["jitter"].stop()
-        m["capture"].stop()
-        if "recv_log" in m:
-            m["recv_log"].close()
-        if "hold_log" in m:
-            m["hold_log"].close()
-        if "group_log" in m:
-            m["group_log"].close()
-
+    def _reset_ui_to_stopped(self):
         for row in self._stream_rows:
+            row.set_stream_id(None)
             row.set_active(False)
-        for c in self._curves.values():
-            c.setData([], [])
-        self._curves.clear()
-        self._modules   = {}
-        self._run_dir   = None
-        self._listening = False
-
+        self._listening  = False
+        self._forwarding = False
+        self._run_dir    = None
         self._set_locked(False)
         self._listen_btn.setEnabled(True)
         self._forward_btn.setText("▶  Forward")
@@ -687,198 +482,60 @@ class PacketizerWindow(QMainWindow):
         self._stop_btn.setEnabled(False)
         self._dest_ip.setEnabled(True)
         self._dest_port.setEnabled(True)
-        self._status.showMessage("Stopped")
 
-    # ── update loops ───────────────────────────────────────────────────────
-
-    def _tick(self):
-        if not self._listening:
-            return
-        agg = self._modules.get("aggregator")
-        pkt = self._modules.get("packetizer")
-        snd = self._modules.get("sender")
-        if not agg:
-            return
-
-        # When not forwarding, drain the aggregator output queue so it never fills
-        # up.  Without this the 8-slot queue fills in ~170 ms and every new chunk
-        # is dropped, freezing chunks_emitted and showing spurious drop counts.
-        if not self._forwarding:
-            agg.flush_queue()
-
-        chunks = agg.chunks_emitted
-        now    = time.monotonic()
-        dt     = now - self._prev_tick_t
-        rate   = (chunks - self._prev_chunks) / dt if dt > 0 else 0.0
-        self._prev_chunks = chunks
-        self._prev_tick_t = now
-
-        self._lbl_chunks.setText(f"{chunks:,}")
-        self._lbl_pkts.setText(f"{snd.packets_sent:,}" if snd else "0")
-        self._lbl_drops.setText(str(agg.packets_dropped + (pkt.packets_dropped if pkt else 0)))
-        self._lbl_rate.setText(f"{rate:.1f} chunks/s")
-
-        last_seen    = agg.stream_last_seen()
-        stream_ports = agg.stream_source_ports()
-        cutoff       = now - STREAM_STALE_S
-        port_to_sid  = {port: sid for sid, port in stream_ports.items()}
-        for row in self._stream_rows:
-            sid = port_to_sid.get(row.port())
-            if sid is not None:
-                active = last_seen.get(sid, 0) >= cutoff
-                if active:
-                    row.set_stream_id(sid)
-                    row.set_active(True)
-                else:
-                    row.set_active(False)
-                    row.reset_stream_id()
-            else:
-                row.set_active(False)
-                if row.stream_id() is not None:
-                    row.reset_stream_id()
-
-    def _update_spectrum(self):
-        agg = self._modules.get("aggregator")
-        if not agg:
-            return
-
-        now          = time.monotonic()
-        last_seen    = agg.stream_last_seen()
-        stale_cutoff = now - STREAM_STALE_S
-
-        # Build live_sids from the aggregator's authoritative port→sid mapping so
-        # that display recovers immediately when a stream reconnects, without waiting
-        # for _tick (500 ms) to re-set row._sid_val after a reset_stream_id() call.
-        stream_ports = agg.stream_source_ports()
-        port_to_sid  = {port: sid for sid, port in stream_ports.items()}
-        live_sids = {
-            port_to_sid[r.port()]
-            for r in self._stream_rows
-            if r.is_live() and r.port() in port_to_sid
-        }
-
-        # Build display data: start from last emitted chunk, supplement with live
-        # buffer previews for streams not yet in that chunk (first discovery, or
-        # when aggregator was waiting for other streams to accumulate samples).
-        stream_data: dict = {}   # sid -> (samples, ctx)
-        chunk = agg.last_chunk
-        if chunk is not None:
-            for s in chunk.streams:
-                stream_data[s.stream_id] = (s.samples, s.context)
-        for sid, samples, ctx in agg.get_stream_previews():
-            if sid not in stream_data:
-                stream_data[sid] = (samples, ctx)
-
-        for sid, (samples, ctx) in stream_data.items():
-            if ctx is None or len(samples) == 0:
-                continue
-            stale = last_seen.get(sid, 0) < stale_cutoff
-            if stale or sid not in live_sids:
-                if sid in self._curves:
-                    self._curves[sid].setData([], [])
-                continue
-            if sid not in self._curves:
-                self._curves[sid] = self._plot.plot([], [], pen=_stream_color(sid))
-            f, m = _stream_fft(samples, ctx)
-            self._curves[sid].setData(f, m)
-
-        # Clear curves for streams that disappeared or went stale
-        for sid in list(self._curves):
-            if sid not in stream_data or last_seen.get(sid, 0) < stale_cutoff:
-                self._curves[sid].setData([], [])
-
-    # ── display helpers ────────────────────────────────────────────────────
-
-    def _apply_range(self):
-        center  = self._disp_center.value_hz()
-        span    = self._disp_span.value_hz()
-        amp_top = self._disp_amp.value()
-        db_div  = self._disp_dbdiv.value()
-        self._plot.setXRange(center - span / 2, center + span / 2, padding=0)
-        self._plot.setYRange(amp_top - db_div * 10, amp_top, padding=0)
-        self._ref_line.setValue(amp_top)
-
-    def _auto_display(self):
-        agg = self._modules.get("aggregator")
-        if not agg:
-            return
-        chunk = agg.last_chunk
-        if chunk is not None:
-            contexts = [s.context for s in chunk.streams if s.context]
-        else:
-            contexts = [ctx for _, _, ctx in agg.get_stream_previews() if ctx]
-        if not contexts:
-            QTimer.singleShot(500, self._auto_display)
-            return
-        rf_refs = [c.rf_ref_freq_hz for c in contexts]
-        fs_vals = [c.sample_rate_hz  for c in contexts]
-        center  = sum(rf_refs) / len(rf_refs)
-        span    = (max(rf_refs) - min(rf_refs)) + max(fs_vals)
-        span    = max(span, max(fs_vals))
-        self._disp_center.set_hz(center)
-        self._disp_span.set_hz(span)
-        self._disp_amp.setValue(-10.0)
-        self._disp_dbdiv.setValue(10.0)
-        self._apply_range()
-
-    def _sync_viewport_to_spinboxes(self):
-        [[x_lo, x_hi], [y_lo, y_hi]] = (
-            self._plot.getPlotItem().getViewBox().viewRange()
-        )
-        if x_hi > x_lo:
-            self._disp_center.set_hz((x_lo + x_hi) / 2.0)
-            self._disp_span.set_hz(x_hi - x_lo)
-        if y_hi > y_lo:
-            self._disp_amp.blockSignals(True)
-            self._disp_dbdiv.blockSignals(True)
-            self._disp_amp.setValue(y_hi)
-            self._disp_dbdiv.setValue((y_hi - y_lo) / 10.0)
-            self._disp_amp.blockSignals(False)
-            self._disp_dbdiv.blockSignals(False)
-            self._ref_line.setValue(y_hi)
+    # ── forwarding filter ──────────────────────────────────────────────────
 
     def _on_filter_changed(self):
-        """Update the packetizer's forward filter when a Fwd checkbox is toggled.
-        The aggregator always collects all streams so spectrum display is unaffected."""
-        pkt = self._modules.get("packetizer")
-        if not pkt:
+        """Push the updated port-based forward filter to the worker when a
+        Fwd checkbox is toggled."""
+        if not self._forwarding:
             return
-        allowed = {
-            r.forwarded_stream_id()
-            for r in self._stream_rows
-            if r.forwarded_stream_id() is not None
-        }
-        pkt.set_forward_filter(allowed)
+        self._send_cmd(cmd="set_forward_ports", forward_ports=self._current_forward_ports())
 
-    def _current_forward_filter(self) -> frozenset | None:
-        """Return the forward filter implied by current Fwd checkboxes.
-        Returns None when all discovered streams are checked (forward all)."""
-        all_checked = all(r.forwarded_stream_id() is not None or r.stream_id() is None
-                          for r in self._stream_rows)
+    def _current_forward_ports(self) -> list | None:
+        """Return the ports to forward, or None to forward everything
+        (all rows currently have Fwd checked)."""
+        all_checked = all(r.forwarded_port() is not None for r in self._stream_rows)
         if all_checked:
             return None
-        return frozenset(
-            r.forwarded_stream_id()
-            for r in self._stream_rows
-            if r.forwarded_stream_id() is not None
-        )
+        return [r.forwarded_port() for r in self._stream_rows if r.forwarded_port() is not None]
 
     def closeEvent(self, event):
         self._stop()
         event.accept()
+        # See gil_friendly_exec.py: app.lastWindowClosed alone was NOT
+        # reliably ending the polling loop -- confirmed as a real bug (the
+        # process kept running as an orphaned background task after the
+        # window closed, still bound to its UDP ports via SO_REUSEADDR,
+        # silently competing with the next run for the same packets and
+        # CPU). Calling request_stop() directly here, at the one place a
+        # close is unambiguously happening, doesn't depend on that signal
+        # firing correctly under manual polling at all.
+        request_stop(QApplication.instance())
 
 
 def main():
+    # Required on Windows before any other multiprocessing call in a
+    # PyInstaller --onefile build -- without it, spawning the worker
+    # process re-executes this whole frozen exe from the top instead of
+    # running combiner_worker.worker_main, which recurses into spawning
+    # another GUI window instead of doing the worker's job.
+    multiprocessing.freeze_support()
+
     from logging_setup import setup_frozen_file_logging
     log_path = setup_frozen_file_logging("Combiner")
 
-    pg.setConfigOptions(antialias=True)
     app = QApplication(sys.argv)
     win = PacketizerWindow()
     if log_path:
         win._status.showMessage(f"Logging to {log_path}")
     win.show()
-    sys.exit(app.exec())
+    # See gil_friendly_exec.py: app.exec()'s native Windows event loop was
+    # measured, via direct A/B test on this exact app, to starve every
+    # other thread in this process (0.0% packet loss with this polling
+    # loop vs 41-46% with app.exec(), everything else identical).
+    app.lastWindowClosed.connect(lambda: request_stop(app))
+    sys.exit(run_gil_friendly(app))
 
 
 if __name__ == "__main__":

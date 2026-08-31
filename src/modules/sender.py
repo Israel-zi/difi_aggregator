@@ -63,6 +63,8 @@ class DifiSender:
     def stop(self):
         self._stop_evt.set()
         self._thread.join(timeout=3.0)
+        if self._thread.is_alive():
+            print("[Sender] WARNING: worker thread did not stop within 3s -- still running")
         self._sock.close()
         print(
             f"[Sender] Stopped | "

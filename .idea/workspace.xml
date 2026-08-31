@@ -11,6 +11,7 @@
       <change beforePath="$PROJECT_DIR$/src/modules/input_capture.py" beforeDir="false" afterPath="$PROJECT_DIR$/src/modules/input_capture.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/src/modules/packetizer.py" beforeDir="false" afterPath="$PROJECT_DIR$/src/modules/packetizer.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/src/modules/receiver.py" beforeDir="false" afterPath="$PROJECT_DIR$/src/modules/receiver.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/modules/sender.py" beforeDir="false" afterPath="$PROJECT_DIR$/src/modules/sender.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/src/ui/packetizer_app.py" beforeDir="false" afterPath="$PROJECT_DIR$/src/ui/packetizer_app.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/src/ui/receiver_app.py" beforeDir="false" afterPath="$PROJECT_DIR$/src/ui/receiver_app.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/src/ui/transmitter_app.py" beforeDir="false" afterPath="$PROJECT_DIR$/src/ui/transmitter_app.py" afterDir="false" />
@@ -355,7 +356,15 @@
       <option name="project" value="LOCAL" />
       <updated>1788020593981</updated>
     </task>
-    <option name="localTasksCounter" value="21" />
+    <task id="LOCAL-00021" summary="initial project structure">
+      <option name="closed" value="true" />
+      <created>1788035471923</created>
+      <option name="number" value="00021" />
+      <option name="presentableId" value="LOCAL-00021" />
+      <option name="project" value="LOCAL" />
+      <updated>1788035471923</updated>
+    </task>
+    <option name="localTasksCounter" value="22" />
     <servers />
   </component>
   <component name="TypeScriptGeneratedFilesManager">
