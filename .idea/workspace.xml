@@ -6,12 +6,11 @@
   <component name="ChangeListManager">
     <list default="true" id="501509db-c9de-4eb9-b574-ffa1c3e6a775" name="Changes" comment="initial project structure">
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/core/difi_packet.py" beforeDir="false" afterPath="$PROJECT_DIR$/src/core/difi_packet.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/src/modules/aggregator.py" beforeDir="false" afterPath="$PROJECT_DIR$/src/modules/aggregator.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/src/modules/generator.py" beforeDir="false" afterPath="$PROJECT_DIR$/src/modules/generator.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/src/modules/input_capture.py" beforeDir="false" afterPath="$PROJECT_DIR$/src/modules/input_capture.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/modules/packetizer.py" beforeDir="false" afterPath="$PROJECT_DIR$/src/modules/packetizer.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/src/modules/receiver.py" beforeDir="false" afterPath="$PROJECT_DIR$/src/modules/receiver.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/modules/sender.py" beforeDir="false" afterPath="$PROJECT_DIR$/src/modules/sender.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/src/ui/packetizer_app.py" beforeDir="false" afterPath="$PROJECT_DIR$/src/ui/packetizer_app.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/src/ui/receiver_app.py" beforeDir="false" afterPath="$PROJECT_DIR$/src/ui/receiver_app.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/src/ui/transmitter_app.py" beforeDir="false" afterPath="$PROJECT_DIR$/src/ui/transmitter_app.py" afterDir="false" />
@@ -364,7 +363,15 @@
       <option name="project" value="LOCAL" />
       <updated>1788035471923</updated>
     </task>
-    <option name="localTasksCounter" value="22" />
+    <task id="LOCAL-00022" summary="initial project structure">
+      <option name="closed" value="true" />
+      <created>1788214225798</created>
+      <option name="number" value="00022" />
+      <option name="presentableId" value="LOCAL-00022" />
+      <option name="project" value="LOCAL" />
+      <updated>1788214225798</updated>
+    </task>
+    <option name="localTasksCounter" value="23" />
     <servers />
   </component>
   <component name="TypeScriptGeneratedFilesManager">

@@ -28,8 +28,9 @@ import pyqtgraph as pg
 
 from modules.receiver import DifiReceiver
 from ui.freq_input    import FreqInput
-from pipeline_logger  import make_run_dir, AsyncPacketLogger as PacketLogger
+from pipeline_logger  import make_run_dir, wall_clock_str, AsyncPacketLogger as PacketLogger
 from gil_friendly_exec import run_gil_friendly, request_stop
+import app_config
 
 
 _STREAM_COLORS = [
@@ -49,10 +50,21 @@ def _stream_color(sid: int):
     return pg.mkPen(_STREAM_COLORS[(sid - 1) % len(_STREAM_COLORS)], width=1)
 
 
+_HANN_CACHE: dict = {}   # seg_len -> (window, sum(window)) -- recomputing per call/stream/tick was pure waste
+
+
+def _hann(seg_len: int):
+    cached = _HANN_CACHE.get(seg_len)
+    if cached is None:
+        w = np.hanning(seg_len)
+        cached = (w, float(np.sum(w)))
+        _HANN_CACHE[seg_len] = cached
+    return cached
+
+
 def _stream_fft(iq, ctx, seg_len: int = 1024):
     """Single-window Hann FFT magnitude spectrum for one IQ buffer."""
-    w     = np.hanning(seg_len)
-    w_amp = float(np.sum(w))
+    w, w_amp = _hann(seg_len)
     n     = min(len(iq), seg_len)
     seg   = iq[-n:].copy()
     if n < seg_len:
@@ -136,7 +148,24 @@ class ReceiverWindow(QMainWindow):
         self._receiver = None
         self._running  = False
         self._recv_log = None
+        # See app_config.py -- loaded here (before _build_ui() creates any
+        # widget) so the bind port can seed its initial value from the
+        # last-saved settings instead of a hardcoded default.
+        self._cfg = app_config.load("Receiver")
         self._build_ui()
+
+        # Opt-in, env-var-gated autostart -- see transmitter_app.py's
+        # identical hook for why. No effect unless DIFI_AUTOSTART=1.
+        if os.environ.get("DIFI_AUTOSTART") == "1":
+            QTimer.singleShot(300, self._autostart_from_env)
+
+    def _autostart_from_env(self):
+        env = os.environ
+        if env.get("DIFI_PORT"):
+            self._port.setValue(int(env["DIFI_PORT"]))
+        self._start_btn.click()
+        if env.get("DIFI_AUTOSTOP_AFTER_S"):
+            QTimer.singleShot(int(float(env["DIFI_AUTOSTOP_AFTER_S"]) * 1000), self.close)
 
     def _build_ui(self):
         central = QWidget()
@@ -156,10 +185,11 @@ class ReceiverWindow(QMainWindow):
         # Listen
         listen_box  = QGroupBox("Listen")
         listen_grid = QGridLayout(listen_box)
+        net_cfg = app_config.Section(self._cfg, "Receiver.Network")
         listen_grid.addWidget(QLabel("Bind port:"), 0, 0)
         self._port = QSpinBox()
         self._port.setRange(1024, 65535)
-        self._port.setValue(50010)
+        self._port.setValue(net_cfg.get_int("port", 50010))
         self._port.setFixedWidth(110)
         port_w = QWidget()
         port_l = QHBoxLayout(port_w)
@@ -172,13 +202,14 @@ class ReceiverWindow(QMainWindow):
         # Display controls
         disp_box  = QGroupBox("Display")
         disp_grid = QGridLayout(disp_box)
+        disp_cfg  = app_config.Section(self._cfg, "Receiver.Display")
 
         disp_grid.addWidget(QLabel("Center:"), 0, 0)
-        self._center = FreqInput(default_hz=2.5e6)
+        self._center = FreqInput(default_hz=disp_cfg.get_float("center_hz", 2.5e6))
         disp_grid.addWidget(self._center, 0, 1)
 
         disp_grid.addWidget(QLabel("Span:"), 1, 0)
-        self._span = FreqInput(default_hz=5e6)
+        self._span = FreqInput(default_hz=disp_cfg.get_float("span_hz", 5e6))
         disp_grid.addWidget(self._span, 1, 1)
 
         disp_grid.addWidget(QLabel("Amplitude:"), 2, 0)
@@ -186,7 +217,7 @@ class ReceiverWindow(QMainWindow):
         self._amp_top.setRange(-200, 50)
         self._amp_top.setDecimals(1)
         self._amp_top.setSingleStep(10)
-        self._amp_top.setValue(-10)
+        self._amp_top.setValue(disp_cfg.get_float("amp_top_db", -10))
         self._amp_top.setSuffix(" dB")
         disp_grid.addWidget(self._amp_top, 2, 1)
 
@@ -194,7 +225,7 @@ class ReceiverWindow(QMainWindow):
         self._db_div = QDoubleSpinBox()
         self._db_div.setRange(1, 100)
         self._db_div.setDecimals(1)
-        self._db_div.setValue(10)
+        self._db_div.setValue(disp_cfg.get_float("db_div_db", 10))
         self._db_div.setSuffix(" dB")
         disp_grid.addWidget(self._db_div, 3, 1)
 
@@ -215,13 +246,19 @@ class ReceiverWindow(QMainWindow):
         self._lbl_data  = QLabel("0")
         self._lbl_ctx   = QLabel("0")
         self._lbl_errs  = QLabel("0")
+        self._lbl_rate  = QLabel("—")
         stats_grid.addWidget(QLabel("Data packets:"),   0, 0)
         stats_grid.addWidget(self._lbl_data,            0, 1)
         stats_grid.addWidget(QLabel("Context packets:"), 1, 0)
         stats_grid.addWidget(self._lbl_ctx,             1, 1)
         stats_grid.addWidget(QLabel("Parse errors:"),   2, 0)
         stats_grid.addWidget(self._lbl_errs,            2, 1)
+        stats_grid.addWidget(QLabel("Rate:"),           3, 0)
+        stats_grid.addWidget(self._lbl_rate,            3, 1)
         left_layout.addWidget(stats_box)
+        self._last_rate_count = 0
+        self._last_rate_bytes = 0
+        self._last_rate_time  = None
 
         # Streams — one card per discovered stream ID, LED shows live/stopped
         streams_box  = QGroupBox("Streams")
@@ -240,13 +277,24 @@ class ReceiverWindow(QMainWindow):
         btn_row = QHBoxLayout()
         self._start_btn = QPushButton("▶  Start")
         self._stop_btn  = QPushButton("■  Stop")
+        self._save_btn  = QPushButton("💾  Save Config")
         self._stop_btn.setEnabled(False)
         self._start_btn.setFixedHeight(36)
         self._stop_btn.setFixedHeight(36)
+        self._save_btn.setFixedHeight(36)
         self._start_btn.clicked.connect(self._start)
         self._stop_btn.clicked.connect(self._stop)
+        # Explicit save independent of Start -- lets an operator set the
+        # bind port and write the ini for this VM without actually
+        # starting the receiver (e.g. pre-staging VMs).
+        self._save_btn.setToolTip(
+            "Write the current settings to SysConfig.ini next to this exe,\n"
+            "without starting Start -- useful for pre-configuring a VM."
+        )
+        self._save_btn.clicked.connect(self._save_config)
         btn_row.addWidget(self._start_btn)
         btn_row.addWidget(self._stop_btn)
+        btn_row.addWidget(self._save_btn)
         left_layout.addLayout(btn_row)
 
         splitter.addWidget(left)
@@ -262,6 +310,16 @@ class ReceiverWindow(QMainWindow):
         self._plot.showGrid(x=True, y=True, alpha=0.3)
         self._plot.enableAutoRange(axis="xy", enable=False)
         self._plot.getPlotItem().getViewBox().enableAutoRange(enable=False)
+        # Standard PyQtGraph real-time-plot settings -- cheapen every
+        # setData() call on the 100ms tick (skip rendering points outside
+        # the current view, and thin points beyond the pixel resolution
+        # of the plot itself, which a 1024-point spectrum can exceed on a
+        # narrow window). Small on their own, but stack with the snapshot-
+        # copy and Hann-window fixes to shrink the UI thread's per-tick
+        # budget overall -- the goal is fewer/shorter windows where a
+        # loaded system can stall this thread and freeze the display.
+        self._plot.setClipToView(True)
+        self._plot.setDownsampling(mode="peak", auto=True)
         self._plot.setYRange(-110, -10, padding=0)
         self._plot.setXRange(0, 5e6, padding=0)
         self._curves: dict = {}  # stream_id → PlotDataItem
@@ -292,21 +350,54 @@ class ReceiverWindow(QMainWindow):
 
     # ── lifecycle ──────────────────────────────────────────────────────────
 
+    def _save_config(self):
+        """See app_config.py -- called on Start/the Save Config button and
+        on window close so the exe remembers its own last settings across
+        restarts instead of the operator re-typing them every run."""
+        net_cfg = app_config.Section(self._cfg, "Receiver.Network")
+        net_cfg.set("port", self._port.value())
+
+        disp_cfg = app_config.Section(self._cfg, "Receiver.Display")
+        disp_cfg.set("center_hz", self._center.value_hz())
+        disp_cfg.set("span_hz", self._span.value_hz())
+        disp_cfg.set("amp_top_db", self._amp_top.value())
+        disp_cfg.set("db_div_db", self._db_div.value())
+
+        app_config.save("Receiver", self._cfg)
+
     def _start(self):
         if self._running:
             return
+        self._save_config()
         port           = self._port.value()
         self._plot.setTitle(f"Receiver Input — port {port}")
         run_dir        = make_run_dir("Receiver")
         self._recv_log = PacketLogger(
             run_dir, "data_received.csv",
+            # 2026-09-04: rf_ref_hz/sample_rate_hz/bandwidth_hz added so
+            # this log alone can confirm DIFI Context info (what a
+            # Context packet actually carries -- RF reference frequency,
+            # sample rate, bandwidth) survived the Combiner correctly,
+            # without needing a separate raw-wire sniffer script each
+            # time. Populated on CONTEXT rows; blank on DATA rows (a DATA
+            # packet doesn't carry these fields itself).
+            # active: blank for DATA/CONTEXT rows; True/False on a STATUS
+            # row -- logged only on a TRANSITION (see _tick()) so this
+            # directly answers "when did the GUI show this stream as
+            # disconnected" against the same timeline as the packet rows,
+            # instead of needing a screenshot to know when that happened.
             ["wall_clock", "stream_id", "pkt_type", "seq", "difi_ts_int",
-             "difi_ts_frac", "samples", "seq_gap", "first_i", "first_q"],
+             "difi_ts_frac", "samples", "seq_gap", "first_i", "first_q",
+             "rf_ref_hz", "sample_rate_hz", "bandwidth_hz", "active"],
         )
+        self._stream_active_logged: dict = {}   # stream_id -> last active state WRITTEN to the log
         self._receiver = DifiReceiver(port=port, packet_logger=self._recv_log)
         self._receiver.start()
         self._running = True
         self._y_range_applied = False
+        self._last_rate_count = 0
+        self._last_rate_bytes = 0
+        self._last_rate_time  = time.monotonic()
         self._start_btn.setEnabled(False)
         self._stop_btn.setEnabled(True)
         self._timer.start()
@@ -338,6 +429,7 @@ class ReceiverWindow(QMainWindow):
             self._stream_rows_layout.removeWidget(row)
             row.deleteLater()
         self._stream_rows.clear()
+        self._lbl_rate.setText("—")
         self._start_btn.setEnabled(True)
         self._stop_btn.setEnabled(False)
         self._status.showMessage("Stopped")
@@ -355,7 +447,17 @@ class ReceiverWindow(QMainWindow):
         self._lbl_ctx.setText(f"{rx.context_received:,}")
         self._lbl_errs.setText(str(rx.parse_errors))
 
-        snaps = rx.get_stream_snapshots()
+        now = time.monotonic()
+        dt  = now - self._last_rate_time if self._last_rate_time else 0.0
+        if dt > 0:
+            rate = (rx.data_received - self._last_rate_count) / dt
+            mbps = (rx.bytes_received - self._last_rate_bytes) / dt / 1e6
+            self._lbl_rate.setText(f"{rate:,.0f} pkt/s  |  {mbps:,.2f} MB/s")
+        self._last_rate_count = rx.data_received
+        self._last_rate_bytes = rx.bytes_received
+        self._last_rate_time  = now
+
+        snaps = rx.get_stream_snapshots(tail_samples=1024)   # matches _stream_fft's seg_len
 
         # Per-stream status rows — LED + fs/RF, explicitly marked "stopped"
         # once a stream goes stale instead of lingering in a flat list
@@ -373,7 +475,19 @@ class ReceiverWindow(QMainWindow):
                 row = ReceiverStreamRow(sid)
                 self._stream_rows_layout.addWidget(row)
                 self._stream_rows[sid] = row
-            self._stream_rows[sid].update_state(ctx_s, active=last >= stale_cutoff)
+            active = last >= stale_cutoff
+            self._stream_rows[sid].update_state(ctx_s, active=active)
+            # 2026-09-04: log a STATUS row on every active<->stale
+            # TRANSITION (not every tick -- that would be 10/s of noise)
+            # so "when did this stream show as disconnected" is answered
+            # directly from the CSV, on the same timeline as the DATA/
+            # CONTEXT rows, instead of only from a screenshot's timestamp.
+            if self._recv_log is not None and self._stream_active_logged.get(sid) != active:
+                self._stream_active_logged[sid] = active
+                self._recv_log.log(
+                    wall_clock_str(), f"0x{sid:08X}", "STATUS", "",
+                    "", "", "", "", "", "", "", "", "", active,
+                )
 
         for sid in list(self._stream_rows):
             last = last_seen.get(sid, 0)
@@ -428,7 +542,7 @@ class ReceiverWindow(QMainWindow):
     def _auto_display(self):
         if not self._receiver:
             return
-        snaps = self._receiver.get_stream_snapshots()
+        snaps = self._receiver.get_stream_snapshots(tail_samples=0)   # only context objects are used here
         contexts = [c for _, c in snaps.values() if c is not None]
         if not contexts:
             QTimer.singleShot(500, self._auto_display)
@@ -464,6 +578,7 @@ class ReceiverWindow(QMainWindow):
 
     def closeEvent(self, event):
         self._stop()
+        self._save_config()
         event.accept()
         # See gil_friendly_exec.py / packetizer_app.py's identical fix --
         # app.lastWindowClosed alone was not reliably ending the polling

@@ -382,6 +382,40 @@ class DifiContextPacket:
 
 
 # ─────────────────────────────────────────────
+# Cheap header-only peek (no numpy IQ unpack)
+# ─────────────────────────────────────────────
+
+def peek_header(data: bytes) -> tuple:
+    """(pkt_type, stream_id, seq_num, timestamp_int, timestamp_frac) read
+    straight from the header words, with no numpy IQ unpack -- for callers
+    that only need to route/filter/log a packet, not touch its payload
+    (see input_capture.py's LAN relay path). Raises ValueError on a
+    too-short packet, same as DifiDataPacket.from_bytes()."""
+    if len(data) < PROLOGUE_WORDS * 4:
+        raise ValueError(f"Packet too short: {len(data)} bytes")
+    word1, word2, _w3, _w4, word5, word6, word7 = struct.unpack_from(">7I", data)
+    pkt_type       = (word1 >> 28) & 0xF
+    seq_num        = (word1 >> 16) & 0xF
+    stream_id      = word2
+    timestamp_int  = word5
+    timestamp_frac = (word6 << 32) | word7
+    return pkt_type, stream_id, seq_num, timestamp_int, timestamp_frac
+
+
+def peek_first_iq(data: bytes, sample_bit_depth: int = 16) -> tuple:
+    """(first_i, first_q) of a DATA packet's payload straight from the raw
+    wire bytes -- same value/rounding as pipeline_logger.sample_fingerprint()
+    on the fully-parsed payload, but reads only the first 2 int16 instead of
+    unpacking the whole array. Returns ("", "") if there's no payload."""
+    payload = data[PROLOGUE_WORDS * 4:]
+    if len(payload) < 4:
+        return ("", "")
+    raw   = np.frombuffer(payload[:4], dtype=np.int16)
+    scale = float((2 ** (sample_bit_depth - 1)) - 1)
+    return (round(float(raw[0]) / scale, 6), round(float(raw[1]) / scale, 6))
+
+
+# ─────────────────────────────────────────────
 # Timestamp helpers
 # ─────────────────────────────────────────────
 

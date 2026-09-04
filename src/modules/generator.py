@@ -107,9 +107,12 @@ class DifiGenerator:
         self._packet_logger = packet_logger
 
         # Data-packet DIFI timestamps are derived from this fixed epoch +
-        # cumulative sample count -- see _next_data_timestamp().
+        # cumulative sample count -- see _next_data_timestamp(). Capped to
+        # never fall this far BEHIND real wall-clock time (one-directional
+        # -- see that method's docstring for why only this direction).
         self._ts_epoch        = None
         self._ts_sample_index = 0
+        self._MAX_TS_LAG_S    = 0.05
 
         self._build_bw_filter()
 
@@ -255,10 +258,47 @@ class DifiGenerator:
         differ by exactly samples_per_pkt / sample_rate_hz seconds, which
         arithmetic can represent distinctly regardless of how coarsely the
         OS clock itself updates.
+
+        2026-09-05: that analytic formula silently assumes this process
+        actually SENDS at sample_rate_hz in real time. Under real CPU
+        contention (confirmed directly: a 2-TX+Combiner+RX run measured one
+        stream's actual throughput at ~7.4% below its configured rate) it
+        doesn't -- and because the formula advances purely off declared
+        sample count, not real elapsed time, a chronic throughput DEFICIT
+        makes the declared timestamp fall increasingly BEHIND wall-clock
+        reality (fewer real samples/sec actually went out than the rate
+        implies, so sample_index / sample_rate_hz UNDERSTATES how much real
+        time it took to produce them) with no bound, since the deficit
+        compounds every packet. Downstream, the Combiner's ring-buffer
+        egress dispatches strictly against real wall-clock time
+        (ring_pipeline.py's now - target_delay): a stream whose declared
+        "now" keeps falling further behind actual "now" eventually writes
+        every packet at an index dispatch has already moved past and will
+        never revisit -- confirmed as the exact mechanism behind a stream
+        going permanently silent at the Combiner while its own ingress kept
+        receiving that stream's UDP packets at a steady rate the whole
+        time.
+
+        Only clamped in this one direction (falling behind), not the
+        opposite (throughput running ABOVE nominal, which makes the
+        declared timestamp lead reality instead): correcting a LAG jumps
+        the next timestamp FORWARD, which preserves monotonicity (every
+        packet this stream has already sent stays earlier than this one).
+        Correcting a LEAD would require jumping BACKWARD instead, making
+        this packet's declared timestamp earlier than one already sent
+        moments before -- trading permanent stream death for a
+        monotonicity violation, a worse problem. The lead case is left
+        exactly as it already behaved (self-corrects once the buffer wraps
+        back around -- observed directly as a transient "cold, then
+        recovered" blip, never a permanent one).
         """
         if self._ts_epoch is None:
             self._ts_epoch = time.time()
         t = self._ts_epoch + self._ts_sample_index / self.sample_rate_hz
+        now = time.time()
+        if t < now - self._MAX_TS_LAG_S:
+            self._ts_epoch = now - self._ts_sample_index / self.sample_rate_hz
+            t = now
         self._ts_sample_index += n_samples
         ts_int = int(t)
         ts_frac = int((t - ts_int) * 1e12)
@@ -393,6 +433,13 @@ class DifiGenerator:
         -- see DelayedDispatcher. Non-zero here means data_sent.csv is
         overcounting what actually left this machine."""
         return self._dispatcher.send_errors
+
+    @property
+    def bytes_sent(self) -> int:
+        """Raw wire bytes that actually left this machine via sendto() --
+        see DelayedDispatcher. Distinct from pkt_count*packet_size since it
+        only counts real successful sends, not scheduled/logged ones."""
+        return self._dispatcher.bytes_sent
 
     def close(self):
         self._running = False

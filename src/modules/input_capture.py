@@ -32,6 +32,9 @@ from core.difi_packet import (
     DifiContextPacket,
     PACKET_TYPE_DATA,
     PACKET_TYPE_CONTEXT,
+    PROLOGUE_WORDS,
+    peek_header,
+    peek_first_iq,
 )
 from pipeline_logger import wall_clock_str, sample_fingerprint
 from thread_priority import boost_current_thread, THREAD_PRIORITY_TIME_CRITICAL, THREAD_PRIORITY_HIGHEST
@@ -48,6 +51,39 @@ class CapturedPacket:
     source_port:    int
     received_at:    float                           # time.monotonic() timestamp
     packet:         DifiDataPacket | DifiContextPacket
+
+
+@dataclass
+class RawCapturedPacket:
+    """LAN relay mode's lightweight counterpart to CapturedPacket (2026-09-03).
+
+    At hold_ms=0 the Combiner never touches a packet's payload -- it only
+    filters by stream_id and retransmits unchanged. The full-parse path
+    (CapturedPacket wrapping a DifiDataPacket) was paying for a numpy IQ
+    unpack on receipt (from_bytes), pickling that numpy array across the
+    packet_q process boundary, and a numpy IQ re-pack before sendto()
+    (to_bytes) -- on every single packet, for zero benefit, since nothing
+    about the payload is ever inspected or modified in relay mode. Measured
+    on real-VM logs as a major, previously-uncounted contributor to
+    packet_q hand-off loss (separate from the queue-capacity mechanism
+    already documented in capture_worker.py's docstring).
+
+    This carries the RAW wire bytes straight through -- combiner_worker.py's
+    _relay_loop() does a plain sendto(raw_bytes, dest), no re-encode -- plus
+    only the header fields peek_header()/peek_first_iq() can read without
+    touching the payload, which is everything the relay path's filtering
+    and CSV logging actually need."""
+    source_port:    int
+    received_at:    float
+    raw_bytes:      bytes
+    pkt_type:       int
+    stream_id:      int
+    seq_num:        int
+    timestamp_int:  int
+    timestamp_frac: int
+    n_samples:      int
+    first_i:        object   # float, or "" for CONTEXT packets
+    first_q:        object
 
 
 # ─────────────────────────────────────────────
@@ -69,6 +105,8 @@ class PortListener(threading.Thread):
         host: str = "0.0.0.0",
         timeout: float = 1.0,
         packet_logger = None,   # pipeline_logger.PacketLogger, or None
+        rcvbuf_bytes: int = 512 * 1024,
+        relay_mode: bool = False,   # True -> cheap header-peek + raw-bytes passthrough, see RawCapturedPacket
     ):
         super().__init__(daemon=True, name=f"listener-{port}")
         self.port      = port
@@ -76,6 +114,8 @@ class PortListener(threading.Thread):
         self.host      = host
         self.timeout   = timeout
         self._packet_logger = packet_logger
+        self._rcvbuf_bytes = rcvbuf_bytes
+        self._relay_mode = relay_mode
         self._stop_evt = threading.Event()
 
         # Bind synchronously in the caller's thread so a failure (port already
@@ -86,24 +126,27 @@ class PortListener(threading.Thread):
         self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         # Windows' default UDP receive buffer is small (measured 64KB on this
         # host) -- some headroom above that default is worth having so a
-        # brief burst doesn't get dropped outright. But this must stay
-        # modest: this thread's actual sustained drain rate (recvfrom -> parse
-        # -> enqueue) is itself limited to roughly 250-300 pkt/s under GIL
-        # contention with the several other threads in this process (measured
-        # directly, independent of buffer size) -- a large buffer does NOT
-        # fix that ceiling, it just lets packets queue in the KERNEL, unseen,
-        # instead of being dropped. A previous 8MB setting here produced
-        # exactly that: measured hold_ms climbing smoothly to a steady 7-9
-        # SECONDS of latency (~2046 queued packets / ~275 pkt/s drain rate),
-        # while every application-level metric stayed healthy because it
-        # only starts counting after a packet is already out of the kernel.
-        # That's worse than dropping for a live display -- stale-but-present
-        # beats absent, but not by 8 seconds. Keep this bounded to roughly
-        # a few hundred milliseconds of true burst absorption at the REAL
-        # drain rate, not a multi-second reservoir: 512KB / ~4.1KB per
-        # packet /~275 pkt/s drain =~ 0.45s worst-case queuing delay.
+        # brief burst doesn't get dropped outright. The 512KB default below
+        # was sized against an old, DIFFERENT failure mode: a SUSTAINED low
+        # drain rate (~275 pkt/s) under GIL contention, where a big buffer
+        # just hid the deficit as multi-second creeping latency instead of
+        # dropping (measured: an 8MB buffer produced a steady 7-9s hold).
+        # 2026-09-01 field evidence (real VM, real network) points at a
+        # DIFFERENT mechanism instead: a hard, RATE-INDEPENDENT receive
+        # ceiling (~620-660 pkt/s regardless of offered load, CPU/RAM both
+        # idle) with a receive-side inter-arrival pattern dominated by a
+        # rhythmic ~2.2ms gap not present in the sender's own send pattern in
+        # the same proportion -- consistent with vmxnet3 interrupt-coalescing
+        # batching delivery rather than a sustained Python-side drain
+        # bottleneck. Against THAT failure mode the old reasoning doesn't
+        # directly apply -- there's no sustained deficit to hide as creeping
+        # latency, only (locally, reproduced via the real multiprocessing
+        # worker topology) occasional 100-400ms recvfrom() stalls that a
+        # bigger buffer could plausibly absorb without loss. Configurable
+        # via rcvbuf_bytes specifically to A/B test this rather than assume
+        # either the old warning or "bigger is just better".
         try:
-            self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 512 * 1024)
+            self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, self._rcvbuf_bytes)
         except OSError:
             pass   # best-effort -- some platforms/permissions cap this; not fatal
         self._sock.settimeout(self.timeout)
@@ -118,6 +161,7 @@ class PortListener(threading.Thread):
             "data_received":    0,
             "context_received": 0,
             "parse_errors":     0,
+            "bytes_received":   0,   # raw wire bytes of every successfully-parsed packet
         }
 
     def stop(self):
@@ -172,6 +216,10 @@ class PortListener(threading.Thread):
         if len(data) < 4:
             return
 
+        if self._relay_mode:
+            self._parse_and_enqueue_relay(data)
+            return
+
         # peek at bits 31-28 of Word 1 to detect packet type
         word1    = int.from_bytes(data[:4], "big")
         pkt_type = (word1 >> 28) & 0xF
@@ -192,6 +240,8 @@ class PortListener(threading.Thread):
             else:
                 # unknown packet type — skip silently
                 return
+
+            self.stats["bytes_received"] += len(data)
 
             if self._packet_logger is not None:
                 pkt_kind = "DATA" if pkt_type == PACKET_TYPE_DATA else "CONTEXT"
@@ -216,6 +266,48 @@ class PortListener(threading.Thread):
         except (ValueError, struct.error) as exc:
             self.stats["parse_errors"] += 1
             print(f"[Capture] Parse error on port {self.port}: {exc}")
+
+    def _parse_and_enqueue_relay(self, data: bytes):
+        """LAN relay mode's cheap path -- see RawCapturedPacket. Header-only
+        peek (no numpy IQ unpack); the raw wire bytes go into out_queue
+        unchanged, ready for combiner_worker.py's _relay_loop() to
+        sendto() directly with no re-encode."""
+        try:
+            pkt_type, stream_id, seq_num, ts_int, ts_frac = peek_header(data)
+        except (ValueError, struct.error) as exc:
+            self.stats["parse_errors"] += 1
+            print(f"[Capture] Parse error on port {self.port}: {exc}")
+            return
+
+        if pkt_type == PACKET_TYPE_DATA:
+            self.stats["data_received"] += 1
+            n_samples = (len(data) - PROLOGUE_WORDS * 4) // 4
+            first_i, first_q = peek_first_iq(data)
+        elif pkt_type == PACKET_TYPE_CONTEXT:
+            self.stats["context_received"] += 1
+            n_samples = 0
+            first_i, first_q = "", ""
+        else:
+            return   # unknown packet type -- skip silently, same as the full-parse path
+
+        self.stats["bytes_received"] += len(data)
+
+        if self._packet_logger is not None:
+            pkt_kind = "DATA" if pkt_type == PACKET_TYPE_DATA else "CONTEXT"
+            self._packet_logger.log(
+                wall_clock_str(), self.port, f"0x{stream_id:08X}", pkt_kind,
+                seq_num, ts_int, ts_frac, n_samples, first_i, first_q,
+            )
+
+        try:
+            self.out_queue.put_nowait(RawCapturedPacket(
+                source_port=self.port, received_at=time.monotonic(), raw_bytes=data,
+                pkt_type=pkt_type, stream_id=stream_id, seq_num=seq_num,
+                timestamp_int=ts_int, timestamp_frac=ts_frac, n_samples=n_samples,
+                first_i=first_i, first_q=first_q,
+            ))
+        except queue.Full:
+            self.stats["parse_errors"] += 1
 
 
 # ─────────────────────────────────────────────
@@ -245,11 +337,32 @@ class InputCapture:
         ports: list,
         host: str        = "0.0.0.0",
         queue_maxsize: int = 30,
-        packet_logger    = None,   # pipeline_logger.PacketLogger, or None
+        packet_logger    = None,   # pipeline_logger.PacketLogger, or None -- shared across all ports
+        packet_logger_factory = None,   # optional Callable[[port:int], logger] -- ONE PER PORT instead
+        rcvbuf_bytes: int = 512 * 1024,
+        relay_mode: bool = False,   # see PortListener/RawCapturedPacket
     ):
+        # 2026-09-01: tried passing a multiprocessing.Queue in here directly
+        # (PortListener enqueuing straight into it, no in-process relay
+        # thread/hop) to cut capture_worker.py down to fewer threads --
+        # measured WORSE, not better: loss at 8000 pkt/s went from ~37% (with
+        # the relay thread) to ~53% (without it), collapsing further at
+        # higher rates. Reverted. The relay thread isn't just overhead: it
+        # shields THIS thread (which must call recvfrom() as promptly and
+        # consistently as possible) from multiprocessing.Queue.put_nowait()'s
+        # own latency (pickling + internal lock/pipe handoff), which an
+        # isolated single-purpose-thread benchmark showed is fast on
+        # average (clean past 15000 pkt/s) but apparently variable enough
+        # that folding it into the recvfrom-critical thread itself costs
+        # real drops. Keep out_queue as a plain in-process queue.Queue;
+        # capture_worker.py's own relay thread is what should be tuned
+        # further, not this.
         self._out_queue = queue.Queue(maxsize=queue_maxsize)
         self._listeners = []
         self._packet_logger = packet_logger
+        self._packet_logger_factory = packet_logger_factory
+        self._rcvbuf_bytes = rcvbuf_bytes
+        self._relay_mode = relay_mode
         # Ports that failed to bind (e.g. already in use by another program) —
         # collected instead of raised so the other ports still start.
         self.bind_errors: dict = {}
@@ -257,11 +370,30 @@ class InputCapture:
             try:
                 self._listeners.append(
                     PortListener(port=p, out_queue=self._out_queue, host=host,
-                                 packet_logger=packet_logger)
+                                 packet_logger=self._logger_for(p), rcvbuf_bytes=rcvbuf_bytes,
+                                 relay_mode=relay_mode)
                 )
             except OSError as exc:
                 self.bind_errors[p] = str(exc)
                 print(f"[Capture] Failed to bind port {p}: {exc}")
+
+    def _logger_for(self, port: int):
+        """Per-port logger if a factory was given (2026-09-03: multiple
+        PortListener threads sharing ONE AsyncPacketLogger means multiple
+        producer threads contending on that logger's internal queue.Queue
+        lock on every single packet -- measured to matter in exactly the
+        same way already documented for Aggregator/Packetizer sharing a
+        hold_log: with 8 simultaneous streams at ~681 pkt/s each (~5450
+        pkt/s combined, well within already-proven-clean aggregate rates
+        for 2-3 streams), real loss appeared (31-43%) that vanished at
+        lower stream counts carrying the SAME or higher aggregate rate --
+        pointing at stream COUNT, not byte rate, and this shared-logger
+        contention was the leading suspect. One dedicated logger per port
+        removes that contention entirely), else the single shared logger
+        (unchanged behavior for every other caller)."""
+        if self._packet_logger_factory is not None:
+            return self._packet_logger_factory(port)
+        return self._packet_logger
 
     def start(self):
         """Start all listener threads."""
@@ -292,7 +424,8 @@ class InputCapture:
         should catch this and surface it rather than let it vanish.
         """
         listener = PortListener(port=port, out_queue=self._out_queue, host=host,
-                                 packet_logger=self._packet_logger)
+                                 packet_logger=self._logger_for(port), rcvbuf_bytes=self._rcvbuf_bytes,
+                                 relay_mode=self._relay_mode)
         self._listeners.append(listener)
         listener.start()
         print(f"[Capture] Added listener on port {port}")
@@ -319,7 +452,7 @@ class InputCapture:
 
     def stats(self) -> dict:
         """Return combined statistics from all listeners."""
-        combined = {"data_received": 0, "context_received": 0, "parse_errors": 0}
+        combined = {"data_received": 0, "context_received": 0, "parse_errors": 0, "bytes_received": 0}
         for listener in self._listeners:
             for key in combined:
                 combined[key] += listener.stats[key]
@@ -373,9 +506,17 @@ class JitterBuffer:
         self._push_seq: int = 0
         self._lock         = threading.Lock()
 
-        # Small queue — keeps pipeline latency low.  At ~47 pps per stream a
-        # depth of 128 gives ~2.7 s of burst tolerance without building a backlog.
-        self._out_queue = queue.Queue(maxsize=128)
+        # 2026-09-01: raised from 128 -- combiner_worker.py now always
+        # engages this class (even at hold_ms=0, pure pass-through) because
+        # its own intake thread turned out to matter for throughput, not
+        # just WAN jitter: it shields the Aggregator's own thread from
+        # multiprocessing.Queue.get()'s latency the same way
+        # capture_worker.py's forward thread shields PortListener from
+        # put()'s latency (see combiner_worker.py's do_listen() comment).
+        # At real target rates (several thousand pkt/s per stream) 128 is
+        # far too small a burst buffer for that role; sized to match
+        # packet_q's own 4096 instead.
+        self._out_queue = queue.Queue(maxsize=4096)
         self._stop_evt  = threading.Event()
         self._thread    = threading.Thread(
             target=self._run, daemon=True, name="jitter-buffer"

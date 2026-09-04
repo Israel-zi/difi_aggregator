@@ -17,6 +17,7 @@ import sys
 import socket
 import threading
 import time
+import queue
 
 import numpy as np
 
@@ -61,8 +62,30 @@ class DifiReceiver:
         self._packet_logger = packet_logger
         self._sock        = None
         self._stop_evt    = threading.Event()
+        self._raw_q       = queue.Queue()
+        # 2026-09-04: split recvfrom() into its own dedicated thread (raw
+        # bytes only, handed off to _raw_q) with this thread left doing
+        # only the CPU-bound work (DIFI parse, ring-buffer update,
+        # synchronous CSV log write) -- previously both lived in the same
+        # loop (_run() called recvfrom() then _handle() inline). A real
+        # multi-stream GUI test (Base/LOGS, 2026-09-04 ~19:04-19:07)
+        # showed near-lossless delivery TX->Combiner and Combiner-ingress
+        # -> Combiner-egress (off by ~1 packet, just an in-flight-at-stop
+        # artifact) but 13-41% loss AND real timestamp-order inversions
+        # specifically on the Combiner->Receiver leg -- exactly the
+        # signature of this same anti-pattern already found and fixed in
+        # ring_capture_main this session (see ring_pipeline.py's own
+        # docstring): CPU-bound work sharing recvfrom()'s thread starves
+        # how often the OS socket is actually drained, so a burst
+        # (unavoidable here -- egress catches up on every stream whose
+        # 200ms hold has elapsed, all at once) overflows the kernel
+        # receive buffer and the OS silently drops/reorders what arrives
+        # while this thread is busy elsewhere.
+        self._recv_thread = threading.Thread(
+            target=self._recv_loop, daemon=True, name="receiver-recv"
+        )
         self._thread      = threading.Thread(
-            target=self._run, daemon=True, name="receiver"
+            target=self._run, daemon=True, name="receiver-process"
         )
 
         # per-stream state — keyed by stream_id (int)
@@ -77,6 +100,7 @@ class DifiReceiver:
         self.context_received = 0
         self.parse_errors     = 0
         self.seq_errors       = 0
+        self.bytes_received   = 0
 
     # ── lifecycle ──────────────────────────────────────────────────────────
 
@@ -87,13 +111,20 @@ class DifiReceiver:
         # the OS default UDP receive buffer is small enough that a real burst
         # can overflow it and get silently dropped before Python ever calls
         # recvfrom() -- invisible to every application-level counter here.
+        # 2026-09-04: bumped 512KB -> 16MB to match ring_capture_main's own
+        # rcvbuf_bytes default -- the Combiner's egress deliberately releases
+        # every stream whose target-delay hold has elapsed in one tight
+        # catch-up burst each tick, and 512KB left no real headroom for
+        # that burst while this socket's OWN thread was also busy parsing/
+        # logging the previous batch (see the recv/process split below).
         try:
-            self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 512 * 1024)
+            self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 16 * 1024 * 1024)
         except OSError:
             pass
         self._sock.settimeout(1.0)
         self._sock.bind((self._host, self._port))
         self._thread.start()
+        self._recv_thread.start()
         print(f"[Receiver] Listening on {self._host}:{self._port}")
 
     def stop(self):
@@ -104,6 +135,7 @@ class DifiReceiver:
             except OSError:
                 pass
             self._sock = None
+        self._recv_thread.join(timeout=2.0)
         self._thread.join(timeout=2.0)
         print(
             f"[Receiver] Stopped | "
@@ -120,10 +152,12 @@ class DifiReceiver:
             except OSError:
                 pass
             self._sock = None
+        self._recv_thread.join(timeout=2.0)
         self._thread.join(timeout=2.0)
 
         self._port     = port
         self._stop_evt = threading.Event()
+        self._raw_q    = queue.Queue()
         self._sock     = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
@@ -132,21 +166,47 @@ class DifiReceiver:
             pass
         self._sock.settimeout(1.0)
         self._sock.bind((self._host, self._port))
-        self._thread = threading.Thread(target=self._run, daemon=True, name="receiver")
+        self._recv_thread = threading.Thread(target=self._recv_loop, daemon=True, name="receiver-recv")
+        self._thread = threading.Thread(target=self._run, daemon=True, name="receiver-process")
         self._thread.start()
+        self._recv_thread.start()
         print(f"[Receiver] Rebound to {self._host}:{self._port}")
 
     # ── data access ────────────────────────────────────────────────────────
 
-    def get_stream_snapshots(self) -> dict:
+    def get_stream_snapshots(self, tail_samples: int | None = None) -> dict:
         """
         Return a dict of {stream_id: (iq_array, context)} for all active streams.
         Both arrays are copies (thread-safe).  Streams without a context packet
         yet are included with context=None.
-        """
+
+        tail_samples: if given, copy only the last N samples per stream
+        instead of the full rolling buffer (default buffer_size=8192).
+        Pass 0 to skip the IQ copy entirely (an empty array is returned) --
+        for callers that only need the context objects.
+
+        2026-09-04: added after finding the GUI's own display timer
+        (receiver_app.py's _tick(), every 100ms) was copying the FULL
+        buffer for every stream just to feed a 1024-sample FFT window
+        (_stream_fft's own seg_len) -- an 8x larger copy than needed, held
+        under the SAME lock the background receive thread needs for every
+        incoming packet. On a loaded system this widened the window for
+        the GUI thread to visibly stall (spectrum frozen, looking like a
+        disconnect) even though the underlying receive thread itself never
+        actually lost data (confirmed separately via the packet logs)."""
         with self._lock:
+            if tail_samples == 0:
+                return {
+                    sid: (np.empty(0, dtype=np.complex64), self._contexts.get(sid))
+                    for sid in self._iq_buffers
+                }
+            if tail_samples is None:
+                return {
+                    sid: (buf.copy(), self._contexts.get(sid))
+                    for sid, buf in self._iq_buffers.items()
+                }
             return {
-                sid: (buf.copy(), self._contexts.get(sid))
+                sid: (buf[-tail_samples:].copy(), self._contexts.get(sid))
                 for sid, buf in self._iq_buffers.items()
             }
 
@@ -182,24 +242,45 @@ class DifiReceiver:
 
     # ── main loop ──────────────────────────────────────────────────────────
 
-    def _run(self):
+    def _recv_loop(self):
+        """recvfrom() only -- nothing else -- so this thread is always
+        available to drain the socket, no matter how busy _run()'s parse/
+        log/ring-buffer work is on any given packet."""
         # See socket_warmup.py: a just-bound socket does not actually
         # deliver inbound traffic for several seconds on this host, even
         # though bind() itself already returned -- absorb that cost here
         # before treating any loss as real.
         warm_ms, leaked = warm_up_socket(self._sock, self._port)
         print(f"[Receiver] Socket warm-up took {warm_ms:.0f} ms")
-        if leaked is not None and not self._stop_evt.is_set():
-            self._handle(leaked)
+        if leaked is not None:
+            self._raw_q.put(leaked)
 
         while not self._stop_evt.is_set():
             try:
                 data, _ = self._sock.recvfrom(self.MAX_UDP_SIZE)
-                self._handle(data)
+                self._raw_q.put(data)
             except socket.timeout:
                 continue
             except OSError:
                 break
+
+    def _run(self):
+        """Consumer side: parse + ring-buffer update + CSV log, decoupled
+        from recvfrom() by _raw_q (see _recv_loop)."""
+        while not self._stop_evt.is_set():
+            try:
+                data = self._raw_q.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            self._handle(data)
+            # Drain whatever else already queued before checking stop_evt
+            # again -- same "fully drain before yielding" shape used
+            # elsewhere in this project (aggregator.py, ring_capture_main).
+            while True:
+                try:
+                    self._handle(self._raw_q.get_nowait())
+                except queue.Empty:
+                    break
 
     def _handle(self, data: bytes):
         if len(data) < 8:
@@ -211,6 +292,7 @@ class DifiReceiver:
 
         try:
             if pkt_type == PACKET_TYPE_DATA:
+                self.bytes_received += len(data)
                 ctx = self._contexts.get(sid)
                 bit_depth = ctx.sample_bit_depth if ctx else 16
                 pkt = DifiDataPacket.from_bytes(data, sample_bit_depth=bit_depth)
@@ -232,9 +314,12 @@ class DifiReceiver:
                         wall_clock_str(), f"0x{sid:08X}", "DATA", pkt.seq_num,
                         pkt.timestamp_int, pkt.timestamp_frac, len(pkt.payload), seq_gap,
                         first_i, first_q,
+                        "", "", "",   # rf_ref_hz/sample_rate_hz/bandwidth_hz -- DATA packets don't carry these
+                        "",           # active -- only STATUS rows (see receiver_app.py's _tick()) carry this
                     )
 
             elif pkt_type == PACKET_TYPE_CONTEXT:
+                self.bytes_received += len(data)
                 pkt = DifiContextPacket.from_bytes(data)
                 with self._lock:
                     self._contexts[pkt.stream_id] = pkt
@@ -249,6 +334,8 @@ class DifiReceiver:
                         wall_clock_str(), f"0x{sid:08X}", "CONTEXT", pkt.seq_num,
                         pkt.timestamp_int, pkt.timestamp_frac, 0, False,
                         "", "",
+                        pkt.rf_ref_freq_hz, pkt.sample_rate_hz, pkt.bandwidth_hz,
+                        "",
                     )
 
         except Exception as exc:
