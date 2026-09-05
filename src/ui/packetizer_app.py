@@ -729,12 +729,25 @@ class PacketizerWindow(QMainWindow):
         self._dest_port.setEnabled(True)
         self._status.showMessage(f"Forwarding stopped — still listening | log: {self._run_dir}")
 
-    def _stop(self):
-        """Stop everything and tear down the ring pipeline."""
+    def _stop(self, timeout: float = 75.0):
+        """Stop everything and tear down the ring pipeline.
+
+        2026-09-05: timeout is now a parameter, not always the module
+        default -- confirmed directly: closing this window (the X button,
+        not the Stop button) used to always wait for the SAME long
+        (75s, raised for AsyncPacketLogger's own slower drain-under-load
+        retry) timeout on the GUI thread. A user closing the window wants
+        it gone now, not a best-effort graceful drain of a trailing CSV
+        log -- and a window stuck unresponsive for up to that long risks
+        Windows (or the user) force-killing the whole process before the
+        child ring_capture_main/ring_egress_main processes ever receive
+        the shutdown command, which is exactly how they end up orphaned,
+        still bound to their UDP ports, after the window is long gone.
+        See closeEvent's own call site for the short timeout used there."""
         if not self._listening:
             return
         if self._ring_handles is not None:
-            stop_ring_pipeline(self._ring_handles)
+            stop_ring_pipeline(self._ring_handles, timeout=timeout)
         self._ring_handles = None
         self._reset_ui_to_stopped()
 
@@ -777,7 +790,10 @@ class PacketizerWindow(QMainWindow):
         return [r.forwarded_port() for r in self._stream_rows if r.forwarded_port() is not None]
 
     def closeEvent(self, event):
-        self._stop()
+        # 5s, not the module's 75s default -- see _stop()'s own note on
+        # why the window-close path needs a short, bounded wait instead of
+        # the graceful-drain timeout the Stop button uses.
+        self._stop(timeout=5.0)
         self._save_config()
         event.accept()
         # See gil_friendly_exec.py: app.lastWindowClosed alone was NOT
