@@ -31,6 +31,9 @@ from core.difi_packet import (
     DifiContextPacket,
     PACKET_TYPE_DATA,
     PACKET_TYPE_CONTEXT,
+    PROLOGUE_WORDS,
+    peek_header,
+    peek_first_iq,
 )
 from pipeline_logger import wall_clock_str, sample_fingerprint
 from socket_warmup import warm_up_socket
@@ -49,6 +52,37 @@ class DifiReceiver:
 
     MAX_UDP_SIZE = 65535
 
+    # 2026-09-05: full parse cost (DifiDataPacket.from_bytes(), ~44x a
+    # header-only peek per this project's own earlier measurement) was
+    # confirmed as the dominant cost keeping this thread from sustaining a
+    # real 2-stream ~4500 pkt/s combined load (measured directly: ~1470
+    # packet/s drops, ~30% of arrival, even after the circular-buffer fix
+    # removed the OTHER per-packet cost this same hot path had). The
+    # rolling display buffer only actually needs to be refreshed often
+    # enough to look smooth at the GUI's own ~10Hz redraw rate, not on
+    # every single packet -- decoding 1 in DECODE_EVERY_N still delivers
+    # far more fresh samples per second than that requires, while cutting
+    # the expensive-parse call rate (and this thread's CPU cost) by
+    # roughly (DECODE_EVERY_N-1)/DECODE_EVERY_N. Every packet still gets
+    # counted, sequence-checked and logged either way -- see _handle()'s
+    # peek_header()/peek_first_iq() path for the skipped ones, the same
+    # header-only functions ring_capture_main and generator.py already
+    # use for exactly this reason.
+    DECODE_EVERY_N = 4
+
+    # 2026-09-05: same DIAGNOSTIC MODE convention as ring_pipeline.py --
+    # env-gated (DIFI_DEBUG_REORDER=1), zero cost otherwise, never set by
+    # the real EXEs' own startup path. Added after confirming this
+    # process's memory grew unbounded (1.36GB -> 2.47GB in ~2 minutes)
+    # with no timestamped signal anywhere that would have shown WHEN the
+    # backlog started forming or how large _raw_q had gotten at that
+    # moment -- the only evidence was periodic manual `tasklist` memory
+    # samples, days too coarse to actually catch the mechanism. This
+    # heartbeat gives the same kind of "walk backward from the last known
+    # good moment" timeline this project's other DIFI_DEBUG_REORDER
+    # instrumentation already relies on.
+    _DEBUG_REORDER = os.environ.get("DIFI_DEBUG_REORDER") == "1"
+
     def __init__(
         self,
         host: str        = "0.0.0.0",
@@ -62,7 +96,26 @@ class DifiReceiver:
         self._packet_logger = packet_logger
         self._sock        = None
         self._stop_evt    = threading.Event()
-        self._raw_q       = queue.Queue()
+        # 2026-09-05: unbounded until now -- confirmed directly: over a
+        # real multi-minute run, this process's memory climbed from
+        # 1.36GB to 2.47GB in about 2 minutes with nothing else wrong in
+        # the pipeline (Combiner ingress/egress counts stayed healthy the
+        # whole time). Unlike ring_capture_main's own raw_q, _handle()
+        # here can't switch to the cheap peek_header()/peek_first_iq()
+        # path that fixed the equivalent spot there -- this class actually
+        # needs the fully decoded IQ payload for the rolling display
+        # buffer, not just header fields -- so DifiDataPacket.from_bytes()
+        # (the ~44x-more-expensive full parse, per this project's own
+        # earlier measurement) runs on every packet here by necessity.
+        # Under a real burst (the Combiner releases a whole hold-window's
+        # worth of both streams at once), that parse cost can fall behind
+        # the multiplexed arrival rate, and an unbounded queue.Queue just
+        # keeps the backlog in memory forever instead of ever catching up
+        # or giving up. Bounding it converts silent unbounded growth into
+        # a visible, counted drop -- same principle already applied to
+        # AsyncPacketLogger's own queue for the same reason.
+        self._raw_q       = queue.Queue(maxsize=20_000)
+        self.raw_q_dropped = 0
         # 2026-09-04: split recvfrom() into its own dedicated thread (raw
         # bytes only, handed off to _raw_q) with this thread left doing
         # only the CPU-bound work (DIFI parse, ring-buffer update,
@@ -89,7 +142,9 @@ class DifiReceiver:
         )
 
         # per-stream state — keyed by stream_id (int)
-        self._iq_buffers:  dict = {}   # stream_id -> np.ndarray[complex64]
+        self._iq_buffers:  dict = {}   # stream_id -> np.ndarray[complex64], CIRCULAR storage (see _write_idx)
+        self._write_idx:   dict = {}   # stream_id -> next write position in _iq_buffers[sid]
+        self._decode_counter: dict = {}   # stream_id -> packets seen, for the every-Nth-packet full decode below
         self._contexts:    dict = {}   # stream_id -> DifiContextPacket
         self._last_seqs:   dict = {}   # stream_id -> last seen seq_num (0-15)
         self._last_update: dict = {}   # stream_id -> time.monotonic() of last data packet
@@ -157,11 +212,12 @@ class DifiReceiver:
 
         self._port     = port
         self._stop_evt = threading.Event()
-        self._raw_q    = queue.Queue()
+        self._raw_q    = queue.Queue(maxsize=self._raw_q.maxsize)
+        self.raw_q_dropped = 0
         self._sock     = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
-            self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 512 * 1024)
+            self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 16 * 1024 * 1024)
         except OSError:
             pass
         self._sock.settimeout(1.0)
@@ -200,14 +256,9 @@ class DifiReceiver:
                     sid: (np.empty(0, dtype=np.complex64), self._contexts.get(sid))
                     for sid in self._iq_buffers
                 }
-            if tail_samples is None:
-                return {
-                    sid: (buf.copy(), self._contexts.get(sid))
-                    for sid, buf in self._iq_buffers.items()
-                }
             return {
-                sid: (buf[-tail_samples:].copy(), self._contexts.get(sid))
-                for sid, buf in self._iq_buffers.items()
+                sid: (self._chronological(sid, tail_samples), self._contexts.get(sid))
+                for sid in self._iq_buffers
             }
 
     def get_iq_snapshot(self) -> np.ndarray:
@@ -218,7 +269,7 @@ class DifiReceiver:
         with self._lock:
             if not self._iq_buffers:
                 return np.zeros(self._buffer_size, dtype=np.complex64)
-            return np.concatenate(list(self._iq_buffers.values()))
+            return np.concatenate([self._chronological(sid) for sid in self._iq_buffers])
 
     @property
     def context(self):
@@ -233,6 +284,7 @@ class DifiReceiver:
         with self._lock:
             for sid in self._iq_buffers:
                 self._iq_buffers[sid][:] = 0
+                self._write_idx[sid] = 0
             self._last_seqs.clear()
 
     def get_sample_rate(self) -> float:
@@ -253,24 +305,63 @@ class DifiReceiver:
         warm_ms, leaked = warm_up_socket(self._sock, self._port)
         print(f"[Receiver] Socket warm-up took {warm_ms:.0f} ms")
         if leaked is not None:
-            self._raw_q.put(leaked)
+            self._put_raw(leaked)
 
         while not self._stop_evt.is_set():
             try:
                 data, _ = self._sock.recvfrom(self.MAX_UDP_SIZE)
-                self._raw_q.put(data)
+                self._put_raw(data)
             except socket.timeout:
                 continue
             except OSError:
                 break
 
+    def _put_raw(self, data: bytes):
+        try:
+            self._raw_q.put_nowait(data)
+        except queue.Full:
+            # The processing side (see _handle()'s own note on why it
+            # can't avoid the expensive full parse) has fallen behind --
+            # drop this packet's bytes rather than let the backlog grow
+            # without limit. Same "never propagate backpressure, but never
+            # go silent about it either" shape as AsyncPacketLogger.
+            self.raw_q_dropped += 1
+            if self.raw_q_dropped == 1 or self.raw_q_dropped % 10_000 == 0:
+                print(f"[Receiver] *** WARNING *** processing has fallen behind "
+                      f"arrival rate -- {self.raw_q_dropped} raw packet(s) dropped "
+                      f"so far (queue full at {self._raw_q.maxsize})")
+
     def _run(self):
         """Consumer side: parse + ring-buffer update + CSV log, decoupled
         from recvfrom() by _raw_q (see _recv_loop)."""
+        _diag_proc = None
+        _last_heartbeat = 0.0
+        if self._DEBUG_REORDER:
+            try:
+                import psutil
+                _diag_proc = psutil.Process()
+            except Exception as _exc:
+                print(f"[Receiver-DEBUG] psutil unavailable, memory tracking disabled: {_exc}")
+
         while not self._stop_evt.is_set():
             try:
                 data = self._raw_q.get(timeout=0.2)
             except queue.Empty:
+                data = None
+            if self._DEBUG_REORDER:
+                now = time.time()
+                if now - _last_heartbeat >= 2.0:
+                    _last_heartbeat = now
+                    mem_str = ""
+                    if _diag_proc is not None:
+                        try:
+                            mem_str = f" working_set={_diag_proc.memory_info().rss / 1e6:.1f}MB"
+                        except Exception:
+                            pass
+                    print(f"[Receiver-DEBUG] {wall_clock_str()} raw_q_qsize={self._raw_q.qsize()} "
+                          f"raw_q_dropped={self.raw_q_dropped} data_received={self.data_received} "
+                          f"seq_errors={self.seq_errors}{mem_str}")
+            if data is None:
                 continue
             self._handle(data)
             # Drain whatever else already queued before checking stop_evt
@@ -293,26 +384,53 @@ class DifiReceiver:
         try:
             if pkt_type == PACKET_TYPE_DATA:
                 self.bytes_received += len(data)
-                ctx = self._contexts.get(sid)
-                bit_depth = ctx.sample_bit_depth if ctx else 16
-                pkt = DifiDataPacket.from_bytes(data, sample_bit_depth=bit_depth)
-                # Detect sequence-number gaps (DIFI seq wraps 0-15)
+                count = self._decode_counter.get(sid, 0)
+                self._decode_counter[sid] = count + 1
+                full_decode = (count % self.DECODE_EVERY_N) == 0
+
+                if full_decode:
+                    ctx = self._contexts.get(sid)
+                    bit_depth = ctx.sample_bit_depth if ctx else 16
+                    pkt = DifiDataPacket.from_bytes(data, sample_bit_depth=bit_depth)
+                    seq_num, timestamp_int, timestamp_frac = pkt.seq_num, pkt.timestamp_int, pkt.timestamp_frac
+                    samples = len(pkt.payload)
+                    first_i, first_q = sample_fingerprint(pkt.payload)
+                    self._update_stream_buffer(sid, pkt.payload)
+                else:
+                    _pt, _sid2, seq_num, timestamp_int, timestamp_frac = peek_header(data)
+                    samples = max(0, (len(data) - PROLOGUE_WORDS * 4) // 4)
+                    first_i, first_q = peek_first_iq(data)
+                    self._last_update[sid] = time.monotonic()   # _update_stream_buffer's own bookkeeping, skipped here
+
+                # Detect sequence-number gaps (DIFI seq wraps 0-15) --
+                # works identically whichever path above supplied seq_num.
                 last_seq = self._last_seqs.get(sid)
-                seq_gap = last_seq is not None and pkt.seq_num != (last_seq + 1) & 0xF
+                seq_gap = last_seq is not None and seq_num != (last_seq + 1) & 0xF
                 if seq_gap:
                     self.seq_errors += 1
-                    print(
-                        f"[Receiver] Seq gap stream 0x{sid:08X}: "
-                        f"expected {(last_seq + 1) & 0xF}, got {pkt.seq_num}"
-                    )
-                self._last_seqs[sid] = pkt.seq_num
-                self._update_stream_buffer(pkt.stream_id, pkt.payload)
+                    # 2026-09-05: this used to print unconditionally, every
+                    # single gap -- confirmed directly: once _raw_q starts
+                    # dropping under real overload, EVERY surviving packet
+                    # after a drop shows a gap, so this printed on nearly
+                    # every packet, adding real per-packet overhead (stdout
+                    # is a real file in the frozen EXE, not a no-op) right
+                    # in the same hot path that was already falling behind
+                    # -- a genuine negative feedback loop, not just log
+                    # noise. Throttled the same way _put_raw's own overload
+                    # warning already is: still counted exactly (seq_errors
+                    # not affected), just not printed for every occurrence.
+                    if self.seq_errors == 1 or self.seq_errors % 10_000 == 0:
+                        print(
+                            f"[Receiver] Seq gap stream 0x{sid:08X}: "
+                            f"expected {(last_seq + 1) & 0xF}, got {seq_num} "
+                            f"({self.seq_errors} total so far)"
+                        )
+                self._last_seqs[sid] = seq_num
                 self.data_received += 1
                 if self._packet_logger is not None:
-                    first_i, first_q = sample_fingerprint(pkt.payload)
                     self._packet_logger.log(
-                        wall_clock_str(), f"0x{sid:08X}", "DATA", pkt.seq_num,
-                        pkt.timestamp_int, pkt.timestamp_frac, len(pkt.payload), seq_gap,
+                        wall_clock_str(), f"0x{sid:08X}", "DATA", seq_num,
+                        timestamp_int, timestamp_frac, samples, seq_gap,
                         first_i, first_q,
                         "", "", "",   # rf_ref_hz/sample_rate_hz/bandwidth_hz -- DATA packets don't carry these
                         "",           # active -- only STATUS rows (see receiver_app.py's _tick()) carry this
@@ -327,6 +445,7 @@ class DifiReceiver:
                         self._iq_buffers[pkt.stream_id] = np.zeros(
                             self._buffer_size, dtype=np.complex64
                         )
+                        self._write_idx[pkt.stream_id] = 0
                         print(f"[Receiver] New stream: 0x{pkt.stream_id:08X}")
                 self.context_received += 1
                 if self._packet_logger is not None:
@@ -348,17 +467,58 @@ class DifiReceiver:
             return dict(self._last_update)
 
     def _update_stream_buffer(self, sid: int, new_samples: np.ndarray):
+        """Write new_samples into this stream's CIRCULAR buffer at O(n) cost.
+
+        2026-09-05: this used to be np.roll(buf, -n) on the WHOLE buffer
+        every single packet -- an O(buffer_size) copy (8192 elements,
+        every call) to insert n=2200 new samples, on top of the already-
+        expensive full DIFI parse this same hot path needs (see _handle()'s
+        own note on why that parse can't be skipped here). Confirmed
+        directly: under a real 2-stream, ~4500 pkt/s combined load, the
+        processing thread fell far enough behind that its (now-bounded,
+        see _raw_q) queue was dropping ~30-65% of arriving packets. A
+        circular buffer with an explicit write index writes only the n new
+        samples per call, with reconstruction into chronological order
+        deferred to get_stream_snapshots() -- called at the GUI's own
+        display-refresh rate (10-30Hz), not per packet."""
         n = len(new_samples)
         with self._lock:
             if sid not in self._iq_buffers:
                 self._iq_buffers[sid] = np.zeros(self._buffer_size, dtype=np.complex64)
+                self._write_idx[sid] = 0
             buf = self._iq_buffers[sid]
             if n >= self._buffer_size:
                 buf[:] = new_samples[-self._buffer_size:]
+                self._write_idx[sid] = 0
             else:
-                self._iq_buffers[sid] = np.roll(buf, -n)
-                self._iq_buffers[sid][-n:] = new_samples
+                idx = self._write_idx[sid]
+                end = idx + n
+                if end <= self._buffer_size:
+                    buf[idx:end] = new_samples
+                else:
+                    first = self._buffer_size - idx
+                    buf[idx:] = new_samples[:first]
+                    buf[:end - self._buffer_size] = new_samples[first:]
+                self._write_idx[sid] = end % self._buffer_size
             self._last_update[sid] = time.monotonic()
+
+    def _chronological(self, sid: int, tail_samples: int | None = None) -> np.ndarray:
+        """Reconstruct the last `tail_samples` (or the full buffer) in
+        oldest-to-newest order from the circular storage. Caller must hold
+        self._lock. Cost is proportional to what's actually requested, not
+        the full buffer_size, matching get_stream_snapshots()'s own
+        existing note on why that mattered for tail reads."""
+        buf = self._iq_buffers[sid]
+        size = len(buf)
+        idx = self._write_idx.get(sid, 0)
+        n = size if tail_samples is None else min(tail_samples, size)
+        if n == size and idx == 0:
+            return buf.copy()
+        start = (idx - n) % size
+        if start + n <= size:
+            return buf[start:start + n].copy()
+        first = size - start
+        return np.concatenate([buf[start:], buf[:n - first]])
 
 
 # ─────────────────────────────────────────────

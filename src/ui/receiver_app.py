@@ -259,6 +259,8 @@ class ReceiverWindow(QMainWindow):
         self._last_rate_count = 0
         self._last_rate_bytes = 0
         self._last_rate_time  = None
+        self._last_dropped_seen = 0    # rx.raw_q_dropped as of the last _tick() -- see _tick()'s own note
+        self._drop_warning_active = False
 
         # Streams — one card per discovered stream ID, LED shows live/stopped
         streams_box  = QGroupBox("Streams")
@@ -398,6 +400,8 @@ class ReceiverWindow(QMainWindow):
         self._last_rate_count = 0
         self._last_rate_bytes = 0
         self._last_rate_time  = time.monotonic()
+        self._last_dropped_seen = 0
+        self._drop_warning_active = False
         self._start_btn.setEnabled(False)
         self._stop_btn.setEnabled(True)
         self._timer.start()
@@ -523,6 +527,38 @@ class ReceiverWindow(QMainWindow):
         n_streams = len([c for _, c in snaps.values() if c is not None])
         ctx = rx.context
         fs_str = f"{ctx.sample_rate_hz / 1e6:.3f} MHz" if ctx else "?"
+
+        # 2026-09-05: surfaces rx.raw_q_dropped -- confirmed directly this
+        # matters: a real Combiner->Receiver run measured ~12% of arriving
+        # packets never counted here, entirely because THIS process's own
+        # processing thread fell behind (DifiDataPacket.from_bytes() is
+        # the ~44x-more-expensive full parse, unavoidable here since the
+        # rolling display buffer needs real decoded IQ, not just header
+        # fields -- see DifiReceiver's own note). The Combiner's own
+        # ingress/egress counters stayed ~98-100% healthy the entire time,
+        # so its equivalent warning correctly never fired -- it has no way
+        # to know this is happening, since UDP gives it no feedback from
+        # this side at all. Without this, that loss looked like nothing
+        # was wrong anywhere.
+        dropped_now = rx.raw_q_dropped
+        d_dropped = dropped_now - self._last_dropped_seen
+        self._last_dropped_seen = dropped_now
+        if d_dropped > 0:
+            self._drop_warning_active = True
+            self._status.showMessage(
+                f"WARNING: this Receiver is falling behind the arrival rate -- "
+                f"{dropped_now:,} packet(s) dropped so far ({d_dropped:,} in the "
+                f"last {self._timer.interval()/1000:.1f}s). The display/parsing work "
+                f"can't keep up with incoming data."
+            )
+            return
+        if self._drop_warning_active:
+            self._drop_warning_active = False
+            self._status.showMessage(
+                f"Listening -- recovered, no further drops (total this session: {dropped_now:,})"
+            )
+            return
+
         self._status.showMessage(
             f"Listening | data={rx.data_received:,} | "
             f"streams={n_streams} | fs={fs_str}"

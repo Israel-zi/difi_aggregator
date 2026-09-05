@@ -128,18 +128,29 @@ class TransmitterWindow(QMainWindow):
             self._stream_id.setText(env["DIFI_STREAM_ID"])
         if env.get("DIFI_SAMPLES_PER_PKT"):
             self._samples_per_pkt.setValue(int(env["DIFI_SAMPLES_PER_PKT"]))
+        # 2026-09-05: these all used to call set_hz() with its default
+        # emit=False, so the "changed" signal never fired here -- confirmed
+        # directly: the "Expected: N pkt/s" preview kept showing whatever
+        # rate was last SAVED to SysConfig, not the rate this autostart run
+        # actually configured (e.g. a real 20MHz test still showed the old
+        # "2,273 pkt/s" from a previously-saved 5MHz session). The actual
+        # generator itself was never affected -- _start() reads self._fs.
+        # value_hz() live, not a cached signal-driven value -- so this was
+        # a real but purely cosmetic bug, not a functional one. emit=True
+        # here makes the preview (and _on_param_changed) fire the same way
+        # a manual edit in the GUI would.
         if env.get("DIFI_SAMPLE_RATE_HZ"):
-            self._fs.set_hz(float(env["DIFI_SAMPLE_RATE_HZ"]))
+            self._fs.set_hz(float(env["DIFI_SAMPLE_RATE_HZ"]), emit=True)
         if env.get("DIFI_SIGNAL_TYPE") == "BW":
             self._bw_rb.setChecked(True)
         elif env.get("DIFI_SIGNAL_TYPE") == "CW":
             self._cw_rb.setChecked(True)
         if env.get("DIFI_BANDWIDTH_HZ"):
-            self._bw.set_hz(float(env["DIFI_BANDWIDTH_HZ"]))
+            self._bw.set_hz(float(env["DIFI_BANDWIDTH_HZ"]), emit=True)
         if env.get("DIFI_TONE_HZ"):
-            self._tone.set_hz(float(env["DIFI_TONE_HZ"]))
+            self._tone.set_hz(float(env["DIFI_TONE_HZ"]), emit=True)
         if env.get("DIFI_RF_REF_HZ"):
-            self._rf.set_hz(float(env["DIFI_RF_REF_HZ"]))
+            self._rf.set_hz(float(env["DIFI_RF_REF_HZ"]), emit=True)
         if env.get("DIFI_SIM_DELAY_MS"):
             self._sim_delay.setValue(float(env["DIFI_SIM_DELAY_MS"]))
         if env.get("DIFI_SIM_JITTER_MS"):

@@ -41,6 +41,7 @@ if not getattr(sys, 'frozen', False):
 import multiprocessing
 import queue as _queue
 import time
+from collections import deque
 
 from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtWidgets import (
@@ -52,6 +53,7 @@ from PySide6.QtWidgets import (
 from pipeline_logger    import make_run_dir
 from ring_pipeline      import start_ring_ingress, start_ring_egress, stop_ring_egress, stop_ring_pipeline
 from gil_friendly_exec  import run_gil_friendly, request_stop
+from time_input         import TimeInput
 import app_config
 
 
@@ -185,6 +187,12 @@ class PacketizerWindow(QMainWindow):
         # session's fixes -- see project memory for the full chain.
         self._ring_handles = None   # set by _listen(), see ring_pipeline.start_ring_ingress()
         self._stream_id_by_port: dict = {}
+        self._capture_last_count_by_port: dict = {}   # port -> data_received as of the last "stats" heartbeat
+        self._egress_prev_sent = None            # egress "stats" heartbeat deltas -- see _handle_egress_status
+        self._ingress_total_at_last_egress_check = None   # sum(_capture_last_count_by_port) at the last egress check
+        self._egress_bad_streak = 0               # consecutive high-real-loss ROLLING evaluations
+        self._egress_was_warning = False           # so a recovery can clear the warning once
+        self._egress_window = deque(maxlen=5)      # rolling (d_sent, d_ingress) samples, ~5s -- see _handle_egress_status
         self._run_dir     = None    # log folder for the current Listen session
         self._stream_rows: list = []
         # See app_config.py -- loaded here (before _build_ui() creates any
@@ -231,10 +239,10 @@ class PacketizerWindow(QMainWindow):
         if env.get("DIFI_CHUNK_SIZE"):
             self._chunk.setValue(int(env["DIFI_CHUNK_SIZE"]))
         if env.get("DIFI_HOLD_MS") is not None:
-            hold_ms = int(float(env["DIFI_HOLD_MS"]))
+            hold_ms = float(env["DIFI_HOLD_MS"])
             if hold_ms > 0:
                 self._hold_enabled_cb.setChecked(True)
-                self._hold_ms.setValue(hold_ms)
+                self._hold_ms.set_ms(hold_ms)
             else:
                 self._hold_enabled_cb.setChecked(False)
         if env.get("DIFI_DEST_IP"):
@@ -339,11 +347,7 @@ class PacketizerWindow(QMainWindow):
         )
         net_layout.addWidget(self._hold_enabled_cb)
 
-        self._hold_ms = QSpinBox()
-        self._hold_ms.setRange(0, 2000)
-        self._hold_ms.setValue(net_cfg.get_int("hold_ms", 0))
-        self._hold_ms.setSuffix(" ms")
-        self._hold_ms.setFixedWidth(90)
+        self._hold_ms = TimeInput(net_cfg.get_float("hold_ms", 0.0))
         self._hold_ms.setEnabled(self._hold_enabled_cb.isChecked())
         self._hold_enabled_cb.toggled.connect(self._hold_ms.setEnabled)
         self._hold_ms.setToolTip(
@@ -511,11 +515,8 @@ class PacketizerWindow(QMainWindow):
                 self._handle_egress_status(msg)
 
     def _handle_capture_status(self, msg: dict):
-        # "stats" (a ~1/s heartbeat with cumulative counts) is intentionally
-        # ignored here -- see the removed "Throughput" box's note in
-        # _build_ui(). Only "stream_discovered" still touches the UI: it
-        # sets the Stream ID text and lights a row's LED, but each fires at
-        # most once per stream, not on a repeating timer.
+        # "stream_discovered" sets the Stream ID text and lights a row's
+        # LED, but fires at most once per stream, not on a repeating timer.
         if msg.get("status") == "stream_discovered":
             self._stream_id_by_port[msg["port"]] = msg["stream_id"]
             for row in self._stream_rows:
@@ -523,8 +524,110 @@ class PacketizerWindow(QMainWindow):
                     row.set_stream_id(msg["stream_id"])
                     row.set_active(True)
 
+        # 2026-09-05: "stats" used to be ignored entirely here, which meant
+        # the LED, once lit by "stream_discovered", never went back out --
+        # confirmed directly: stop a Transmitter mid-run and its row stays
+        # green forever, even though ring_capture_main has been getting
+        # nothing from that port since. Fixed by comparing this heartbeat's
+        # CUMULATIVE data_received against the value from this port's
+        # previous heartbeat (~1/s apart, per ring_capture_main's own
+        # heartbeat interval): unchanged means nothing new arrived in that
+        # whole interval, so the LED should go dark, same signal the
+        # Receiver's own active/stale STATUS row already uses for the same
+        # purpose on that side of the pipeline.
+        elif msg.get("status") == "stats" and "data_received" in msg:
+            port = msg["port"]
+            count = msg["data_received"]
+            prev = self._capture_last_count_by_port.get(port)
+            active = (count > 0) if prev is None else (count != prev)
+            if msg.get("final"):
+                active = False
+            self._capture_last_count_by_port[port] = count
+            for row in self._stream_rows:
+                if row.port() == port:
+                    row.set_active(active)
+
     def _handle_egress_status(self, msg: dict):
-        pass   # nothing left to do with "stats" -- see _handle_capture_status
+        # 2026-09-05: added after confirming directly (measured real
+        # ingress processing latency: p50 82-117ms, p99 121-157ms, max up
+        # to 248ms on this machine under real load) that a hold_ms shorter
+        # than the link's actual real-world latency causes the egress
+        # dispatch deadline to reach a packet's slot before ingress has
+        # even written it there -- and since dispatch never looks
+        # backward, that packet is gone forever. Surfacing a live ratio
+        # here so a too-tight hold shows up as an explained warning, not a
+        # mystery.
+        #
+        # 2026-09-05, corrected: the first version compared packets_sent
+        # against packets_zero_filled (empty TIME-SLOT checks) -- but this
+        # design deliberately polls every stream's ring buffer once per
+        # 20us slot regardless of whether real data is expected there (see
+        # ring_pipeline.py's own docstring), and a real DIFI packet only
+        # occupies about 1 of every ~22 of those slots at typical
+        # samples/pkt. That makes ~95-96% "empty slots" the NORMAL,
+        # HEALTHY baseline at 100% real delivery, not a fault signal --
+        # confirmed directly against a run with steady, undegraded
+        # throughput the entire time (max_work_this_period 1.5-3ms
+        # throughout, skipped_stale=0) that still measured ~96% zero-fill,
+        # exactly matching what this warning was treating as a crisis. So
+        # this fired on every run regardless of actual health -- a
+        # completely different bug from the "too-tight hold" one it was
+        # built to explain. Fixed by measuring what actually matters:
+        # real packets delivered vs. real packets that arrived at
+        # ingress (already tracked per-port for the LED fix, in
+        # _capture_last_count_by_port), not slot-polling arithmetic.
+        if msg.get("status") != "stats":
+            return
+        sent = msg.get("packets_sent", 0)
+        prev_sent = self._egress_prev_sent
+        self._egress_prev_sent = sent
+        ingress_total = sum(self._capture_last_count_by_port.values())
+        prev_ingress = self._ingress_total_at_last_egress_check
+        self._ingress_total_at_last_egress_check = ingress_total
+        if prev_sent is None or prev_ingress is None or msg.get("final"):
+            return
+        d_sent = sent - prev_sent
+        d_ingress = ingress_total - prev_ingress
+        if d_ingress < 500:   # too little real traffic this interval to judge
+            return
+        # Rolling window (~5 egress heartbeats, ~5s) so one interval's
+        # ordinary phase misalignment between the independent ingress and
+        # egress heartbeats doesn't read as loss on its own -- only a
+        # SUSTAINED shortfall crosses the threshold.
+        self._egress_window.append((d_sent, d_ingress))
+        window_sent = sum(s for s, _ in self._egress_window)
+        window_ingress = sum(i for _, i in self._egress_window)
+        ratio = 1.0 - min(1.0, window_sent / window_ingress)   # fraction of arrivals NOT delivered
+        if len(self._egress_window) < self._egress_window.maxlen:
+            return   # not enough history yet to judge a sustained trend
+        # 2026-09-05: was 0.15 -- not grounded in anything, just a guess
+        # made before any real threshold had been discussed. Set to the
+        # commonly-cited real-time UDP quality line instead (ITU-T style
+        # guidance for VoIP/video): ~1% packet loss is the standard
+        # threshold for "good" -- above that already reads as degraded,
+        # not merely "not yet broken." And that standard is for media with
+        # real perceptual tolerance for a dropped packet; this pipeline
+        # forwards RF sample data for actual signal analysis, where a lost
+        # sample has no equivalent "the ear/eye won't notice" slack, so 1%
+        # is if anything already lenient here, not conservative.
+        if ratio > 0.01:
+            self._egress_bad_streak += 1
+        else:
+            self._egress_bad_streak = 0
+        # Still require 2 consecutive bad ROLLING evaluations (not just 2
+        # bad raw heartbeats) before warning, and clear once it recovers.
+        if self._egress_bad_streak >= 2:
+            hold_ms = self._hold_ms.value_ms()
+            unit, val = TimeInput._pick_unit(hold_ms)
+            self._status.showMessage(
+                f"WARNING: {ratio*100:.0f}% of arriving packets were not delivered over "
+                f"the last ~{self._egress_window.maxlen}s -- the {val:g}{unit} hold may be "
+                f"shorter than this link's real processing latency. Try raising it."
+            )
+            self._egress_was_warning = True
+        elif self._egress_bad_streak == 0 and self._egress_was_warning:
+            self._status.showMessage("Forwarding -- recovered, hold looks sufficient again.")
+            self._egress_was_warning = False
 
     # ── lifecycle ──────────────────────────────────────────────────────────
 
@@ -533,7 +636,7 @@ class PacketizerWindow(QMainWindow):
         hold" is unchecked, regardless of what's in the spinbox, so an
         operator never has to remember/re-zero a previously-tuned value
         just to switch to LAN mode."""
-        return self._hold_ms.value() if self._hold_enabled_cb.isChecked() else 0.0
+        return self._hold_ms.value_ms() if self._hold_enabled_cb.isChecked() else 0.0
 
     def _save_config(self):
         """See app_config.py -- called on Listen/Forward/the Save Config
@@ -549,7 +652,7 @@ class PacketizerWindow(QMainWindow):
         in_cfg.set("chunk_size", self._chunk.value())
 
         net_cfg = app_config.Section(self._cfg, "Combiner.Network")
-        net_cfg.set("hold_ms", self._hold_ms.value())
+        net_cfg.set("hold_ms", self._hold_ms.value_ms())
         net_cfg.set("hold_enabled", self._hold_enabled_cb.isChecked())
 
         out_cfg = app_config.Section(self._cfg, "Combiner.Output")
@@ -575,6 +678,7 @@ class PacketizerWindow(QMainWindow):
         self._run_dir = make_run_dir("Combiner")
         self._ring_handles = start_ring_ingress(ports, self._run_dir)
         self._stream_id_by_port = {}
+        self._capture_last_count_by_port = {}
 
         self._listening = True
         self._set_locked(True)
@@ -602,6 +706,11 @@ class PacketizerWindow(QMainWindow):
         target_delay_ms = self._effective_hold_ms()
         start_ring_egress(self._ring_handles, dest_ip, dest_port, target_delay_ms)
         self._apply_forward_filter()
+        self._egress_prev_sent = None
+        self._ingress_total_at_last_egress_check = None
+        self._egress_bad_streak = 0
+        self._egress_was_warning = False
+        self._egress_window.clear()
 
         self._forwarding = True
         self._forward_btn.setText("■  Stop Fwd")
@@ -701,7 +810,7 @@ def main():
     # See gil_friendly_exec.py: app.exec()'s native Windows event loop was
     # measured, via direct A/B test on this exact app, to starve every
     # other thread in this process (0.0% packet loss with this polling
-    # loop vs 41-46% with app.exec(), everything else identical).
+    # loop vs 41-46% with app.exec(), everything else identical).please you do the test
     app.lastWindowClosed.connect(lambda: request_stop(app))
     sys.exit(run_gil_friendly(app))
 
